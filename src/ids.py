@@ -21,14 +21,28 @@ COMPANY_TOTAL = "__ALL__"
 SEP = ":"
 
 
-def cluster_id(run_id: str, product_family: str, local_id: int | str) -> str:
-    """`{run_id}:{product_family}:{local_id}` — unique across refits."""
-    for part, name in ((run_id, "run_id"), (str(product_family), "product_family")):
+def _scoped(run_id: str, scope: str, local_id: int | str) -> str:
+    for part, name in ((run_id, "run_id"), (str(scope), "scope")):
         if not part:
             raise ValueError(f"{name} must be non-empty")
         if SEP in part:
             raise ValueError(f"{name} must not contain {SEP!r}: {part!r}")
-    return f"{run_id}{SEP}{product_family}{SEP}{local_id}"
+    return f"{run_id}{SEP}{scope}{SEP}{local_id}"
+
+
+def cluster_id(run_id: str, product_family: str, local_id: int | str) -> str:
+    """`{run_id}:{product_family}:{local_id}` — unique across refits."""
+    return _scoped(run_id, product_family, local_id)
+
+
+def campaign_id(run_id: str, local_id: int | str) -> str:
+    """`{run_id}:campaign:{local_id}` — unique across refits.
+
+    Campaign features (`burstiness`, `state_concentration`, `first_seen`) are
+    time-windowed, so campaigns are regenerated at every cutoff and a bare
+    local id would collide the same way cluster ids would.
+    """
+    return _scoped(run_id, "campaign", local_id)
 
 
 def parse_cluster_id(cid: str) -> tuple[str, str, str]:

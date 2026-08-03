@@ -64,11 +64,11 @@ with similar names. Silently corrupts every company-level statistic.
 ### Phase 0 — Scaffold
 _Date:_ 2026-08-03
 
-_What was built:_ repo skeleton, `db/schema.sql` (21 tables, verified to apply),
+_What was built:_ repo skeleton, `db/schema.sql` (22 tables, verified to apply),
 `src/config.py` (frozen + fingerprinted), `src/db.py` (run registry),
 `src/checks.py` (stage assertions), `src/ids.py`, three pure normalization
 modules (`pii`, `text`, `company`), `src/pipeline.py`, `src/ingestion/download.py`,
-78 tests, Makefile, ruff + GitHub Actions CI.
+90 tests, Makefile, ruff + GitHub Actions CI.
 
 _Decisions:_
 
@@ -214,6 +214,29 @@ flag if a real need to run non-strict ever appears.
 load-bearing (lexicographic time-sortability, collision-freedom) with no
 dependency. Swap in `python-ulid` if the canonical 26-character format is ever
 needed by something external.
+
+### 2026-08-03 — `dup_groups` and `campaigns` are run-scoped; `dup_pairs` split out
+
+Documenting the per-cutoff refit split (above) exposed that two dedup tables
+still had cutoff-independent keys: `dup_groups` was `PRIMARY KEY (complaint_id)`
+while carrying a cutoff-dependent `is_representative`, and `campaigns.campaign_id`
+was a bare VARCHAR while `campaigns.as_of` said it is regenerated per cutoff.
+Eight refits, one slot each — the same collision `cluster_id` had.
+
+Split along the line the refit table already draws: `dup_pairs` holds pairwise
+similarity (computed once, date-independent), `dup_groups` holds connected
+components and representative selection keyed `(run_id, complaint_id)`.
+`campaign_id` now goes through `src/ids.py` like `cluster_id`.
+
+Caught before Phase 2 wrote a single row. After that it would have been a
+migration plus a full re-run.
+
+### 2026-08-03 — `signals.company_id` uses the `'__ALL__'` sentinel too
+
+`cluster_timeseries` got the sentinel; `signals` was left nullable. A join
+between them on `company_id` — the natural Phase 5/6 query — would have returned
+nothing for exactly the cluster-level rows. Not an error, just missing alerts.
+Regression test: `test_cluster_level_signal_joins_its_timeseries_total`.
 
 ### 2026-08-03 — Embeddings and MinHash are not refit per cutoff
 

@@ -43,8 +43,13 @@ def expect_rows(
     max: int | None = None,
     where: str | None = None,
 ) -> int:
-    """Assert a row count is inside an expected range. Returns the count."""
-    sql = f"SELECT count(*) FROM {_ident(table)}"  # noqa: S608 - _ident() validates
+    """Assert a row count is inside an expected range. Returns the count.
+
+    `where` is interpolated verbatim and is NOT validated — it must always be a
+    literal written in this codebase, never anything derived from data or user
+    input. `table` is validated by `_ident()`.
+    """
+    sql = f"SELECT count(*) FROM {_ident(table)}"  # noqa: S608 - see docstring
     if where:
         sql += f" WHERE {where}"
     n = con.execute(sql).fetchone()[0]

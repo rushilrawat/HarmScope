@@ -37,6 +37,13 @@ Union-find over LSH candidate pairs → `group_id`.
 Tune the threshold on hand-labeled pairs. Character shingles beat word shingles here because
 templates vary mainly in inserted account numbers and dates.
 
+**Pairs and groups are stored separately**, because only one of them depends on
+the cutoff. `dup_pairs` holds the pairwise similarities — computed once over the
+whole corpus, since Jaccard similarity between two narratives does not depend on
+what else exists. `dup_groups` holds the connected components, refit per cutoff:
+transitive closure *is* date-dependent, because if A~B and B~C but B arrives
+after the cutoff, A and C are separate groups at that cutoff.
+
 **Tier 3 — campaign detection.** Groups are not enough; a campaign may vary phrasing enough to
 evade MinHash. Compute per candidate campaign (a dup_group, or a tight embedding neighborhood):
 

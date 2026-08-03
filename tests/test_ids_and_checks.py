@@ -5,7 +5,7 @@ from datetime import date
 import pytest
 
 from src import checks
-from src.ids import COMPANY_TOTAL, cluster_id, parse_cluster_id
+from src.ids import COMPANY_TOTAL, campaign_id, cluster_id, parse_cluster_id
 
 
 # --------------------------------------------------------------------------
@@ -37,6 +37,13 @@ def test_cluster_id_rejects_ambiguous_parts(run_id, family):
 def test_malformed_cluster_id_rejected():
     with pytest.raises(ValueError, match="malformed"):
         parse_cluster_id("mortgage-3")
+
+
+def test_campaign_ids_do_not_collide_across_refits():
+    """Campaign features are time-windowed, so campaigns are regenerated per
+    cutoff for the same reason clusters are."""
+    assert campaign_id("run-2019", 1) != campaign_id("run-2020", 1)
+    assert parse_cluster_id(campaign_id("run-2019", 1)) == ("run-2019", "campaign", "1")
 
 
 def test_company_total_sentinel_is_not_a_plausible_company_id():
@@ -95,10 +102,10 @@ def test_expect_scalar_range(con):
 def test_expect_no_leakage(seeded):
     con, run_id, cid = seeded
     con.execute(
-        "INSERT INTO signals (signal_id, run_id, cluster_id, period_month, method, "
-        "statistic, n_supporting, n_supporting_groups, as_of) "
-        "VALUES ('s1', ?, ?, DATE '2018-05-01', 'prr', 3.1, 40, 38, DATE '2019-01-01')",
-        [run_id, cid],
+        "INSERT INTO signals (signal_id, run_id, cluster_id, company_id, period_month, "
+        "method, statistic, n_supporting, n_supporting_groups, as_of) "
+        "VALUES ('s1', ?, ?, ?, DATE '2018-05-01', 'prr', 3.1, 40, 38, DATE '2019-01-01')",
+        [run_id, cid, COMPANY_TOTAL],
     )
     checks.expect_no_leakage(con, "signals", date(2019, 1, 1))
     with pytest.raises(checks.CheckFailed, match="LEAKAGE"):

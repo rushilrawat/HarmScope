@@ -202,24 +202,35 @@ CREATE TABLE narratives (
 CREATE INDEX idx_narr_hash ON narratives(text_hash);
 
 -- ============ dedup ============
-CREATE TABLE dup_groups (
-  complaint_id  BIGINT PRIMARY KEY REFERENCES narratives(complaint_id),
-  group_id      VARCHAR NOT NULL,
-  is_representative BOOLEAN NOT NULL,
-  method        VARCHAR NOT NULL,       -- exact | minhash
-  similarity    DOUBLE,
-  group_size    INTEGER NOT NULL
+CREATE TABLE dup_pairs (                -- computed once; date-independent
+  complaint_id_a BIGINT NOT NULL,
+  complaint_id_b BIGINT NOT NULL,       -- always > complaint_id_a
+  similarity     DOUBLE NOT NULL,
+  method         VARCHAR NOT NULL,      -- exact | minhash
+  PRIMARY KEY (complaint_id_a, complaint_id_b)
 );
 
-CREATE TABLE campaigns (                -- suspected mass filings
-  campaign_id   VARCHAR PRIMARY KEY,
-  n_complaints  BIGINT,
+CREATE TABLE dup_groups (               -- refit per cutoff
+  run_id        VARCHAR NOT NULL REFERENCES runs(run_id),
+  complaint_id  BIGINT NOT NULL,
+  group_id      VARCHAR NOT NULL,
+  is_representative BOOLEAN NOT NULL,
+  group_size    INTEGER NOT NULL,
+  as_of         DATE NOT NULL,
+  PRIMARY KEY (run_id, complaint_id)
+);
+
+CREATE TABLE campaigns (                -- suspected mass filings; refit per cutoff
+  campaign_id   VARCHAR PRIMARY KEY,    -- '{run_id}:campaign:{local_id}'
+  run_id        VARCHAR NOT NULL REFERENCES runs(run_id),
+  n_complaints  BIGINT NOT NULL,
   first_seen    DATE, last_seen DATE,
   top_company_id VARCHAR,
   burstiness    DOUBLE,
   state_concentration DOUBLE,
   boilerplate_score DOUBLE,
-  flagged       BOOLEAN NOT NULL
+  flagged       BOOLEAN NOT NULL,
+  as_of         DATE NOT NULL
 );
 CREATE TABLE campaign_members (
   complaint_id BIGINT PRIMARY KEY, campaign_id VARCHAR NOT NULL
@@ -291,7 +302,7 @@ CREATE TABLE signals (
   signal_id     VARCHAR PRIMARY KEY,
   run_id        VARCHAR NOT NULL,
   cluster_id    VARCHAR NOT NULL,
-  company_id    VARCHAR,
+  company_id    VARCHAR NOT NULL,       -- '__ALL__' = cluster-level, matching cluster_timeseries
   period_month  DATE NOT NULL,          -- period at which the signal fires
   method        VARCHAR NOT NULL,       -- prr | ebgm | ewma | pelt
   statistic     DOUBLE NOT NULL,
@@ -333,6 +344,16 @@ CREATE TABLE backtest_results (
 
 ### Schema notes
 
+- **Every per-cutoff artifact is run-scoped.** `cluster_id` and `campaign_id` are
+  globally unique by construction (`src/ids.py`); `dup_groups` is keyed
+  `(run_id, complaint_id)`. `dup_pairs` is the one dedup artifact that is not,
+  because pairwise similarity is date-independent and computed once
+  (`EVALUATION.md` §1.1.1). The rule: if a stage is refit per cutoff, its output
+  key carries the run.
+- **`signals.company_id` and `cluster_timeseries.company_id` use the same
+  `'__ALL__'` sentinel.** If one used NULL and the other the sentinel, a join on
+  `company_id` would silently drop exactly the cluster-level rows — a missing
+  alert rather than a visible error.
 - **`cluster_id` is globally unique by construction:** `{run_id}:{product_family}:{local_id}`
   (`src/ids.py`). The backtest refits clustering once per annual cutoff, so a
   locally unique id such as `mortgage-3` would collide across cutoffs in every

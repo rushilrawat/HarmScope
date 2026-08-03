@@ -103,17 +103,33 @@ CREATE TABLE IF NOT EXISTS redaction_stats (
 );
 
 -- ============ dedup ============
+-- Split along the same line as docs/EVALUATION.md §1.1.1: pairwise similarity
+-- is date-independent and computed once; grouping and representative selection
+-- depend on which complaints exist before the cutoff and are refit per run.
+CREATE TABLE IF NOT EXISTS dup_pairs (        -- computed once, reused by every cutoff
+  complaint_id_a BIGINT NOT NULL,
+  complaint_id_b BIGINT NOT NULL,             -- always > complaint_id_a
+  similarity     DOUBLE NOT NULL,
+  method         VARCHAR NOT NULL CHECK (method IN ('exact', 'minhash')),
+  PRIMARY KEY (complaint_id_a, complaint_id_b)
+);
+
+-- Connected components over the date-filtered subgraph. Transitive closure is
+-- date-dependent: if A~B and B~C but B is post-cutoff, then A and C are
+-- separate groups at that cutoff. Hence one row per (run, complaint).
 CREATE TABLE IF NOT EXISTS dup_groups (
-  complaint_id      BIGINT PRIMARY KEY REFERENCES narratives(complaint_id),
+  run_id            VARCHAR NOT NULL REFERENCES runs(run_id),
+  complaint_id      BIGINT NOT NULL,
   group_id          VARCHAR NOT NULL,
-  is_representative BOOLEAN NOT NULL,
-  method            VARCHAR NOT NULL CHECK (method IN ('exact', 'minhash')),
-  similarity        DOUBLE,
-  group_size        INTEGER NOT NULL
+  is_representative BOOLEAN NOT NULL,         -- earliest date_received in group, ties on lower id
+  group_size        INTEGER NOT NULL,
+  as_of             DATE NOT NULL,            -- point-in-time guard
+  PRIMARY KEY (run_id, complaint_id)
 );
 
 CREATE TABLE IF NOT EXISTS campaigns (        -- suspected mass filings
-  campaign_id         VARCHAR PRIMARY KEY,
+  campaign_id         VARCHAR PRIMARY KEY,    -- '{run_id}:campaign:{local_id}', see src/ids.py
+  run_id              VARCHAR NOT NULL REFERENCES runs(run_id),
   n_complaints        BIGINT NOT NULL,
   first_seen          DATE, last_seen DATE,
   top_company_id      VARCHAR,
@@ -121,7 +137,7 @@ CREATE TABLE IF NOT EXISTS campaigns (        -- suspected mass filings
   state_concentration DOUBLE,
   boilerplate_score   DOUBLE,
   flagged             BOOLEAN NOT NULL,
-  as_of               DATE NOT NULL     -- campaign features are time-windowed; see docs/EVALUATION.md §1.2
+  as_of               DATE NOT NULL     -- campaign features are time-windowed; see docs/EVALUATION.md §1.1.1
 );
 
 CREATE TABLE IF NOT EXISTS campaign_members (
@@ -203,7 +219,10 @@ CREATE TABLE IF NOT EXISTS signals (
   signal_id            VARCHAR PRIMARY KEY,
   run_id               VARCHAR NOT NULL REFERENCES runs(run_id),
   cluster_id           VARCHAR NOT NULL REFERENCES clusters(cluster_id),
-  company_id           VARCHAR,
+  -- Same sentinel as cluster_timeseries. If one table used NULL and the other
+  -- '__ALL__', a join on company_id would silently drop exactly the
+  -- cluster-level rows — a missing alert, not a visible error.
+  company_id           VARCHAR NOT NULL,-- '__ALL__' = cluster-level, not company-specific
   period_month         DATE NOT NULL,   -- period at which the signal fires
   method               VARCHAR NOT NULL CHECK (method IN ('prr', 'ror', 'ebgm', 'ewma', 'pelt')),
   statistic            DOUBLE NOT NULL,
@@ -248,7 +267,8 @@ CREATE TABLE IF NOT EXISTS backtest_results (
 CREATE INDEX IF NOT EXISTS idx_narr_hash        ON narratives(text_hash);
 CREATE INDEX IF NOT EXISTS idx_complaints_month ON complaints(period_month);
 CREATE INDEX IF NOT EXISTS idx_complaints_co    ON complaints(company_id);
-CREATE INDEX IF NOT EXISTS idx_dup_group        ON dup_groups(group_id);
+CREATE INDEX IF NOT EXISTS idx_dup_group        ON dup_groups(run_id, group_id);
+CREATE INDEX IF NOT EXISTS idx_campaign_run     ON campaigns(run_id);
 CREATE INDEX IF NOT EXISTS idx_cluster_run      ON clusters(run_id);
 CREATE INDEX IF NOT EXISTS idx_signals_asof     ON signals(as_of);
 

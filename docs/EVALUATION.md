@@ -28,8 +28,8 @@ can depend on when a complaint arrived.
 | Stage | Per cutoff? | Why |
 |---|---|---|
 | Embedding | **No — compute once** | The encoder is a fixed pretrained checkpoint, never fit on the corpus (§5 item 3). A vector for complaint *i* is identical whether or not complaint *j* exists. Date-filter the matrix; do not recompute it. |
-| MinHash pair detection | **No — compute once** | Jaccard similarity between two narratives is pairwise and date-independent. |
-| Representative selection | **Yes** | The representative of a dup-group must be chosen from members with `date_received < C`, or a pre-cutoff group inherits a post-cutoff exemplar. |
+| MinHash pair detection (`dup_pairs`) | **No — compute once** | Jaccard similarity between two narratives is pairwise and date-independent. |
+| Grouping + representative selection (`dup_groups`) | **Yes** | Transitive closure is date-dependent: if A~B and B~C but B is post-cutoff, A and C are separate groups at that cutoff. And the representative must be chosen from members with `date_received < C`, or a pre-cutoff group inherits a post-cutoff exemplar. |
 | Campaign detection | **Yes** | `burstiness`, `state_concentration`, `first_seen`/`last_seen` are time-windowed aggregates (`METHODOLOGY.md` §2.2). Computed over the full corpus they leak post-cutoff behaviour into a pre-cutoff flag — and campaign-flagged complaints are *excluded* from detection, so a leaked flag silently suppresses a real signal. This is the most dangerous of the five to get wrong, because its failure mode is a missing alert rather than a spurious one. |
 | UMAP + HDBSCAN | **Yes** | Cluster definitions are the leakage vector trap T3 names. |
 | Novelty scoring | **Yes** | Label distributions are over cluster members. |

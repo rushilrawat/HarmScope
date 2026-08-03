@@ -122,7 +122,8 @@ and the README must say so.
 
 ```bash
 make init                                    # venv, deps, empty schema-valid DuckDB
-make test                                    # 78 tests
+make test                                    # test suite
+make lint                                    # ruff
 make download                                # CFPB bulk CSV snapshot (~1.4 GB compressed)
 python -m src.pipeline runs                  # the run registry
 ```
