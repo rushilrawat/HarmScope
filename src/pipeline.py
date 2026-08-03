@@ -230,6 +230,73 @@ def phase_normalize(args: argparse.Namespace) -> int:
     return 0
 
 
+def phase_dedup(args: argparse.Namespace) -> int:
+    """Phase 2 [GATE] — exact + MinHash dedup, union-find, campaign detection."""
+    import numpy as np
+
+    from src.dedup import campaign, detect
+
+    con = db.bootstrap()
+    as_of = con.execute("SELECT max(date_received) FROM complaints").fetchone()[0]
+
+    with db.run(con, "dedup", CONFIG) as r:
+        con.execute("DELETE FROM dup_pairs")
+        n_exact = detect.exact_pairs(con)
+        print(f"tier 1 exact  : {n_exact:,} pairs", flush=True)
+
+        reps = detect.representatives(con)
+        ids = np.array([x[0] for x in reps], dtype=np.int64)
+        families = [x[1] for x in reps]
+        print(f"representatives: {len(reps):,}", flush=True)
+
+        sig = detect.build_signatures([x[2] for x in reps], CONFIG)
+        pairs = detect.candidate_pairs(con, ids, families, sig)
+        print(f"lsh candidates : {len(pairs):,}", flush=True)
+
+        if len(pairs):
+            keep, sims = detect.verify(sig, pairs, CONFIG.dedup.jaccard_threshold)
+            good = pairs[keep]
+            print(f"verified >= {CONFIG.dedup.jaccard_threshold}: {len(good):,} "
+                  f"({len(good) / max(len(pairs), 1):.1%} of candidates)", flush=True)
+            if len(good):
+                a = np.minimum(ids[good[:, 0]], ids[good[:, 1]])
+                b = np.maximum(ids[good[:, 0]], ids[good[:, 1]])
+                frame = {"complaint_id_a": a, "complaint_id_b": b,  # noqa: F841
+                         "similarity": sims[keep].astype(float),
+                         "method": np.array(["minhash"] * len(good), dtype=object)}
+                con.execute(
+                    "INSERT INTO dup_pairs SELECT * FROM frame "
+                    "WHERE (complaint_id_a, complaint_id_b) NOT IN "
+                    "(SELECT complaint_id_a, complaint_id_b FROM dup_pairs)"
+                )
+
+        n_groups, n_rows = detect.assign_groups(con, r.run_id, as_of)
+        n_cand, n_flagged = detect.build_campaigns(con, r.run_id, CONFIG, as_of)
+        r.finish(output_rows=n_rows, input_rows=len(reps))
+
+    print(f"\ngroups        : {n_groups:,} over {n_rows:,} narratives")
+    print(f"campaigns     : {n_cand:,} candidates, {n_flagged:,} flagged")
+    print(f"corpus boilerplate baseline: {campaign.boilerplate_share(con):.4f}")
+
+    print("\ncampaign-flagged share by product family "
+          "(METHODOLOGY §2.4: credit reporting must be clearly highest):")
+    for fam, tot, flagged in con.execute(
+        f"""
+        SELECT c.product_family, count(*) AS tot,
+               count(*) FILTER (WHERE cm.complaint_id IS NOT NULL) AS flagged
+        FROM complaints c
+        JOIN narratives n USING (complaint_id)
+        LEFT JOIN (SELECT DISTINCT m.complaint_id FROM campaign_members m
+                   JOIN campaigns ca USING (campaign_id)
+                   WHERE ca.run_id = '{r.run_id}' AND ca.flagged) cm
+               USING (complaint_id)
+        GROUP BY 1 ORDER BY flagged::DOUBLE / count(*) DESC
+        """
+    ).fetchall():
+        print(f"  {fam:<18} {flagged:>9,} / {tot:>9,}  {flagged / tot:6.2%}")
+    return 0
+
+
 def cmd_taxonomy(args: argparse.Namespace) -> int:
     """Print the label vocabulary the crosswalk has to cover, by volume."""
     con = db.connect(read_only=True)
@@ -255,10 +322,10 @@ PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
     "download": phase_download,
     "load": phase_load,
     "normalize": phase_normalize,
+    "dedup": phase_dedup,
 }
 
 PLANNED: dict[str, str] = {
-    "dedup": "ROADMAP Phase 2 [GATE] — exact + MinHash + campaign detection",
     "embed": "ROADMAP Phase 3 — encode representatives, build FAISS index",
     "cluster": "ROADMAP Phase 4 [GATE] — UMAP + HDBSCAN + novelty scoring",
     "signals": "ROADMAP Phase 5 — disproportionality, changepoint, FDR",

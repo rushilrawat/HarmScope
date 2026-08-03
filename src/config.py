@@ -101,10 +101,16 @@ class DedupConfig:
     # Campaign detection (Tier 3). Hand-tuned against the labelled pair set;
     # deliberately not a supervised model — too few labels, features are readable.
     campaign_min_size: int = 20
-    burstiness_threshold: float = 3.0           # Fano factor of daily counts
+    # A campaign is flagged when at least this many of the six signals fire.
+    # Not a trained model (docs/METHODOLOGY.md §2.2): too few labels, and a
+    # human has to be able to audit why a flag fired.
+    campaign_min_signals: int = 3
+    burstiness_threshold: float = 3.0            # Fano factor of daily counts
     state_concentration_threshold: float = 0.25  # HHI over state
-    boilerplate_threshold: float = 0.15          # statutory-citation density
-    length_cv_threshold: float = 0.20            # coefficient of variation of char_len
+    company_concentration_threshold: float = 0.50    # HHI over company_id
+    submitted_via_concentration_threshold: float = 0.95  # HHI over channel
+    boilerplate_threshold: float = 0.50          # share of members citing statute
+    length_cv_threshold: float = 0.20            # LOW variance is the signal
     # Gate: docs/METHODOLOGY.md §2.4. False merges destroy real signal, so
     # precision is the binding constraint, not recall.
     min_precision: float = 0.95
