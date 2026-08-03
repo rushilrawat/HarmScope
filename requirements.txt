@@ -1,0 +1,3 @@
+# Base runtime. Enough for Phase 0 (scaffold) and Phase 1 (ingest/normalize).
+duckdb==1.5.5
+rapidfuzz==3.14.4

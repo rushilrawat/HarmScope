@@ -1,0 +1,22 @@
+# Data. Everything under data/ is derived or downloaded, EXCEPT ground truth,
+# which is hand-curated and must be committed and frozen (docs/DATA.md §4).
+/data/*
+!/data/ground_truth/
+
+*.duckdb
+*.duckdb.wal
+*.npy
+*.faiss
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Secrets
+.env
+
+.DS_Store

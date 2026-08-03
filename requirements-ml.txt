@@ -1,0 +1,30 @@
+# Phase 2+ stack. Install when you reach the phase that needs it — this pulls
+# torch and is slow. Kept out of the base requirements so CI and `make init`
+# stay fast.
+-r requirements.txt
+
+# Phase 2 - dedup / campaign detection
+datasketch==1.6.5
+
+# Phase 3 - embedding + ANN index
+sentence-transformers==5.1.2
+faiss-cpu==1.13.0
+numpy==2.3.4
+
+# Phase 4 - dimensionality reduction + clustering
+umap-learn==0.5.9
+hdbscan==0.8.41
+scikit-learn==1.7.2
+
+# Phase 5 - disproportionality, negative binomial, changepoint
+scipy==1.16.3
+statsmodels==0.14.6
+ruptures==1.1.10
+
+# Phase 8 - LLM labelling + retrieval
+anthropic==0.75.0
+rank-bm25==0.2.2
+
+# Phase 10 - API
+fastapi==0.121.2
+uvicorn==0.38.0
