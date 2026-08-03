@@ -23,8 +23,13 @@ lint: $(VENV)
 fmt: $(VENV)
 	$(VENV)/bin/ruff format src tests
 
-## download: snapshot the CFPB bulk CSV (~1.4 GB compressed). Not run by init.
+## download: snapshot the CFPB bulk CSV, compressed (~1.4 GB). Not run by init.
 download: $(VENV)
+	$(PY) -m src.pipeline run --phase download
+
+## extract: unzip the snapshot (~15 GB). Separate on purpose — the archive is
+## the reproducibility anchor; the CSV is just what DuckDB can read.
+extract: $(VENV)
 	$(PY) -m src.pipeline run --phase download --extract
 
 ## clean: drop the database and caches, keep the raw snapshot and ground truth

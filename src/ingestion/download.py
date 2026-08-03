@@ -19,6 +19,7 @@ import hashlib
 import json
 import shutil
 import sys
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass
@@ -27,6 +28,18 @@ from pathlib import Path
 
 CHUNK = 1 << 20  # 1 MiB
 MANIFEST_NAME = "manifest.json"
+
+# The CDN in front of files.consumerfinance.gov rejects short bare-token
+# User-Agents with a hard 403 — `harmscope/0.1`, `harmscope`, and even
+# `Mozilla/5.0 (compatible; harmscope/0.1)` all fail deterministically, while
+# urllib's own default and any UA carrying a parenthesised identification
+# comment succeed. Measured 2026-08-03, three trials each.
+#
+# So this string is load-bearing, not decoration: the parenthesised comment is
+# what gets the request through. It is also the right thing to send for a bulk
+# research download — identify the client and give someone a way to reach you.
+# Put a real contact URL here if you fork this.
+USER_AGENT = "harmscope/0.1 (research; +https://github.com/harmscope)"
 
 
 @dataclass
@@ -90,8 +103,21 @@ def download(url: str, dest_dir: Path, *, force: bool = False) -> Manifest:
     # this into a file:// read.
     if not url.startswith("https://"):
         raise ValueError(f"refusing to download from a non-https URL: {url!r}")
-    req = urllib.request.Request(url, headers={"User-Agent": "harmscope/0.1"})  # noqa: S310
-    with urllib.request.urlopen(req) as resp:  # noqa: S310
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # noqa: S310
+    try:
+        resp_cm = urllib.request.urlopen(req)  # noqa: S310
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            raise PermissionError(
+                f"403 from {url}.\n"
+                f"The CDN rejects short bare-token User-Agents. The UA sent was "
+                f"{USER_AGENT!r} — if you edited USER_AGENT in this module, put "
+                f"the parenthesised identification comment back. See the note "
+                f"above the constant."
+            ) from exc
+        raise
+
+    with resp_cm as resp:
         total = int(resp.headers.get("Content-Length") or 0) or None
         last_modified = resp.headers.get("Last-Modified")
         done = 0
