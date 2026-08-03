@@ -27,3 +27,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106"]
+# This module's whole job is building `read_csv` statements. DuckDB table
+# functions cannot take bind parameters, so the path is interpolated — escaped
+# by `_q()`, and sourced from our own config, not from data. Every other value
+# in these statements is a literal written in the module.
+"src/ingestion/load.py" = ["S608"]

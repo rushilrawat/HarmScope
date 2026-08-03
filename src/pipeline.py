@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 from src import checks, db
 from src.config import CONFIG, PATHS
@@ -50,15 +51,100 @@ def phase_download(args: argparse.Namespace) -> int:
     return 0
 
 
+def phase_load(args: argparse.Namespace) -> int:
+    """Phase 1b — CFPB snapshot CSV -> `complaints_raw`, with reconciliation."""
+    from src.ingestion import download as dl
+    from src.ingestion import load as ld
+
+    if args.csv:
+        csv = Path(args.csv)
+    else:
+        manifest_path = PATHS.raw / dl.MANIFEST_NAME
+        if not manifest_path.exists():
+            raise SystemExit("no snapshot yet — run `make download` first")
+        manifest = dl.Manifest.read(manifest_path)
+        if not manifest.extracted_csv:
+            raise SystemExit(
+                "snapshot is still a zip — run "
+                "`python -m src.pipeline run --phase download --extract`"
+            )
+        csv = PATHS.raw / manifest.extracted_csv
+
+    con = db.bootstrap()
+    coverage = 0.0
+
+    def acceptance(c) -> None:
+        """ROADMAP Phase 1 acceptance. Runs before the load is committed."""
+        nonlocal coverage
+        n = c.execute("SELECT count(*) FROM complaints_raw").fetchone()[0]
+        if n != n_csv:
+            raise checks.CheckFailed(
+                f"row counts do not reconcile: CSV has {n_csv:,}, "
+                f"complaints_raw has {n:,}"
+            )
+        # The corpus-size bound asserts "this is the CFPB corpus", which is
+        # simply false when --csv points at something else. Every other check
+        # still applies.
+        if not args.csv:
+            checks.expect_rows(
+                c, "complaints_raw",
+                min=CONFIG.expect.complaints_raw_min,
+                max=CONFIG.expect.complaints_raw_max,
+            )
+        checks.expect_no_nulls(c, "complaints_raw", ["complaint_id", "date_received"])
+        coverage = checks.expect_scalar(
+            c,
+            "SELECT avg(CAST(has_narrative AS INT)) FROM complaints_raw",
+            lo=CONFIG.expect.narrative_fraction_min,
+            hi=CONFIG.expect.narrative_fraction_max,
+            label="narrative coverage fraction",
+        )
+
+    with db.run(con, "load", CONFIG, params={"csv": str(csv)}) as r:
+        n_csv = ld.csv_row_count(con, csv)
+        n_loaded = ld.load_raw(con, csv, validate=acceptance)
+        r.finish(output_rows=n_loaded, input_rows=n_csv)
+
+    n_products, n_issues, lo, hi = con.execute(
+        "SELECT count(DISTINCT product), count(DISTINCT issue), "
+        "min(date_received), max(date_received) FROM complaints_raw"
+    ).fetchone()
+    print(f"rows          : {n_loaded:,} (reconciled against CSV)")
+    print(f"date range    : {lo} .. {hi}")
+    print(f"narrative frac: {coverage:.4f}  <- record this in docs/DATA.md §5")
+    print(f"distinct      : {n_products} products, {n_issues} issues")
+    print("\nnext: the taxonomy crosswalk needs those product/issue values —")
+    print("      `python -m src.pipeline taxonomy` lists them by volume.")
+    return 0
+
+
+def cmd_taxonomy(args: argparse.Namespace) -> int:
+    """Print the label vocabulary the crosswalk has to cover, by volume."""
+    con = db.connect(read_only=True)
+    rows = con.execute(
+        "SELECT product, count(*) n, min(date_received), max(date_received) "
+        "FROM complaints_raw WHERE product IS NOT NULL "
+        "GROUP BY product ORDER BY n DESC"
+    ).fetchall()
+    if not rows:
+        raise SystemExit("complaints_raw is empty — run `--phase load` first")
+    print(f"{'n':>12}  {'first':<12} {'last':<12} product")
+    for product, n, lo, hi in rows:
+        print(f"{n:>12,}  {str(lo):<12} {str(hi):<12} {product}")
+    print(f"\n{len(rows)} distinct products. Products whose date range ends near the")
+    print("2017 restructuring are the ones the crosswalk has to map forward.")
+    return 0
+
+
 # Implemented phases only. Everything else is named here so that asking for it
 # gives the roadmap phase that would build it, not a KeyError.
 PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
     "init": phase_init,
     "download": phase_download,
+    "load": phase_load,
 }
 
 PLANNED: dict[str, str] = {
-    "load": "ROADMAP Phase 1 — CSV -> complaints_raw -> complaints, narratives",
     "normalize": "ROADMAP Phase 1 — company canonicalization, taxonomy crosswalk",
     "dedup": "ROADMAP Phase 2 [GATE] — exact + MinHash + campaign detection",
     "embed": "ROADMAP Phase 3 — encode representatives, build FAISS index",
@@ -115,7 +201,11 @@ def main(argv: list[str] | None = None) -> int:
                        help="replace an existing raw snapshot (download only)")
     p_run.add_argument("--extract", action="store_true",
                        help="extract the CSV after download")
+    p_run.add_argument("--csv", help="load from this CSV instead of the snapshot")
     p_run.set_defaults(func=cmd_run)
+
+    p_tax = sub.add_parser("taxonomy", help="label vocabulary by volume")
+    p_tax.set_defaults(func=cmd_taxonomy)
 
     p_runs = sub.add_parser("runs", help="show the run registry")
     p_runs.add_argument("-n", type=int, default=20)
