@@ -63,11 +63,18 @@ CREATE TABLE IF NOT EXISTS company_alias (
   method      VARCHAR NOT NULL
 );
 
+-- `sub_product_raw` is required, not decorative: two of CFPB's taxonomy changes
+-- are splits rather than renames (`Consumer Loan` -> vehicle/personal;
+-- `Credit card or prepaid card` -> credit card/prepaid), so Product alone
+-- cannot route those rows. '*' is the wildcard — DuckDB rejects NULL in a PK.
+-- See docs/DATA.md §3.4.
 CREATE TABLE IF NOT EXISTS taxonomy_crosswalk (
-  product_raw    VARCHAR, issue_raw VARCHAR, sub_issue_raw VARCHAR,
-  product_std    VARCHAR, issue_std VARCHAR, sub_issue_std VARCHAR,
-  product_family VARCHAR NOT NULL,      -- coarse grouping used for stratification
-  effective_from DATE, effective_to DATE
+  product_raw     VARCHAR NOT NULL,
+  sub_product_raw VARCHAR NOT NULL,     -- '*' = applies to every sub-product
+  product_std     VARCHAR NOT NULL,     -- current-era name for this family
+  product_family  VARCHAR NOT NULL,     -- coarse grouping used for stratification
+  era             VARCHAR,              -- which schema era the raw label belongs to
+  PRIMARY KEY (product_raw, sub_product_raw)
 );
 
 CREATE TABLE IF NOT EXISTS complaints (       -- analysis-ready

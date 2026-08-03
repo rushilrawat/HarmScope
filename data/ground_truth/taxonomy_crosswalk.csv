@@ -1,0 +1,35 @@
+product_raw,sub_product_raw,product_std,product_family,era
+Credit reporting or other personal consumer reports,*,Credit reporting or other personal consumer reports,credit_reporting,2023-
+"Credit reporting, credit repair services, or other personal consumer reports",*,Credit reporting or other personal consumer reports,credit_reporting,2017-2023
+Credit reporting,*,Credit reporting or other personal consumer reports,credit_reporting,-2017
+Debt collection,*,Debt collection,debt_collection,all
+Mortgage,*,Mortgage,mortgage,all
+Checking or savings account,*,Checking or savings account,bank_account,2017-
+Bank account or service,*,Checking or savings account,bank_account,-2017
+Credit card,*,Credit card,credit_card,all
+Prepaid card,*,Prepaid card,prepaid_card,all
+Credit card or prepaid card,General-purpose credit card or charge card,Credit card,credit_card,2017-2023 split
+Credit card or prepaid card,Store credit card,Credit card,credit_card,2017-2023 split
+Credit card or prepaid card,General-purpose prepaid card,Prepaid card,prepaid_card,2017-2023 split
+Credit card or prepaid card,Government benefit card,Prepaid card,prepaid_card,2017-2023 split
+Credit card or prepaid card,Gift card,Prepaid card,prepaid_card,2017-2023 split
+Credit card or prepaid card,Payroll card,Prepaid card,prepaid_card,2017-2023 split
+Credit card or prepaid card,Student prepaid card,Prepaid card,prepaid_card,2017-2023 split
+Credit card or prepaid card,*,Credit card,credit_card,2017-2023 split fallback (modal family; 3 rows have no sub-product)
+"Money transfer, virtual currency, or money service",*,"Money transfer, virtual currency, or money service",money_service,2017-
+Money transfers,*,"Money transfer, virtual currency, or money service",money_service,-2017
+Virtual currency,*,"Money transfer, virtual currency, or money service",money_service,-2017
+Student loan,*,Student loan,student_loan,all
+Vehicle loan or lease,*,Vehicle loan or lease,vehicle_loan,2017-
+Consumer Loan,Vehicle loan,Vehicle loan or lease,vehicle_loan,-2017 split
+Consumer Loan,Vehicle lease,Vehicle loan or lease,vehicle_loan,-2017 split
+Consumer Loan,Installment loan,"Payday loan, title loan, personal loan, or advance loan",personal_loan,-2017 split
+Consumer Loan,Personal line of credit,"Payday loan, title loan, personal loan, or advance loan",personal_loan,-2017 split
+Consumer Loan,Title loan,"Payday loan, title loan, personal loan, or advance loan",personal_loan,-2017 split
+Consumer Loan,Pawn loan,"Payday loan, title loan, personal loan, or advance loan",personal_loan,-2017 split
+Consumer Loan,*,"Payday loan, title loan, personal loan, or advance loan",personal_loan,-2017 split fallback (modal family)
+"Payday loan, title loan, personal loan, or advance loan",*,"Payday loan, title loan, personal loan, or advance loan",personal_loan,2023-
+"Payday loan, title loan, or personal loan",*,"Payday loan, title loan, personal loan, or advance loan",personal_loan,2017-2023
+Payday loan,*,"Payday loan, title loan, personal loan, or advance loan",personal_loan,-2017
+Debt or credit management,*,Debt or credit management,debt_relief,2023-
+Other financial service,*,Other financial service,other,-2017

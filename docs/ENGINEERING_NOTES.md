@@ -136,7 +136,38 @@ than renames (`Consumer Loan` → vehicle/payday; `Credit card or prepaid card` 
 credit card/prepaid), so the crosswalk must key on `(Product, Sub-product)`, not
 `Product` alone. Full table in `DATA.md` §3.4.
 
-_Companies requiring manual merge:_ pending.
+_Companies requiring manual merge:_ 8,042 raw strings → 7,991 canonical. Only
+51 merged, all by **exact match after normalization** (`ONEMAIN FINANCE`,
+`FLAGSTAR BANK`, `SETERUS`, …). Fuzzy similarity proposes, never merges, and
+the review queue shows why: `token_set_ratio` scores **100** on
+`CL` vs `MICROBILT PRBC FORMERLY CL VERIFY` and on `CREDIT ACCEPTANCE` vs
+`AMERICAN CREDIT ACCEPTANCE`, and **90** on `CCS FINANCIAL SERVICES` vs
+`BMW FINANCIAL SERVICES`. Auto-merging above any threshold that catches the
+real duplicates also fuses unrelated companies — trap T6, with no downstream
+check that would ever notice. 30 candidates written to
+`data/ground_truth/company_merge_review.csv` for a human; decisions go in
+`company_canonical_manual.csv`.
+
+_Phase 1 results (2026-08-03):_ 34 crosswalk rules, **0 uncovered labels**;
+16,564,967 complaints (≥ 2015-01-01); 3,830,002 narratives. Wall time 34.5 min,
+dominated by the PII pass. Family volume continuity: **all 12 families have 0
+empty months inside their active range**, which is the ROADMAP Phase 1
+acceptance criterion — a family with a gap is the signature of a label
+vanishing at a schema boundary.
+
+_A check that was vacuous until real data ran:_ `redaction_rate_min` was 0.0,
+so the redaction check would have passed with the PII sweep switched off
+entirely. Measured baseline is 0.00781 mean redactions per narrative and 0.296%
+of documents touched (low because CFPB already masks aggressively and this is
+the *secondary* sweep). Floor raised to 0.002 and a document-fraction check
+added, so drift is now actually detectable per `DATA.md` §6 item 3.
+
+_Latent trap found:_ `apply_schema` uses `CREATE TABLE IF NOT EXISTS`, which is
+idempotent but silently skips a table whose *definition* changed — the symptom
+was a BinderError three stages later about a column `schema.sql` clearly
+declares. `db.check_schema_drift()` now diffs the live database against a
+throwaway in-memory apply of `schema.sql` and fails at bootstrap with
+instructions. First migration lives at `db/migrations/001_*.sql`.
 
 ### Phase 2 — Dedup & campaign detection [GATE]
 _MinHash threshold chosen and why:_

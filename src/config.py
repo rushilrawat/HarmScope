@@ -253,8 +253,16 @@ class Expectations:
     max_dropped_fraction: float = 0.001
     narrative_fraction_min: float = 0.05
     narrative_fraction_max: float = 0.95
-    redaction_rate_min: float = 0.0
-    redaction_rate_max: float = 20.0     # mean redactions per narrative
+    # Mean redactions per narrative. Measured 0.00781 on the 2026-08-03
+    # snapshot — low because CFPB already masks aggressively, and this module
+    # is the secondary sweep. The original 0.0 floor made the check vacuous: it
+    # would have passed with redaction switched off entirely. docs/DATA.md §6
+    # item 3 wants rate drift to be *detectable*, so the floor has to bite.
+    redaction_rate_min: float = 0.002
+    redaction_rate_max: float = 0.10
+    # Fraction of narratives with at least one redaction. Measured 0.00296.
+    redacted_doc_fraction_min: float = 0.001
+    redacted_doc_fraction_max: float = 0.05
 
 
 @dataclass(frozen=True)

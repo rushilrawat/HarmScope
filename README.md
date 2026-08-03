@@ -20,7 +20,7 @@ see the empty table at the bottom, which stays empty until Phase 9.
 | Phase | State |
 |---|---|
 | 0 — Scaffold | ✅ schema, config, run registry, checks, normalization, CI |
-| 1 — Ingestion & normalization | ⬜ `download` built; `load` not built |
+| 1 — Ingestion & normalization | ✅ 16.5M complaints, 3.83M narratives, crosswalk covers both schema eras |
 | 2 — Dedup & campaign detection **[GATE]** | ⬜ |
 | 3 — Embedding & index | ⬜ |
 | 4 — Clustering & novelty **[GATE]** | ⬜ |

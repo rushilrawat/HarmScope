@@ -171,7 +171,22 @@ Measured from the **2026-08-03** snapshot (sha256 `841c146e…`, 1,409,256,676 b
 | Date range | 2011-12-01 .. 2026-08-03 | Pre-2015 narrative coverage is too thin to use (§4) |
 | **Narrative coverage** | **0.2266** all-time, 0.2312 since 2015 | Never quote a rate over narrative complaints as a rate over all complaints (§3.1) |
 | Distinct `Product` / `Issue` | 21 / 178 | Across both schema eras (§3.4) |
+| `complaints` (≥ 2015-01-01) | 16,564,967 | Analysis-ready, crosswalked, company-resolved |
+| `narratives` (≥ 2015-01-01) | 3,830,002 | PII-swept; 0.296% needed any redaction |
+| Canonical companies | 7,991 from 8,042 raw strings | Exact-normalization merges only (§3.5) |
 | 2015+, with narrative, post-dedup | target ≤ 3×10⁶ | This is the embedding workload |
+
+Family volume, 2015+ — credit reporting dominates exactly as §3.3 warns, at
+**82.5%** of the corpus. Never report a single global cluster count as a headline:
+
+| Family | n | Family | n |
+|---|---:|---|---:|
+| credit_reporting | 13,670,355 | student_loan | 121,124 |
+| debt_collection | 1,111,842 | vehicle_loan | 113,021 |
+| credit_card | 474,600 | personal_loan | 77,091 |
+| bank_account | 430,468 | prepaid_card | 41,573 |
+| mortgage | 324,264 | debt_relief | 9,726 |
+| money_service | 189,963 | other | 940 |
 
 Embedding 3M narratives: ~20–40 min on a single modern GPU, ~2–5 h on CPU with batching.
 Both acceptable. Clustering 3M points is **not** — see `docs/METHODOLOGY.md §4` for the

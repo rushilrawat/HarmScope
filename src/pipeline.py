@@ -132,6 +132,104 @@ def phase_load(args: argparse.Namespace) -> int:
     return 0
 
 
+def phase_normalize(args: argparse.Namespace) -> int:
+    """Phase 1c — crosswalk, company canonicalization, complaints, narratives."""
+    from src.ingestion import build
+    from src.ingestion import download as dl
+    from src.normalization import company, taxonomy
+
+    manifest = dl.Manifest.read(PATHS.raw / dl.MANIFEST_NAME)
+    csv = PATHS.raw / (manifest.extracted_csv or "")
+    if not csv.exists():
+        raise SystemExit("no readable CSV — run `make gzip` first")
+
+    con = db.bootstrap()
+    window = CONFIG.data.window_start
+
+    with db.run(con, "normalize", CONFIG) as r:
+        n_cross = taxonomy.load_crosswalk(con)
+        uncovered = taxonomy.uncovered_labels(con)
+        if uncovered:
+            raise checks.CheckFailed(
+                "crosswalk does not cover: "
+                + "; ".join(f"{p} / {sp} ({n:,})" for p, sp, n in uncovered[:10])
+                + "\nproduct_family is NOT NULL — add these to "
+                "data/ground_truth/taxonomy_crosswalk.csv rather than defaulting them."
+            )
+
+        n_co, n_alias = company.build_canonical(con)
+        n_complaints = build.build_complaints(con, window)
+        n_narr, hits, docs = build.build_narratives(con, csv, window, r.run_id)
+
+        checks.expect_rows(con, "taxonomy_crosswalk", min=1)
+        checks.expect_no_nulls(con, "complaints", ["product_family", "period_month"])
+        checks.expect_rows(con, "complaints", min=1)
+        checks.expect_scalar(
+            con,
+            "SELECT count(*) FROM complaints WHERE company_id IS NULL",
+            hi=0, label="complaints with unresolved company",
+        )
+        # narratives must line up exactly with the has_narrative flag
+        expected = con.execute(
+            "SELECT count(*) FROM complaints WHERE has_narrative"
+        ).fetchone()[0]
+        if n_narr != expected:
+            raise checks.CheckFailed(
+                f"narratives: {n_narr:,} rows but {expected:,} complaints are "
+                f"flagged has_narrative"
+            )
+        checks.expect_no_nulls(con, "narratives", ["text_redacted", "text_hash"])
+        checks.expect_scalar(
+            con,
+            "SELECT avg(redaction_count) FROM narratives",
+            lo=CONFIG.expect.redaction_rate_min,
+            hi=CONFIG.expect.redaction_rate_max,
+            label="mean redactions per narrative",
+        )
+        checks.expect_scalar(
+            con,
+            "SELECT avg(CASE WHEN redaction_count > 0 THEN 1.0 ELSE 0 END) "
+            "FROM narratives",
+            lo=CONFIG.expect.redacted_doc_fraction_min,
+            hi=CONFIG.expect.redacted_doc_fraction_max,
+            label="fraction of narratives with a redaction",
+        )
+        r.finish(output_rows=n_complaints, input_rows=n_cross)
+
+    print(f"crosswalk     : {n_cross} rules, 0 uncovered labels")
+    print(f"companies     : {n_co:,} canonical from {n_alias:,} raw strings")
+    print(f"complaints    : {n_complaints:,} (>= {window})")
+    print(f"narratives    : {n_narr:,}  ({docs:,} had at least one redaction)")
+    print("redactions    : " + ", ".join(f"{k}={v:,}" for k, v in hits.items() if v))
+
+    print("\nfamily volume continuity (ROADMAP Phase 1 acceptance):")
+    gaps = con.execute(
+        """
+        WITH m AS (
+          SELECT product_family f, period_month p, count(*) n
+          FROM complaints GROUP BY 1, 2
+        ), rng AS (
+          SELECT f, min(p) lo, max(p) hi FROM m GROUP BY 1
+        )
+        SELECT r.f, count(*) FILTER (WHERE m.n IS NULL) AS empty_months
+        FROM rng r
+        LEFT JOIN generate_series(r.lo, r.hi, INTERVAL 1 MONTH) g(p) ON true
+        LEFT JOIN m ON m.f = r.f AND m.p = g.p::DATE
+        GROUP BY 1 ORDER BY 2 DESC, 1
+        """
+    ).fetchall()
+    for fam, empty in gaps:
+        flag = "  <- GAP" if empty else ""
+        print(f"  {fam:<18} {empty} empty months in range{flag}")
+    if any(e for _, e in gaps):
+        raise SystemExit(
+            "a product_family has months with no complaints inside its own active "
+            "range — that is the signature of a label vanishing at a schema "
+            "boundary, i.e. the crosswalk is incomplete."
+        )
+    return 0
+
+
 def cmd_taxonomy(args: argparse.Namespace) -> int:
     """Print the label vocabulary the crosswalk has to cover, by volume."""
     con = db.connect(read_only=True)
@@ -156,10 +254,10 @@ PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
     "init": phase_init,
     "download": phase_download,
     "load": phase_load,
+    "normalize": phase_normalize,
 }
 
 PLANNED: dict[str, str] = {
-    "normalize": "ROADMAP Phase 1 — company canonicalization, taxonomy crosswalk",
     "dedup": "ROADMAP Phase 2 [GATE] — exact + MinHash + campaign detection",
     "embed": "ROADMAP Phase 3 — encode representatives, build FAISS index",
     "cluster": "ROADMAP Phase 4 [GATE] — UMAP + HDBSCAN + novelty scoring",

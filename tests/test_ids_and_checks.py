@@ -84,12 +84,18 @@ def test_expect_no_nulls(con):
 
 
 def test_expect_unique(con):
+    """Two aliases legitimately share a company_id; asserting otherwise fails."""
     con.execute(
-        "INSERT INTO taxonomy_crosswalk (product_raw, product_family) "
-        "VALUES ('Mortgage', 'mortgage'), ('Mortgage', 'mortgage')"
+        "INSERT INTO company_canonical (company_id, canonical_name, verified_by) "
+        "VALUES ('equifax', 'EQUIFAX', 'manual')"
     )
+    con.execute(
+        "INSERT INTO company_alias (alias_raw, company_id, method) VALUES "
+        "('EQUIFAX, INC.', 'equifax', 'exact'), ('Equifax Inc', 'equifax', 'exact')"
+    )
+    checks.expect_unique(con, "company_alias", ["alias_raw"])
     with pytest.raises(checks.CheckFailed, match="duplicated"):
-        checks.expect_unique(con, "taxonomy_crosswalk", ["product_raw"])
+        checks.expect_unique(con, "company_alias", ["company_id"])
 
 
 def test_expect_scalar_range(con):

@@ -137,6 +137,27 @@ def test_dup_groups_hold_one_row_per_run_and_complaint(seeded):
     assert sizes == [(3,), (5,)]
 
 
+def test_schema_drift_is_detected(tmp_path):
+    """`CREATE TABLE IF NOT EXISTS` cannot alter an existing table, so a stale
+    database must be caught at bootstrap rather than three stages later as a
+    BinderError about a column schema.sql clearly declares."""
+    stale = tmp_path / "stale.duckdb"
+    con = db.connect(stale)
+    db.apply_schema(con)
+    con.execute("ALTER TABLE taxonomy_crosswalk DROP COLUMN era")
+
+    with pytest.raises(db.SchemaDrift, match="era"):
+        db.check_schema_drift(con)
+    con.close()
+
+
+def test_fresh_database_has_no_drift(tmp_path):
+    con = db.connect(tmp_path / "fresh.duckdb")
+    db.apply_schema(con)
+    db.check_schema_drift(con)  # must not raise
+    con.close()
+
+
 def test_run_status_is_constrained(con):
     with pytest.raises(duckdb.ConstraintException):
         con.execute(

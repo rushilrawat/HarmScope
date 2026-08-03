@@ -32,3 +32,7 @@ ignore = [
 # by `_q()`, and sourced from our own config, not from data. Every other value
 # in these statements is a literal written in the module.
 "src/ingestion/load.py" = ["S608"]
+# Same reasoning: these compose SQL from module-literal fragments (crosswalk
+# lookup expressions, the escaped CSV path). No value here comes from data.
+"src/ingestion/build.py" = ["S608"]
+"src/normalization/taxonomy.py" = ["S608"]

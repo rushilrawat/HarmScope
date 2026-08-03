@@ -85,11 +85,70 @@ def apply_schema(con: duckdb.DuckDBPyConnection, schema_sql: Path | None = None)
     con.execute((schema_sql or PATHS.schema_sql).read_text())
 
 
+def _columns(con: duckdb.DuckDBPyConnection) -> dict[str, list[str]]:
+    rows = con.execute(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = 'main' ORDER BY table_name, ordinal_position"
+    ).fetchall()
+    out: dict[str, list[str]] = {}
+    for table, column in rows:
+        out.setdefault(table, []).append(column)
+    return out
+
+
+class SchemaDrift(RuntimeError):
+    """The database on disk does not match db/schema.sql."""
+
+
+def check_schema_drift(
+    con: duckdb.DuckDBPyConnection, schema_sql: Path | None = None
+) -> None:
+    """Fail loudly when an existing database predates a schema change.
+
+    Every statement in schema.sql is `CREATE TABLE IF NOT EXISTS`, which makes
+    bootstrap idempotent but also makes it silently skip a table whose
+    definition has changed. The symptom is a BinderError three stages later
+    complaining about a column that schema.sql clearly declares.
+
+    Rather than parse the DDL, apply it to a throwaway in-memory database and
+    diff `information_schema` — exact, and it cannot drift from the file.
+    """
+    reference = duckdb.connect()
+    try:
+        apply_schema(reference, schema_sql)
+        expected = _columns(reference)
+    finally:
+        reference.close()
+
+    live = _columns(con)
+    problems: list[str] = []
+    for table, cols in expected.items():
+        if table not in live:
+            problems.append(f"  {table}: missing entirely")
+            continue
+        missing = [c for c in cols if c not in live[table]]
+        extra = [c for c in live[table] if c not in cols]
+        if missing:
+            problems.append(f"  {table}: missing columns {missing}")
+        if extra:
+            problems.append(f"  {table}: unexpected columns {extra}")
+
+    if problems:
+        raise SchemaDrift(
+            "database does not match db/schema.sql:\n"
+            + "\n".join(problems)
+            + "\n\nCREATE TABLE IF NOT EXISTS cannot alter an existing table. "
+            "Add a migration under db/migrations/, or rebuild from scratch:\n"
+            "  make clean && make init"
+        )
+
+
 def bootstrap(path: Path | None = None) -> duckdb.DuckDBPyConnection:
     """Create the data directories and an empty, schema-valid database."""
     PATHS.ensure()
     con = connect(path)
     apply_schema(con)
+    check_schema_drift(con)
     return con
 
 
