@@ -15,6 +15,7 @@ Last-Modified — enough to prove which vintage of the database produced a resul
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import shutil
@@ -176,6 +177,53 @@ def extract(dest_dir: Path, *, force: bool = False) -> Path:
             print(f"extracting {member} -> {out}", file=sys.stderr)
             with zf.open(member) as src, out.open("wb") as dst:
                 shutil.copyfileobj(src, dst, CHUNK)
+
+    manifest.extracted_csv = out.name
+    manifest.csv_bytes = out.stat().st_size
+    manifest.write(manifest_path)
+    return out
+
+
+def recompress_gzip(dest_dir: Path, *, force: bool = False, level: int = 6) -> Path:
+    """Restream the zipped CSV as gzip, without materialising the plain CSV.
+
+    DuckDB's `read_csv` cannot read a member of a zip archive but reads gzip
+    natively, so this is the cheapest path from snapshot to queryable: ~1.4 GB
+    on disk instead of ~9 GB, and no loader change. The zip is kept — its
+    sha256 is the reproducibility anchor.
+    """
+    manifest_path = dest_dir / MANIFEST_NAME
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"no manifest at {manifest_path}; run download first")
+    manifest = Manifest.read(manifest_path)
+    archive = dest_dir / manifest.filename
+
+    if not zipfile.is_zipfile(archive):
+        raise ValueError(f"{archive} is not a zip; nothing to recompress")
+
+    with zipfile.ZipFile(archive) as zf:
+        members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if len(members) != 1:
+            raise ValueError(f"expected exactly one CSV in {archive}, found {members}")
+        member = members[0]
+        out = dest_dir / (Path(member).name + ".gz")
+
+        if out.exists() and not force:
+            print(f"already recompressed: {out}", file=sys.stderr)
+        else:
+            tmp = out.with_suffix(out.suffix + ".partial")
+            total = zf.getinfo(member).file_size
+            print(f"recompressing {member} -> {out.name}", file=sys.stderr)
+            done = 0
+            with zf.open(member) as src, gzip.open(tmp, "wb", compresslevel=level) as dst:
+                while chunk := src.read(CHUNK):
+                    dst.write(chunk)
+                    done += len(chunk)
+                    if done % (256 * CHUNK) < CHUNK:
+                        _progress(done, total)
+            _progress(done, total)
+            print(file=sys.stderr)
+            tmp.replace(out)
 
     manifest.extracted_csv = out.name
     manifest.csv_bytes = out.stat().st_size

@@ -108,10 +108,35 @@ _Gate:_ n/a (Phase 0 is not a gate). Acceptance `make init && make test`
 verified from a clean clone.
 
 ### Phase 1 — Ingestion & normalization
-_Actual corpus size:_
-_Narrative coverage fraction:_
-_Companies requiring manual merge:_
-_Taxonomy crosswalk edge cases:_
+_Snapshot:_ 2026-08-03, sha256 `841c146eac4400dd7957403c4c2e7ddb10048a9524f58d071c12b357e199d826`,
+1,409,256,676 bytes compressed / 9,048,372,819 uncompressed.
+
+_Actual corpus size:_ 16,906,905 CSV rows → 16,900,994 loaded (75 s).
+_Narrative coverage fraction:_ 0.2266 all-time, 0.2312 since 2015.
+_Date range:_ 2011-12-01 .. 2026-08-03. 21 products, 178 issues, 0 duplicate IDs.
+
+_Three things the real data forced:_
+
+1. **`parallel = false` on `read_csv`, mandatory.** DuckDB's parallel CSV reader
+   raises `NotImplementedException` on a full read of this file — narratives
+   contain newlines inside quoted fields, so it cannot pick safe split points.
+   Not a tuning knob; the load simply does not run without it.
+2. **5,911 rows (0.035%) have no `Complaint ID`**, all recent. No primary key
+   means nothing downstream can reference them, so they are dropped — but the
+   loader reconciles CSV rows against loaded rows and fails above
+   `Expectations.max_dropped_fraction` (0.1%), so the drop cannot go silent.
+3. **DuckDB cannot read a zip member.** It reads gzip natively, so the snapshot
+   is restreamed zip → gzip (1.41 GB) rather than extracted (9 GB). The zip is
+   kept as the reproducibility anchor.
+
+_Taxonomy crosswalk edge cases:_ **there are two restructurings, not one.** The
+2023-08-24/25 boundary is at least as large as the 2017 one — 11.4M rows sit
+under the post-2023 credit-reporting label alone. Two changes are splits rather
+than renames (`Consumer Loan` → vehicle/payday; `Credit card or prepaid card` →
+credit card/prepaid), so the crosswalk must key on `(Product, Sub-product)`, not
+`Product` alone. Full table in `DATA.md` §3.4.
+
+_Companies requiring manual merge:_ pending.
 
 ### Phase 2 — Dedup & campaign detection [GATE]
 _MinHash threshold chosen and why:_

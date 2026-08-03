@@ -45,7 +45,10 @@ def phase_download(args: argparse.Namespace) -> int:
     print(f"sha256    : {manifest.sha256}")
     print(f"bytes     : {manifest.bytes:,}")
     print(f"vintage   : {manifest.last_modified}")
-    if args.extract:
+    if args.gzip:
+        csv = dl.recompress_gzip(PATHS.raw, force=args.force)
+        print(f"csv.gz    : {csv} ({csv.stat().st_size:,} bytes)")
+    elif args.extract:
         csv = dl.extract(PATHS.raw, force=args.force)
         print(f"csv       : {csv} ({csv.stat().st_size:,} bytes)")
     return 0
@@ -72,15 +75,25 @@ def phase_load(args: argparse.Namespace) -> int:
 
     con = db.bootstrap()
     coverage = 0.0
+    dropped = 0
 
     def acceptance(c) -> None:
         """ROADMAP Phase 1 acceptance. Runs before the load is committed."""
         nonlocal coverage
+        nonlocal dropped
         n = c.execute("SELECT count(*) FROM complaints_raw").fetchone()[0]
-        if n != n_csv:
+        dropped = n_csv - n
+        if dropped < 0:
             raise checks.CheckFailed(
-                f"row counts do not reconcile: CSV has {n_csv:,}, "
-                f"complaints_raw has {n:,}"
+                f"loaded more rows than the CSV has: {n:,} vs {n_csv:,}"
+            )
+        frac = dropped / n_csv if n_csv else 0.0
+        if frac > CONFIG.expect.max_dropped_fraction:
+            raise checks.CheckFailed(
+                f"{dropped:,} of {n_csv:,} CSV rows ({frac:.4%}) did not load, "
+                f"above the {CONFIG.expect.max_dropped_fraction:.3%} bound. "
+                f"Only unkeyed rows are droppable — check whether the export "
+                f"shape changed."
             )
         # The corpus-size bound asserts "this is the CFPB corpus", which is
         # simply false when --csv points at something else. Every other check
@@ -109,7 +122,8 @@ def phase_load(args: argparse.Namespace) -> int:
         "SELECT count(DISTINCT product), count(DISTINCT issue), "
         "min(date_received), max(date_received) FROM complaints_raw"
     ).fetchone()
-    print(f"rows          : {n_loaded:,} (reconciled against CSV)")
+    print(f"rows          : {n_loaded:,} of {n_csv:,} CSV rows")
+    print(f"dropped       : {dropped:,} unkeyed ({dropped / n_csv:.4%})")
     print(f"date range    : {lo} .. {hi}")
     print(f"narrative frac: {coverage:.4f}  <- record this in docs/DATA.md §5")
     print(f"distinct      : {n_products} products, {n_issues} issues")
@@ -201,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="replace an existing raw snapshot (download only)")
     p_run.add_argument("--extract", action="store_true",
                        help="extract the CSV after download")
+    p_run.add_argument("--gzip", action="store_true",
+                       help="restream the snapshot as .csv.gz (DuckDB reads it directly)")
     p_run.add_argument("--csv", help="load from this CSV instead of the snapshot")
     p_run.set_defaults(func=cmd_run)
 

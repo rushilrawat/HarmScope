@@ -246,6 +246,11 @@ class Expectations:
 
     complaints_raw_min: int = 1_000_000
     complaints_raw_max: int = 50_000_000
+    # Rows in the CSV that do not reach complaints_raw. Only unkeyed rows (no
+    # Complaint ID) are droppable, and they were 0.035% of the 2026-08-03
+    # snapshot. A jump here means the export shape changed, not that the data
+    # got worse — investigate before raising it.
+    max_dropped_fraction: float = 0.001
     narrative_fraction_min: float = 0.05
     narrative_fraction_max: float = 0.95
     redaction_rate_min: float = 0.0

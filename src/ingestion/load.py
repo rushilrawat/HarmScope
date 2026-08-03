@@ -45,6 +45,12 @@ COLUMN_MAP: dict[str, str] = {
 
 NARRATIVE_COLUMN = "Consumer complaint narrative"
 
+# `parallel = false` is required, not a tuning knob. The parallel CSV reader
+# cannot do a full read of this file — narratives contain newlines inside
+# quoted fields, so it cannot pick safe split points, and it raises
+# NotImplementedException rather than guessing. Measured 2026-08-03.
+READ_OPTS = "header = true, all_varchar = true, parallel = false"
+
 
 class HeaderMismatch(RuntimeError):
     """The CSV does not have the columns this loader was written against."""
@@ -70,7 +76,7 @@ def _blank_to_null(csv_col: str) -> str:
 def csv_header(con: duckdb.DuckDBPyConnection, csv_path: Path) -> list[str]:
     rows = con.execute(
         f"DESCRIBE SELECT * FROM read_csv({_q(str(csv_path))}, "
-        f"header = true, all_varchar = true, sample_size = 1)"
+        f"{READ_OPTS}, sample_size = 1)"
     ).fetchall()
     return [r[0] for r in rows]
 
@@ -117,7 +123,14 @@ def _select_sql(csv_path: Path) -> str:
           {_blank_to_null("Submitted via")}                         AS submitted_via,
           -- Presence only. The text itself never enters the database.
           coalesce(trim("{NARRATIVE_COLUMN}") <> '', false)         AS has_narrative
-        FROM read_csv({_q(str(csv_path))}, header = true, all_varchar = true)
+        FROM read_csv({_q(str(csv_path))}, {READ_OPTS})
+        -- A row with no Complaint ID has no primary key, so nothing downstream
+        -- can reference it: not a narrative, not a dup-group, not a signal.
+        -- Dropping is the only option, but the caller reconciles CSV rows
+        -- against loaded rows and fails if the gap exceeds
+        -- Expectations.max_dropped_fraction, so this can never go silent.
+        -- Measured 2026-08-03: 5,911 of 16,906,905 rows (0.035%), all recent.
+        WHERE TRY_CAST("Complaint ID" AS BIGINT) IS NOT NULL
     """
 
 
@@ -164,5 +177,5 @@ def csv_row_count(con: duckdb.DuckDBPyConnection, csv_path: Path) -> int:
     """Count rows in the CSV itself, for reconciliation against the load."""
     return con.execute(
         f"SELECT count(*) FROM read_csv({_q(str(Path(csv_path)))}, "
-        f"header = true, all_varchar = true)"
+        f"{READ_OPTS})"
     ).fetchone()[0]

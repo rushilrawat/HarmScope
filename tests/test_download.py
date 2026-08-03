@@ -7,7 +7,13 @@ import re
 
 import pytest
 
-from src.ingestion.download import MANIFEST_NAME, USER_AGENT, Manifest, extract
+from src.ingestion.download import (
+    MANIFEST_NAME,
+    USER_AGENT,
+    Manifest,
+    extract,
+    recompress_gzip,
+)
 
 
 def test_user_agent_keeps_its_identification_comment():
@@ -65,6 +71,36 @@ def test_extract_pulls_the_single_csv_member(tmp_path):
     # The archive is kept: its sha256 is the reproducibility anchor.
     assert archive.exists()
     assert Manifest.read(tmp_path / MANIFEST_NAME).extracted_csv == "complaints.csv"
+
+
+def test_recompress_gzip_is_duckdb_readable(tmp_path):
+    """The point of the .gz path: DuckDB reads gzip but not a zip member."""
+    import zipfile
+
+    import duckdb
+
+    body = "Complaint ID,Product\n1,Mortgage\n2,Student loan\n"
+    archive = tmp_path / "complaints.csv.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("complaints.csv", body)
+    Manifest(
+        url="https://example.test/complaints.csv.zip",
+        filename=archive.name,
+        sha256="d" * 64,
+        bytes=archive.stat().st_size,
+        downloaded_at="2026-08-03T00:00:00+00:00",
+    ).write(tmp_path / MANIFEST_NAME)
+
+    out = recompress_gzip(tmp_path)
+    assert out.name == "complaints.csv.gz"
+    assert archive.exists()  # reproducibility anchor is kept
+    assert not (tmp_path / "complaints.csv").exists()  # 9 GB never materialised
+
+    n = duckdb.connect().execute(
+        f"SELECT count(*) FROM read_csv('{out}', header=true, all_varchar=true)"  # noqa: S608
+    ).fetchone()[0]
+    assert n == 2
+    assert Manifest.read(tmp_path / MANIFEST_NAME).extracted_csv == "complaints.csv.gz"
 
 
 def test_extract_rejects_ambiguous_archives(tmp_path):

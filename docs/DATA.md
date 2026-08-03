@@ -75,8 +75,23 @@ metrics. Never report a single global cluster count as a headline.
 
 ### 3.4 Taxonomy schema drift
 
-`Product` / `Issue` values were restructured (a major revision took effect in 2017; smaller
-changes since). Consequences:
+**There are two restructurings, not one.** Measured against the 2026-08-03 snapshot,
+`Product` date ranges make both boundaries exact:
+
+| Boundary | Examples |
+|---|---|
+| **2017-04-21/24** | `Credit reporting` → `Credit reporting, credit repair services, or other personal consumer reports`; `Bank account or service` → `Checking or savings account`; `Consumer Loan` → `Vehicle loan or lease` **and** `Payday loan, title loan, or personal loan`; `Money transfers` → `Money transfer, virtual currency, or money service` |
+| **2023-08-24/25** | `Credit reporting, credit repair services, …` → `Credit reporting or other personal consumer reports`; `Credit card or prepaid card` → `Credit card` **and** `Prepaid card`; `Payday loan, title loan, or personal loan` → `Payday loan, title loan, personal loan, or advance loan`; `Debt or credit management` appears |
+
+The 2023 boundary is not a "smaller change since" — 11.4M rows (67% of the
+corpus) sit under the post-2023 credit-reporting label alone. A crosswalk built
+for 2017 only would leave the largest discontinuity in the data untouched.
+
+Two of these are **splits**, not renames (`Consumer Loan`, `Credit card or
+prepaid card`), so the crosswalk cannot key on `Product` alone — it needs
+`Sub-product` to route those rows.
+
+`Product` / `Issue` values were restructured at both boundaries. Consequences:
 
 - Raw taxonomy time series have artificial discontinuities at schema boundaries.
 - The baseline you are comparing against must use a **crosswalk** mapping old labels to new,
@@ -145,10 +160,17 @@ this explicitly whenever you report the metric.
 
 ## 5. Volume and scale planning
 
-| Slice | Approx. order of magnitude | Notes |
+Measured from the **2026-08-03** snapshot (sha256 `841c146e…`, 1,409,256,676 bytes):
+
+| Slice | Count | Notes |
 |---|---|---|
-| All complaints, all time | 10⁷ | Verify actual count at ingest; log it |
-| With narrative | ~10⁶–10⁷ | Compute exact ratio in Phase 1, record in this file |
+| Rows in the CSV | 16,906,905 | |
+| Loaded to `complaints_raw` | 16,900,994 | |
+| Dropped: no `Complaint ID` | 5,911 (0.0350%) | No primary key, so unreferenceable. Bounded by `Expectations.max_dropped_fraction`. |
+| Duplicate complaint IDs | 0 | |
+| Date range | 2011-12-01 .. 2026-08-03 | Pre-2015 narrative coverage is too thin to use (§4) |
+| **Narrative coverage** | **0.2266** all-time, 0.2312 since 2015 | Never quote a rate over narrative complaints as a rate over all complaints (§3.1) |
+| Distinct `Product` / `Issue` | 21 / 178 | Across both schema eras (§3.4) |
 | 2015+, with narrative, post-dedup | target ≤ 3×10⁶ | This is the embedding workload |
 
 Embedding 3M narratives: ~20–40 min on a single modern GPU, ~2–5 h on CPU with batching.

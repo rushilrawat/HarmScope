@@ -184,6 +184,21 @@ def test_validate_sees_the_loaded_rows(con, csv_path):
     assert seen["n"] == 3
 
 
+def test_rows_without_a_complaint_id_are_dropped(con, tmp_path):
+    """0.035% of the real snapshot has no Complaint ID. Such a row has no
+    primary key, so nothing downstream can reference it — but the caller
+    reconciles CSV rows against loaded rows, so the drop is never silent."""
+    unkeyed = ROWS[1].rsplit(",", 1)[0] + ","
+    p = tmp_path / "unkeyed.csv"
+    p.write_text(HEADER + "\n" + ROWS[0] + "\n" + unkeyed + "\n")
+
+    assert csv_row_count(con, p) == 2
+    assert load_raw(con, p) == 1  # the gap is what the caller checks
+    assert con.execute(
+        "SELECT complaint_id FROM complaints_raw"
+    ).fetchall() == [(6681519,)]
+
+
 def test_column_map_covers_every_schema_column(con):
     """Every column in complaints_raw is populated by the loader."""
     schema_cols = {

@@ -27,8 +27,13 @@ fmt: $(VENV)
 download: $(VENV)
 	$(PY) -m src.pipeline run --phase download
 
-## extract: unzip the snapshot (~15 GB). Separate on purpose — the archive is
-## the reproducibility anchor; the CSV is just what DuckDB can read.
+## gzip: restream the snapshot as .csv.gz (~1.4 GB). DuckDB reads gzip natively
+## but cannot read a zip member, so this is the cheapest path to queryable.
+gzip: $(VENV)
+	$(PY) -m src.pipeline run --phase download --gzip
+
+## extract: unzip to plain CSV (~9 GB). Only if you need the raw file itself;
+## `make gzip` is enough for the pipeline.
 extract: $(VENV)
 	$(PY) -m src.pipeline run --phase download --extract
 
