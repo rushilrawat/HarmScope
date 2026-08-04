@@ -113,14 +113,31 @@ def concentration_sql(run_id: str, column: str) -> str:
     """
 
 
-def count_signals(row: dict, cfg: DedupConfig) -> int:
-    """How many of the six signals fire. Stored so a flag is auditable."""
+def count_signals(
+    row: dict, cfg: DedupConfig, baseline: dict[str, float] | None = None
+) -> int:
+    """How many of the six signals fire. Stored so a flag is auditable.
+
+    `baseline` maps `{family: hhi}` per concentration column; a concentration
+    signal fires when the group exceeds its own family's baseline by
+    `concentration_ratio`. Absolute thresholds were measured degenerate — see
+    the note on `DedupConfig.concentration_ratio`.
+    """
+    baseline = baseline or {}
+    family = row.get("product_family")
+
+    def concentrated(col: str) -> bool:
+        value = row.get(col)
+        base = baseline.get(f"{col}:{family}")
+        if value is None or not base:
+            return False
+        return value > base * cfg.concentration_ratio
+
     checks = (
         (row.get("burstiness") or 0) > cfg.burstiness_threshold,
-        (row.get("state_concentration") or 0) > cfg.state_concentration_threshold,
-        (row.get("company_concentration") or 0) > cfg.company_concentration_threshold,
-        (row.get("submitted_via_concentration") or 0)
-        > cfg.submitted_via_concentration_threshold,
+        concentrated("state_concentration"),
+        concentrated("company_concentration"),
+        concentrated("submitted_via_concentration"),
         # Templates have unnaturally LOW length variance — note the direction.
         (row.get("length_cv") if row.get("length_cv") is not None else 1.0)
         < cfg.length_cv_threshold,
@@ -129,7 +146,38 @@ def count_signals(row: dict, cfg: DedupConfig) -> int:
     return sum(bool(c) for c in checks)
 
 
-def is_flagged(row: dict, cfg: DedupConfig) -> bool:
+def family_baselines(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
+    """`{"<column>:<family>": hhi}` over every complaint in the family.
+
+    This is what "concentrated" is measured against: a credit-reporting group
+    split across three bureaus is normal for its family, the same split in
+    mortgage would be extraordinary.
+    """
+    out: dict[str, float] = {}
+    for col, expr in (
+        ("state_concentration", "c.state"),
+        ("company_concentration", "c.company_id"),
+        ("submitted_via_concentration", "r.submitted_via"),
+    ):
+        rows = con.execute(
+            f"""
+            WITH per AS (
+              SELECT c.product_family AS f, {expr} AS v, count(*) AS n
+              FROM complaints c JOIN complaints_raw r USING (complaint_id)
+              JOIN narratives USING (complaint_id) GROUP BY 1, 2
+            ), tot AS (SELECT f, sum(n) AS t FROM per GROUP BY 1)
+            SELECT per.f, sum(pow(per.n::DOUBLE / tot.t, 2))
+            FROM per JOIN tot USING (f) GROUP BY 1
+            """
+        ).fetchall()
+        for family, hhi in rows:
+            out[f"{col}:{family}"] = hhi
+    return out
+
+
+def is_flagged(
+    row: dict, cfg: DedupConfig, baseline: dict[str, float] | None = None
+) -> bool:
     """Flag a candidate as a campaign.
 
     Size gate first: a three-complaint group is not a mass filing whatever its
@@ -138,7 +186,7 @@ def is_flagged(row: dict, cfg: DedupConfig) -> bool:
     """
     if row["n_complaints"] < cfg.campaign_min_size:
         return False
-    return count_signals(row, cfg) >= cfg.campaign_min_signals
+    return count_signals(row, cfg, baseline) >= cfg.campaign_min_signals
 
 
 def boilerplate_share(con: duckdb.DuckDBPyConnection) -> float:

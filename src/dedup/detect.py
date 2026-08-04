@@ -247,11 +247,12 @@ def build_campaigns(
     if not records:
         return 0, 0
 
+    baseline = campaign.family_baselines(con)
     rows = []
     members = []
     for i, rec in enumerate(dict(zip(cols, r, strict=True)) for r in records):
-        n_sig = campaign.count_signals(rec, cfg.dedup)
-        flagged = campaign.is_flagged(rec, cfg.dedup)
+        n_sig = campaign.count_signals(rec, cfg.dedup, baseline)
+        flagged = campaign.is_flagged(rec, cfg.dedup, baseline)
         cid = make_campaign_id(run_id, i)
         rows.append((
             cid, run_id, int(rec["n_complaints"]), 1,

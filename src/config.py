@@ -97,7 +97,24 @@ class DedupConfig:
 
     minhash_perms: int = 128
     shingle_size: int = 5               # character 5-shingles beat word shingles here
-    jaccard_threshold: float = 0.85
+    # Tuned on the 300-pair labelled set (METHODOLOGY §2.2 sanctions this),
+    # 2026-08-04. At the spec's 0.85 precision was 0.905 — the gate needs 0.95.
+    # The cause was NOT a loose threshold but estimator noise: 128 permutations
+    # give a standard error of ~0.088, so pairs with true Jaccard just under
+    # 0.85 clear the bar about half the time. All 19 false positives were
+    # direct edges with upward drift; zero came from transitive closure.
+    #
+    #   0.85 -> P 0.9050  R 1.0000   fail
+    #   0.88 -> P 0.9632  R 0.8674   PASS  <- best recall among passing
+    #   0.90 -> P 0.9921  R 0.6961
+    #
+    # Trade-off, stated plainly: at 0.88 roughly 13% of true duplicates are
+    # missed. Those become separate groups, which INFLATES distinct-group
+    # counts and makes a signal look stronger than it is (METHODOLOGY §2.3
+    # weights 400 complaints in 380 groups as strong). That is the
+    # anti-conservative direction, and it is accepted only because §2.4 is
+    # explicit that a false merge destroys real signal outright.
+    jaccard_threshold: float = 0.88
     # Campaign detection (Tier 3). Hand-tuned against the labelled pair set;
     # deliberately not a supervised model — too few labels, features are readable.
     campaign_min_size: int = 20
@@ -106,11 +123,20 @@ class DedupConfig:
     # human has to be able to audit why a flag fired.
     campaign_min_signals: int = 3
     burstiness_threshold: float = 3.0            # Fano factor of daily counts
-    state_concentration_threshold: float = 0.25  # HHI over state
-    company_concentration_threshold: float = 0.50    # HHI over company_id
-    submitted_via_concentration_threshold: float = 0.95  # HHI over channel
-    boilerplate_threshold: float = 0.50          # share of members citing statute
-    length_cv_threshold: float = 0.20            # LOW variance is the signal
+    # Concentration signals are RELATIVE to the product family's own baseline,
+    # not absolute. Measured on the 2026-08-03 snapshot, absolute thresholds
+    # were degenerate: `submitted_via > 0.95` fired on 100% of candidates
+    # (almost everything arrives via Web, so HHI is ~1.0 for any group) and
+    # `company > 0.50` fired on 0% (credit reporting splits across three
+    # bureaus, HHI ~0.33). A signal that always fires is worse than useless —
+    # it was silently adding +1 to every group's n_signals, turning
+    # campaign_min_signals=3 into an effective 2.
+    #
+    # "Organic harms spread, campaigns concentrate" (METHODOLOGY §2.2) is a
+    # claim about concentrating MORE than the surrounding family does.
+    concentration_ratio: float = 1.5   # group HHI / family baseline HHI
+    boilerplate_threshold: float = 0.50   # bimodal in practice; any 0.1-0.9 works
+    length_cv_threshold: float = 0.20     # LOW variance is the signal
     # Gate: docs/METHODOLOGY.md §2.4. False merges destroy real signal, so
     # precision is the binding constraint, not recall.
     min_precision: float = 0.95
