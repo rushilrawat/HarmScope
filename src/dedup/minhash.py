@@ -122,6 +122,62 @@ def jaccard(sig_a: np.ndarray, sig_b: np.ndarray) -> np.ndarray:
     return (sig_a == sig_b).mean(axis=-1)
 
 
+def star_cluster(n: int, edges: np.ndarray) -> np.ndarray:
+    """Group nodes so every member is within one hop of its seed.
+
+    Returns `label[i]` = the seed index of node i's group.
+
+    This replaces connected components, and the reason is the whole Phase 2
+    gate. Union-find merges A and Z whenever a chain A~B~...~Z exists with each
+    consecutive pair above threshold, even though A and Z are unrelated. On the
+    2026-08-04 corpus that produced a "duplicate group" of 84,657 members and a
+    mean group size of 3,709 — chains, not groups. Raising the pairwise
+    threshold cannot fix it: it only requires more hops, and with 12.9M edges
+    hops are abundant.
+
+    Star clustering bounds group diameter at 1 by construction: a member has to
+    clear the threshold against the *seed*, not against some other member. The
+    cost is that a genuine duplicate cluster wider than one hop gets split into
+    several groups — which is the safe direction, because METHODOLOGY §2.4 is
+    explicit that a false merge destroys real signal while a miss does not.
+
+    Seeds are taken highest-degree first, ties by lowest index: the canonical
+    copy of a template has the most neighbours, so it seeds its own group, and
+    the ordering is deterministic so the same corpus yields the same groups.
+    """
+    label = np.arange(n, dtype=np.int64)
+    if len(edges) == 0:
+        return label
+
+    src = np.concatenate([edges[:, 0], edges[:, 1]])
+    dst = np.concatenate([edges[:, 1], edges[:, 0]])
+    order = np.argsort(src, kind="stable")
+    src, dst = src[order], dst[order]
+
+    nodes = np.arange(n)
+    starts = np.searchsorted(src, nodes, side="left")
+    ends = np.searchsorted(src, nodes, side="right")
+    degree = ends - starts
+
+    label[:] = -1
+    # Only nodes with neighbours can seed a multi-member group; the rest are
+    # singletons and are filled in at the end.
+    seeds = np.lexsort((nodes, -degree))
+    seeds = seeds[degree[seeds] > 0]
+
+    for seed in seeds:
+        if label[seed] != -1:
+            continue
+        label[seed] = seed
+        neighbours = dst[starts[seed] : ends[seed]]
+        free = neighbours[label[neighbours] == -1]
+        label[free] = seed
+
+    singletons = label == -1
+    label[singletons] = nodes[singletons]
+    return label
+
+
 class UnionFind:
     """Path-compressed union-find over integer ids.
 

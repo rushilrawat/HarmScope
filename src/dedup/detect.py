@@ -152,18 +152,38 @@ def assign_groups(
     looking, so a group that gains members after a backtest cutoff does not
     retroactively change what a pre-cutoff run saw.
     """
-    uf = minhash.UnionFind()
-    for a, b in con.execute(
-        "SELECT complaint_id_a, complaint_id_b FROM dup_pairs "
-        "ORDER BY complaint_id_a, complaint_id_b"
-    ).fetchall():
-        uf.union(a, b)
+    # Exact duplicates are atomic: identical text, similarity 1.0 by
+    # definition, so they are collapsed first and only their representatives
+    # are star-clustered. Otherwise a seed could admit some members of an exact
+    # group and not others, splitting byte-identical documents.
+    exact = con.execute(
+        "SELECT complaint_id, min(complaint_id) OVER (PARTITION BY text_hash) "
+        "FROM narratives ORDER BY complaint_id"
+    ).fetchall()
+    rep_of = dict(exact)
+    reps = sorted({rep for _, rep in exact})
+    index = {rep: i for i, rep in enumerate(reps)}
 
-    groups = uf.groups()
+    edges = con.execute(
+        "SELECT complaint_id_a, complaint_id_b FROM dup_pairs "
+        "WHERE method = 'minhash' ORDER BY complaint_id_a, complaint_id_b"
+    ).fetchall()
+    pairs = np.array(
+        [(index[a], index[b]) for a, b in edges
+         if a in index and b in index],
+        dtype=np.int64,
+    ).reshape(-1, 2)
+
+    label = minhash.star_cluster(len(reps), pairs)
+    group_of_rep = {rep: f"g{reps[label[i]]}" for i, rep in enumerate(reps)}
+    assignment = {cid: group_of_rep[rep] for cid, rep in rep_of.items()}
+
+    sizes: dict[str, int] = {}
+    for gid in assignment.values():
+        sizes[gid] = sizes.get(gid, 0) + 1
     rows = [
-        (run_id, cid, f"g{root}", len(members), as_of)
-        for root, members in groups.items()
-        for cid in members
+        (run_id, cid, gid, sizes[gid], as_of)
+        for cid, gid in sorted(assignment.items())
     ]
     # Singletons are groups of one; they must still appear so that downstream
     # "distinct groups" counts are correct.

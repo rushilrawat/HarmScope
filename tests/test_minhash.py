@@ -8,13 +8,13 @@ import pytest
 from src.dedup.minhash import (
     BANDS,
     ROWS,
-    UnionFind,
     band_hashes,
     jaccard,
     permutations,
     shingles,
     signature,
     signatures,
+    star_cluster,
 )
 
 K = 5
@@ -196,29 +196,62 @@ def test_unrelated_documents_rarely_share_a_band(perms):
 
 
 # --------------------------------------------------------------------------
-# Union-find
+# Star clustering — bounded group diameter
 # --------------------------------------------------------------------------
-def test_union_find_builds_transitive_groups():
-    uf = UnionFind()
-    uf.union(1, 2)
-    uf.union(2, 3)
-    uf.union(10, 11)
-    groups = {frozenset(v) for v in uf.groups().values()}
-    assert groups == {frozenset({1, 2, 3}), frozenset({10, 11})}
+def test_star_cluster_does_not_chain():
+    """The Phase 2 gate failure in one test.
+
+    A~B~C~D with each consecutive pair above threshold but A and D unrelated.
+    Connected components merge all four; star clustering must not.
+    """
+    edges = np.array([[0, 1], [1, 2], [2, 3]], dtype=np.int64)
+    label = star_cluster(4, edges)
+    assert label[0] != label[3], "endpoints of a chain must not share a group"
+    assert len({int(x) for x in label}) >= 2
 
 
-def test_union_find_group_id_is_order_independent():
-    """Group identity must not depend on the order candidate pairs arrive in,
-    or the same corpus produces different dup_groups on a re-run."""
-    forward, backward = UnionFind(), UnionFind()
-    for x, y in [(5, 9), (9, 2), (2, 7)]:
-        forward.union(x, y)
-    for x, y in [(2, 7), (9, 2), (5, 9)]:
-        backward.union(x, y)
-    assert forward.groups() == backward.groups()
-    assert set(forward.groups()) == {2}  # smallest id is always the root
+def test_star_cluster_keeps_a_true_star_together():
+    """A template and all its variants share a seed, so they stay one group."""
+    edges = np.array([[0, 1], [0, 2], [0, 3], [0, 4]], dtype=np.int64)
+    label = star_cluster(5, edges)
+    assert len({int(x) for x in label}) == 1
 
 
-def test_singleton_is_its_own_root():
-    uf = UnionFind()
-    assert uf.find(42) == 42
+def test_star_cluster_seeds_highest_degree_first():
+    """Node 1 has three neighbours, node 0 has one; 1 should seed."""
+    edges = np.array([[0, 1], [1, 2], [1, 3]], dtype=np.int64)
+    label = star_cluster(4, edges)
+    assert label[1] == 1
+    assert label[0] == label[2] == label[3] == 1
+
+
+def test_star_cluster_isolated_nodes_are_singletons():
+    label = star_cluster(4, np.array([[0, 1]], dtype=np.int64))
+    assert label[2] == 2 and label[3] == 3
+    assert label[0] == label[1]
+
+
+def test_star_cluster_no_edges():
+    label = star_cluster(3, np.empty((0, 2), dtype=np.int64))
+    assert list(label) == [0, 1, 2]
+
+
+def test_star_cluster_is_deterministic():
+    edges = np.array([[0, 1], [1, 2], [2, 3], [3, 4], [1, 4]], dtype=np.int64)
+    a = star_cluster(5, edges)
+    b = star_cluster(5, edges[::-1].copy())
+    assert list(a) == list(b)
+
+
+def test_star_cluster_bounds_group_diameter():
+    """Every member must have a direct edge to its seed — the invariant that
+    makes an 84,657-member chain impossible."""
+    rng = np.random.default_rng(0)
+    n = 200
+    e = rng.integers(0, n, (600, 2))
+    e = e[e[:, 0] != e[:, 1]]
+    label = star_cluster(n, e)
+    adj = {(int(x), int(y)) for x, y in e} | {(int(y), int(x)) for x, y in e}
+    for node, seed in enumerate(label):
+        if node != seed:
+            assert (node, int(seed)) in adj, f"{node} not adjacent to seed {seed}"
