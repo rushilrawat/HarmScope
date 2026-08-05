@@ -136,8 +136,8 @@ actions in **2017–2024**. Per action record:
 | `company_raw` | company name as published |
 | `company_canonical_id` | FK into `company_canonical`; null if no complaint-DB match |
 | `product_family` | mapped to complaint-DB product family |
-| `harm_summary` | 1–2 sentences, your words |
-| `harm_keywords` | terms an analyst would expect in matching narratives |
+| `harm_summary` | CFPB's own published description, captured by the scraper. **Changed 2026-08-05** from "1–2 sentences, your words": curation happened after detection ran (`EVALUATION.md` §1.4), so anything written in the curator's words now would put post-hoc language into the file the adjudicator reads. The scraped text predates every signal. |
+| `harm_keywords` | **deliberately left empty.** `EVALUATION.md` §5 item 7 forbids these reaching the detection path; an empty column cannot leak even by accident. Enforced by test. |
 | `conduct_start` | approximate start of alleged conduct, if stated in the action |
 | `source_url` | |
 | `usable` | bool — false if no company match or no narratives in window |

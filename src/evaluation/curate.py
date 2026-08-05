@@ -152,7 +152,7 @@ def curate(
             "action_id": row["action_id"],
             "filed_date": row["filed_date"],
             "company_raw": row["company_raw"],
-            "company_id": company_id or "",
+            "company_canonical_id": company_id or "",
             "product_family": "",
             # CFPB's own description, captured by the scraper before any signal
             # existed. Writing a summary "in the curator's words" now would put
@@ -168,8 +168,12 @@ def curate(
     return rows, tally
 
 
+# Column names follow DATA.md §4, which names the CSV field
+# `company_canonical_id` while db/schema.sql calls the table column
+# `company_id`. Keeping the CSV aligned with the candidates file it is derived
+# from matters more than matching the table it is loaded into; `load()` maps.
 HEADER = [
-    "action_id", "filed_date", "company_raw", "company_id", "product_family",
+    "action_id", "filed_date", "company_raw", "company_canonical_id", "product_family",
     "harm_summary", "harm_keywords", "conduct_start", "source_url",
     "usable", "exclusion_reason", "resolution_method",
 ]
@@ -194,7 +198,7 @@ def load(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
         "source_url, usable, exclusion_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         [
             (r["action_id"], r["filed_date"], r["company_raw"],
-             r["company_id"] or None, r["product_family"] or None,
+             r["company_canonical_id"] or None, r["product_family"] or None,
              r["harm_summary"] or None, None, None, r["source_url"],
              r["usable"] == "true", r["exclusion_reason"] or None)
             for r in rows

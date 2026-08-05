@@ -133,4 +133,4 @@ def test_committed_ground_truth_is_within_the_evaluable_window():
     for row in usable:
         filed = date.fromisoformat(row["filed_date"])
         assert curate.WINDOW_START <= filed <= curate.WINDOW_END
-        assert row["company_id"], "a usable action must resolve to a company"
+        assert row["company_canonical_id"], "a usable action must resolve to a company"
