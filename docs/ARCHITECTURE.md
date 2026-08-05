@@ -56,10 +56,10 @@ harmscope/
 │   │   ├── encode.py            # sentence-transformers -> .npy memmap
 │   │   └── index.py             # FAISS build / query
 │   ├── cluster/
-│   │   ├── reduce.py            # UMAP
-│   │   ├── fit.py               # HDBSCAN on sample
-│   │   ├── assign.py            # full-corpus assignment
-│   │   └── novelty.py           # novelty vs existing taxonomy
+│   │   ├── fit.py               # UMAP -> HDBSCAN on a per-family sample
+│   │   ├── assign.py            # centroid assignment over every representative
+│   │   ├── novelty.py           # novelty vs existing taxonomy + label ablation
+│   │   └── stability.py         # ARI across sample sizes and disjoint halves
 │   ├── signals/
 │   │   ├── timeseries.py        # cluster x period x company panels
 │   │   ├── disproportionality.py# PRR / ROR / shrinkage
@@ -293,6 +293,12 @@ CREATE TABLE cluster_members (
   PRIMARY KEY (cluster_id, complaint_id)
 );
 
+CREATE TABLE related_clusters (          -- same harm under two product families
+  cluster_id_a VARCHAR NOT NULL REFERENCES clusters(cluster_id),
+  cluster_id_b VARCHAR NOT NULL REFERENCES clusters(cluster_id),
+  similarity   DOUBLE NOT NULL,
+  PRIMARY KEY (cluster_id_a, cluster_id_b)
+);
 CREATE TABLE cluster_novelty (
   cluster_id            VARCHAR PRIMARY KEY,
   dominant_label        VARCHAR,        -- most common (issue, sub_issue) tuple

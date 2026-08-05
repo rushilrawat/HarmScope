@@ -171,6 +171,10 @@ class ClusterConfig:
     fit_sample_size: int = 500_000
     stability_sample_sizes: tuple[int, ...] = (100_000, 250_000, 500_000)
     assign_max_distance: float = 0.35    # beyond this, a point becomes noise
+    # METHODOLOGY §4.2: clusters in different families this close are the same
+    # harm under two products. Higher than assign_max_distance implies, because
+    # two centroids agreeing is a stronger claim than a point sitting near one.
+    related_min_similarity: float = 0.80
 
 
 @dataclass(frozen=True)

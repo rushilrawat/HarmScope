@@ -197,6 +197,17 @@ CREATE TABLE IF NOT EXISTS cluster_members (
   PRIMARY KEY (cluster_id, complaint_id)
 );
 
+-- METHODOLOGY §4.2: clusters in different families whose centroids are close
+-- are the same harm surfacing under two products. Ordered pair (a < b) so a
+-- link is stored once. Added by migration 005 — specified since Phase 0, absent
+-- from this file until Phase 4 needed it.
+CREATE TABLE IF NOT EXISTS related_clusters (
+  cluster_id_a VARCHAR NOT NULL REFERENCES clusters(cluster_id),
+  cluster_id_b VARCHAR NOT NULL REFERENCES clusters(cluster_id),
+  similarity   DOUBLE NOT NULL,   -- cosine between the two cluster centroids
+  PRIMARY KEY (cluster_id_a, cluster_id_b)
+);
+
 CREATE TABLE IF NOT EXISTS cluster_novelty (
   cluster_id             VARCHAR PRIMARY KEY REFERENCES clusters(cluster_id),
   dominant_label         VARCHAR,       -- most common (issue_std, sub_issue_std) tuple

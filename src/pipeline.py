@@ -411,6 +411,252 @@ def cmd_neighbours(args: argparse.Namespace) -> int:
     return 0
 
 
+def _representatives(con, dedup_run: str, model: str) -> tuple[dict, dict]:
+    """`{product_family: memmap row indices}` for this dedup run's representatives.
+
+    Clustering consumes representatives only (METHODOLOGY §2.3) — one document
+    per dup group, so a 24,507-member template contributes one point rather than
+    24,507. Phase 5 expands back through `dup_groups` for its counts.
+    """
+    import numpy as np
+
+    rows = con.execute(
+        """
+        SELECT c.product_family, e.row_idx, d.complaint_id
+        FROM dup_groups d
+        JOIN complaints c USING (complaint_id)
+        JOIN embedding_map e USING (complaint_id)
+        WHERE d.run_id = ? AND d.is_representative AND e.model = ?
+        ORDER BY c.product_family, d.complaint_id
+        """,
+        [dedup_run, model],
+    ).fetchall()
+    out: dict[str, list] = {}
+    ids: dict[str, list] = {}
+    for family, row_idx, complaint_id in rows:
+        out.setdefault(family, []).append(row_idx)
+        ids.setdefault(family, []).append(complaint_id)
+    return (
+        {f: np.asarray(v, dtype=np.int64) for f, v in out.items()},
+        {f: np.asarray(v, dtype=np.int64) for f, v in ids.items()},
+    )
+
+
+def phase_cluster(args: argparse.Namespace) -> int:
+    """Phase 4 [GATE] — UMAP + HDBSCAN per family, assignment, novelty."""
+    import numpy as np
+
+    from src.cluster import assign as assign_mod
+    from src.cluster import fit as fit_mod
+    from src.ids import cluster_id as make_cluster_id
+
+    con = db.bootstrap()
+    model = args.model or CONFIG.embed.model
+    memmap = PATHS.artifacts / f"embeddings.{model.split('/')[-1]}.npy"
+    if not memmap.exists():
+        raise SystemExit(f"no embeddings at {memmap} — run `--phase embed` first")
+    vectors = np.load(memmap, mmap_mode="r")
+
+    dedup_run = args.dedup_run or latest_run(con, "dedup")
+    as_of = con.execute("SELECT max(date_received) FROM complaints").fetchone()[0]
+    by_family, ids_by_family = _representatives(con, dedup_run, model)
+    families = [f for f in sorted(by_family, key=lambda f: -len(by_family[f]))
+                if not args.family or f == args.family]
+
+    params = {"model": model, "dedup_run": dedup_run, "limit": args.limit,
+              "family": args.family}
+    totals = {"clusters": 0, "assigned": 0, "reps": 0}
+    with db.run(con, "cluster", CONFIG, params=params) as r:
+        con.execute(f"DELETE FROM cluster_novelty WHERE cluster_id LIKE '{r.run_id}:%'")
+        con.execute(f"DELETE FROM cluster_members WHERE cluster_id LIKE '{r.run_id}:%'")
+        con.execute("DELETE FROM related_clusters WHERE cluster_id_a LIKE ?",
+                    [f"{r.run_id}:%"])
+        con.execute("DELETE FROM clusters WHERE run_id = ?", [r.run_id])
+
+        print(f"dedup run  : {dedup_run}")
+        print(f"model      : {model}\nas_of      : {as_of}\n")
+        centroids_by_family: dict[str, np.ndarray] = {}
+        cluster_ids: dict[str, list[str]] = {}
+
+        for family in families:
+            rows, complaint_ids = by_family[family], ids_by_family[family]
+            totals["reps"] += len(rows)
+            result = fit_mod.fit_family(
+                vectors, rows, family, CONFIG.cluster, CONFIG.seed,
+                sample_size=args.limit or None,
+            )
+            if result is None or result.n_clusters == 0:
+                continue
+
+            # Every representative goes through the same rule, sampled or not —
+            # see the note in cluster/fit.py on why that symmetry matters.
+            labels, sims = assign_mod.assign(
+                vectors, rows, result.centroids, CONFIG.cluster.assign_max_distance
+            )
+            coherence = assign_mod.coherence(labels, sims, result.n_clusters)
+            medoid = assign_mod.medoids(vectors, rows, labels, sims, result.n_clusters)
+            assigned = labels != assign_mod.NOISE
+            totals["assigned"] += int(assigned.sum())
+
+            local_ids = []
+            cluster_rows, member_rows = [], []
+            for c in range(result.n_clusters):
+                member = labels == c
+                n_members = int(member.sum())
+                if n_members == 0:
+                    local_ids.append(None)
+                    continue
+                cid = make_cluster_id(r.run_id, family, c)
+                local_ids.append(cid)
+                cluster_rows.append((
+                    cid, r.run_id, family, n_members,
+                    float(result.persistence[c]) if c < len(result.persistence) else 0.0,
+                    float(coherence[c]), int(medoid[c]), as_of,
+                ))
+                for pos in np.flatnonzero(member):
+                    member_rows.append((
+                        cid, int(complaint_ids[pos]), float(sims[pos]),
+                        bool(rows[pos] == medoid[c]),
+                    ))
+            con.executemany(
+                "INSERT INTO clusters (cluster_id, run_id, product_family, n_members,"
+                " persistence, coherence, centroid_idx, as_of) VALUES (?,?,?,?,?,?,?,?)",
+                cluster_rows,
+            )
+            con.executemany(
+                "INSERT INTO cluster_members (cluster_id, complaint_id, "
+                "membership_prob, is_exemplar) VALUES (?, ?, ?, ?)",
+                member_rows,
+            )
+            totals["clusters"] += len(cluster_rows)
+            centroids_by_family[family] = result.centroids
+            cluster_ids[family] = local_ids
+            print(f"  {'':<18} {len(cluster_rows):>5} kept  "
+                  f"assigned {assigned.mean():5.1%}  "
+                  f"mean coherence {coherence[coherence > 0].mean():.3f}")
+
+        n_novel = _write_novelty(con, r.run_id)
+        n_related = _write_related(con, centroids_by_family, cluster_ids)
+        checks.expect_rows(con, "clusters", min=1)
+        r.finish(output_rows=totals["clusters"], input_rows=totals["reps"])
+
+    print(f"\nclusters   : {totals['clusters']:,} over {totals['reps']:,} "
+          f"representatives")
+    print(f"assigned   : {totals['assigned']:,} "
+          f"({totals['assigned'] / max(totals['reps'], 1):.1%}); the rest are noise")
+    print(f"novel      : {n_novel:,} pass novelty + coherence + persistence")
+    print(f"related    : {n_related:,} cross-family links")
+    print("\nGATE: `pipeline stability` and `pipeline ablation` are the two "
+          "numbers ROADMAP Phase 4 turns on.")
+    return 0
+
+
+def _write_novelty(con, run_id: str) -> int:
+    """Score every cluster against the taxonomy it is supposed to be new to."""
+    from src.cluster import novelty as novelty_mod
+
+    members = _cluster_label_members(con, run_id)
+    space = dict(con.execute(
+        "SELECT product_family, count(DISTINCT (issue_std, sub_issue_std)) "
+        "FROM complaints GROUP BY 1"
+    ).fetchall())
+    meta = dict(con.execute(
+        "SELECT cluster_id, (product_family, coherence, persistence) FROM clusters "
+        "WHERE run_id = ?", [run_id],
+    ).fetchall())
+
+    rows = []
+    for cluster_id, pairs in members.items():
+        family, coherence, persistence = meta[cluster_id]
+        nov = novelty_mod.score_cluster(
+            [novelty_mod.label_of(i, s) for i, s in pairs],
+            space.get(family, 2), CONFIG.novelty,
+        )
+        rows.append((
+            cluster_id, nov.dominant_label, nov.dominant_share, nov.entropy,
+            _family_nmi(con, run_id, family), nov.score,
+            novelty_mod.is_novel(nov, coherence or 0.0, persistence or 0.0,
+                                 CONFIG.novelty),
+        ))
+    con.executemany(
+        "INSERT INTO cluster_novelty (cluster_id, dominant_label, "
+        "dominant_label_share, label_entropy, normalized_mutual_info, "
+        "novelty_score, is_novel) VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
+    return sum(1 for r in rows if r[-1])
+
+
+_NMI_CACHE: dict[tuple[str, str], float] = {}
+
+
+def _family_nmi(con, run_id: str, family: str) -> float:
+    """NMI between cluster assignment and label assignment, within a family.
+
+    METHODOLOGY §5 calls for this "computed globally"; the schema stores it per
+    cluster. It is a property of a whole partition, not of one cluster, so the
+    family's value is written onto each of its clusters and cached rather than
+    recomputed per row.
+    """
+    key = (run_id, family)
+    if key in _NMI_CACHE:
+        return _NMI_CACHE[key]
+    from sklearn.metrics import normalized_mutual_info_score
+
+    pairs = con.execute(
+        """
+        SELECT m.cluster_id, coalesce(c.issue_std, '') || '|' || coalesce(c.sub_issue_std, '')
+        FROM cluster_members m
+        JOIN clusters cl USING (cluster_id)
+        JOIN complaints c ON c.complaint_id = m.complaint_id
+        WHERE cl.run_id = ? AND cl.product_family = ?
+        """,
+        [run_id, family],
+    ).fetchall()
+    value = 0.0
+    if len(pairs) > 1:
+        value = float(normalized_mutual_info_score([a for a, _ in pairs],
+                                                   [b for _, b in pairs]))
+    _NMI_CACHE[key] = value
+    return value
+
+
+def _cluster_label_members(
+    con, run_id: str, family: str | None = None
+) -> dict[str, list[tuple[str | None, str | None]]]:
+    rows = con.execute(
+        """
+        SELECT m.cluster_id, c.issue_std, c.sub_issue_std
+        FROM cluster_members m
+        JOIN clusters cl USING (cluster_id)
+        JOIN complaints c ON c.complaint_id = m.complaint_id
+        WHERE cl.run_id = ? AND (? IS NULL OR cl.product_family = ?)
+        """,
+        [run_id, family, family],
+    ).fetchall()
+    out: dict[str, list] = {}
+    for cluster_id, issue, sub_issue in rows:
+        out.setdefault(cluster_id, []).append((issue, sub_issue))
+    return out
+
+
+def _write_related(con, centroids: dict, cluster_ids: dict) -> int:
+    from src.cluster import assign as assign_mod
+
+    links = assign_mod.related(centroids, CONFIG.cluster.related_min_similarity)
+    rows = []
+    for fa, ia, fb, ib, sim in links:
+        a, b = cluster_ids[fa][ia], cluster_ids[fb][ib]
+        if a and b:
+            rows.append((a, b, sim) if a < b else (b, a, sim))
+    if rows:
+        con.executemany(
+            "INSERT INTO related_clusters (cluster_id_a, cluster_id_b, similarity) "
+            "VALUES (?, ?, ?) ON CONFLICT DO NOTHING", rows,
+        )
+    return len(rows)
+
+
 def latest_run(con, phase: str) -> str:
     """The most recent successful run of `phase`. Everything Phase 2 reports is
     run-scoped, so reading the wrong run is silently wrong, not an error."""
@@ -741,6 +987,178 @@ def cmd_adjudicate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _family_rows(con, dedup_run: str, model: str, family: str):
+    import numpy as np
+
+    rows = con.execute(
+        """
+        SELECT e.row_idx FROM dup_groups d
+        JOIN complaints c USING (complaint_id)
+        JOIN embedding_map e USING (complaint_id)
+        WHERE d.run_id = ? AND d.is_representative AND e.model = ?
+          AND c.product_family = ? ORDER BY d.complaint_id
+        """,
+        [dedup_run, model, family],
+    ).fetchall()
+    return np.asarray([r[0] for r in rows], dtype=np.int64)
+
+
+def cmd_stability(args: argparse.Namespace) -> int:
+    """ROADMAP Phase 4 gate — ARI between disjoint halves, and across sample sizes.
+
+    Reports whatever it finds. METHODOLOGY §4.3: "Report the ARI in the README
+    regardless of what it says."
+    """
+    import numpy as np
+
+    from src.cluster import stability
+
+    con = db.connect(read_only=True)
+    model = args.model or CONFIG.embed.model
+    memmap = PATHS.artifacts / f"embeddings.{model.split('/')[-1]}.npy"
+    vectors = np.load(memmap, mmap_mode="r")
+    dedup_run = args.dedup_run or latest_run(con, "dedup")
+
+    families = args.family.split(",") if args.family else ["credit_reporting"]
+    for family in families:
+        rows = _family_rows(con, dedup_run, model, family)
+        print(f"\n{'=' * 72}\n{family}: {len(rows):,} representatives\n{'=' * 72}")
+
+        print("\ndisjoint halves (the gate's headline number):")
+        halves = stability.disjoint_halves(
+            vectors, rows, family, CONFIG.cluster, CONFIG.seed,
+            eval_size=args.eval_size,
+        )
+        if halves.get("ari") is None:
+            print("  not computable — a half produced no clusters")
+        else:
+            print(f"  half sizes      {halves['half_sizes'][0]:,} / "
+                  f"{halves['half_sizes'][1]:,}, evaluated on {halves['eval_size']:,} "
+                  f"held-out points neither half saw")
+            print(f"  clusters        {halves['n_clusters'][0]} / {halves['n_clusters'][1]}")
+            print(f"  fit noise       {halves['fit_noise'][0]:.1%} / "
+                  f"{halves['fit_noise'][1]:.1%}")
+            print(f"  assigned        {halves['assigned_fraction'][0]:.1%} / "
+                  f"{halves['assigned_fraction'][1]:.1%}")
+            print(f"  ARI             {halves['ari']:.4f}  "
+                  f"over {halves['n_compared']:,} points both assigned")
+
+        sizes = tuple(s for s in CONFIG.cluster.stability_sample_sizes
+                      if s <= len(rows))
+        if len(sizes) < 2:
+            print(f"\nsample-size sweep: needs two of "
+                  f"{CONFIG.cluster.stability_sample_sizes}, family has "
+                  f"{len(rows):,} — skipped")
+            continue
+        print(f"\nsample-size sweep {sizes}:")
+        sweep = stability.sample_size_sweep(
+            vectors, rows, family, CONFIG.cluster, CONFIG.seed, sizes,
+            eval_size=args.eval_size,
+        )
+        print(f"  {'size':>9} {'clusters':>9} {'fit noise':>10} {'assigned':>9} "
+              f"{'ARI vs largest':>15}")
+        for run in sweep["runs"]:
+            print(f"  {run['size']:>9,} {run['n_clusters']:>9} "
+                  f"{run['fit_noise']:>9.1%} {run['assigned_fraction']:>9.1%} "
+                  f"{run['ari_vs_largest']:>15.4f}")
+    return 0
+
+
+def cmd_ablation(args: argparse.Namespace) -> int:
+    """ROADMAP Phase 4 gate — can novelty recover deliberately hidden Issues?
+
+    "If the score cannot recover deliberately hidden categories, it will not
+    find real new ones" (METHODOLOGY §5.1).
+    """
+    from src.cluster import novelty as novelty_mod
+
+    con = db.connect(read_only=True)
+    run_id = args.run_id or latest_run(con, "cluster")
+    space = dict(con.execute(
+        "SELECT product_family, count(DISTINCT (issue_std, sub_issue_std)) "
+        "FROM complaints GROUP BY 1"
+    ).fetchall())
+    families = con.execute(
+        "SELECT product_family, count(*) FROM clusters WHERE run_id = ? "
+        "GROUP BY 1 ORDER BY 2 DESC", [run_id],
+    ).fetchall()
+
+    print(f"run   : {run_id}")
+    print(f"bound : AUC >= {CONFIG.novelty.ablation_min_auc} "
+          f"over {CONFIG.novelty.ablation_n_issues} hidden issues\n")
+    print(f"{'family':<18} {'clusters':>9} {'issues':>7} {'mean AUC':>9} "
+          f"{'pooled':>8}  verdict")
+    overall = []
+    for family, n_clusters in families:
+        members = _cluster_label_members(con, run_id, family)
+        report = novelty_mod.ablation_auc(members, space.get(family, 2), CONFIG.novelty)
+        if report["mean_auc"] is None:
+            print(f"{family:<18} {n_clusters:>9} {'—':>7} {'—':>9} {'—':>8}  "
+                  f"no issue dominates a cluster")
+            continue
+        overall.append(report["mean_auc"])
+        verdict = "PASS" if report["passes"] else "FAIL"
+        print(f"{family:<18} {n_clusters:>9} {report['n_issues']:>7} "
+              f"{report['mean_auc']:>9.4f} {report['pooled_auc']:>8.4f}  {verdict}")
+        if args.verbose:
+            for row in sorted(report["per_issue"], key=lambda r: r["auc"]):
+                print(f"    {row['auc']:.4f}  n={row['n_positive']:<4} {row['issue'][:64]}")
+    if overall:
+        mean = sum(overall) / len(overall)
+        print(f"\nacross {len(overall)} families: mean AUC {mean:.4f} — "
+              f"{'PASS' if mean >= CONFIG.novelty.ablation_min_auc else 'FAIL'}")
+    return 0
+
+
+def cmd_clusters(args: argparse.Namespace) -> int:
+    """ROADMAP Phase 4 gate — read N random clusters. Can you name each one?
+
+    "If not, `min_cluster_size` is wrong." No statistic answers this.
+    """
+    import random
+
+    con = db.connect(read_only=True)
+    run_id = args.run_id or latest_run(con, "cluster")
+    rows = con.execute(
+        """
+        SELECT c.cluster_id, c.product_family, c.n_members, c.coherence,
+               c.persistence, n.novelty_score, n.dominant_label, n.is_novel,
+               n.dominant_label_share
+        FROM clusters c LEFT JOIN cluster_novelty n USING (cluster_id)
+        WHERE c.run_id = ? ORDER BY c.cluster_id
+        """,
+        [run_id],
+    ).fetchall()
+    if not rows:
+        raise SystemExit(f"no clusters for run {run_id}")
+    rng = random.Random(CONFIG.seed)  # noqa: S311 - sampling, not cryptography
+    picked = rows if args.novel_only else rng.sample(rows, min(args.n, len(rows)))
+    if args.novel_only:
+        picked = [r for r in rows if r[7]]
+        picked = rng.sample(picked, min(args.n, len(picked)))
+
+    for (cid, family, n_members, coh, pers, score, dominant, novel,
+         share) in picked:
+        print(f"\n{'=' * 72}")
+        print(f"[{family}] {n_members:,} members  coherence {coh:.3f}  "
+              f"persistence {pers:.3f}")
+        print(f"novelty {score:.3f}{'  NOVEL' if novel else ''}   "
+              f"dominant label ({share:.0%}): {dominant}")
+        print("-" * 72)
+        for (text,) in con.execute(
+            """
+            SELECT any_value(n.text_redacted) FROM cluster_members m
+            JOIN narratives n USING (complaint_id)
+            WHERE m.cluster_id = ?
+            GROUP BY m.complaint_id
+            ORDER BY m.is_exemplar DESC, m.membership_prob DESC LIMIT ?
+            """,
+            [cid, args.k],
+        ).fetchall():
+            print("  • " + " ".join(text.split())[:240])
+    return 0
+
+
 def cmd_taxonomy(args: argparse.Namespace) -> int:
     """Print the label vocabulary the crosswalk has to cover, by volume."""
     con = db.connect(read_only=True)
@@ -768,10 +1186,10 @@ PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
     "normalize": phase_normalize,
     "dedup": phase_dedup,
     "embed": phase_embed,
+    "cluster": phase_cluster,
 }
 
 PLANNED: dict[str, str] = {
-    "cluster": "ROADMAP Phase 4 [GATE] — UMAP + HDBSCAN + novelty scoring",
     "signals": "ROADMAP Phase 5 — disproportionality, changepoint, FDR",
     "backtest": "ROADMAP Phase 6 [GATE] — point-in-time harness",
     "baselines": "ROADMAP Phase 7 — B0 volume, B1 taxonomy, B2 LDA, B3 BERTopic",
@@ -845,7 +1263,10 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--model", help="embedding model (default: config)")
     p_run.add_argument("--batch", type=int, help="encode batch size")
     p_run.add_argument("--device", help="cpu | mps | cuda (default: autodetect)")
-    p_run.add_argument("--limit", type=int, help="encode only the first N texts")
+    p_run.add_argument("--limit", type=int,
+                       help="encode only the first N texts; cluster: fit sample size")
+    p_run.add_argument("--dedup-run", help="dedup run whose representatives to cluster")
+    p_run.add_argument("--family", help="cluster only this product family")
     p_run.set_defaults(func=cmd_run)
 
     p_gate = sub.add_parser("gate", help="Phase 2 gate report: precision, recall, "
@@ -874,6 +1295,25 @@ def main(argv: list[str] | None = None) -> int:
     p_nn.add_argument("-k", type=int, default=5, help="neighbours per query")
     p_nn.add_argument("--model")
     p_nn.set_defaults(func=cmd_neighbours)
+
+    p_stab = sub.add_parser("stability", help="Phase 4 gate: ARI across refits")
+    p_stab.add_argument("--family", help="comma-separated; default credit_reporting")
+    p_stab.add_argument("--dedup-run")
+    p_stab.add_argument("--model")
+    p_stab.add_argument("--eval-size", type=int, default=50_000)
+    p_stab.set_defaults(func=cmd_stability)
+
+    p_abl = sub.add_parser("ablation", help="Phase 4 gate: label-ablation AUC")
+    p_abl.add_argument("--run-id")
+    p_abl.add_argument("-v", "--verbose", action="store_true")
+    p_abl.set_defaults(func=cmd_ablation)
+
+    p_cl = sub.add_parser("clusters", help="Phase 4 gate: read N random clusters")
+    p_cl.add_argument("-n", type=int, default=15)
+    p_cl.add_argument("-k", type=int, default=4, help="narratives per cluster")
+    p_cl.add_argument("--run-id")
+    p_cl.add_argument("--novel-only", action="store_true")
+    p_cl.set_defaults(func=cmd_clusters)
 
     p_tax = sub.add_parser("taxonomy", help="label vocabulary by volume")
     p_tax.set_defaults(func=cmd_taxonomy)
