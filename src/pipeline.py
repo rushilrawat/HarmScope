@@ -341,6 +341,46 @@ def cmd_gate(args: argparse.Namespace) -> int:
     print(f"recall        : {m['recall']:.4f}   (reported, not gated)")
     print(f"f1            : {m['f1']:.4f}")
 
+    # The labels were frozen when jaccard_threshold was 0.85; the detector now
+    # runs at 0.88. That cannot inflate precision — a pair the detector declines
+    # is never a false positive — but it does depress recall with pairs the
+    # detector is *right* to reject at its own operating point. Rescore on the
+    # restricted population rather than subtracting an estimate: MinHash SE is
+    # ~0.088, so a pair at 0.86 clears 0.88 about half the time and is a true
+    # positive, not a definitional miss. Only `recall` is meaningful here —
+    # every label in the subset is `dup`, so precision is 1.0 by construction.
+    thr = CONFIG.dedup.jaccard_threshold
+    label_bar = max(
+        (r["true_jaccard"] for r in rows if r["label"] == "not_dup"), default=0.0
+    )
+    at_thr = [r for r in rows if r["true_jaccard"] >= thr]
+    below = [r for r in rows if r["label"] == "dup" and r["true_jaccard"] < thr]
+    if below:
+        print(f"  labels frozen at ~{label_bar:.2f}, detector runs at {thr}: "
+              f"{len(below)} dup-labelled pairs sit below the detector's own "
+              f"threshold and are not its errors.")
+        try:
+            r_at = evalset.score(con, at_thr, run_id)["recall"]
+            print(f"  recall over the {len(at_thr)} pairs at or above {thr}: "
+                  f"{r_at:.4f}")
+        except ValueError:
+            print(f"  recall over the {len(at_thr)} pairs at or above {thr}: "
+                  f"n/a — no true positives in the subset, which is itself the "
+                  f"finding")
+
+    # d9ead66's diagnosis: MinHash overestimates near the bar. These merges are
+    # only not false positives because the label bar sits at 0.85.
+    over = sum(
+        1 for r in rows
+        if r["true_jaccard"] < thr and con.execute(
+            "SELECT count(*) = 2 AND count(DISTINCT group_id) = 1 FROM dup_groups "
+            "WHERE run_id = ? AND complaint_id IN (?, ?)",
+            [run_id, r["complaint_id_a"], r["complaint_id_b"]],
+        ).fetchone()[0]
+    )
+    print(f"  merged despite true Jaccard < {thr}: {over}  "
+          f"(MinHash overestimate near the bar)")
+
     for stratum in ("obvious", "hard", "unrelated"):
         sub = [r for r in rows if r["stratum"] == stratum]
         if sub:
@@ -357,7 +397,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
             note = f"P={s['precision']:.3f} R={s['recall']:.3f}" if s else "negatives"
             print(f"  {stratum:<10} n={len(sub):<4} errors={wrong:<3} {note}")
 
-    near = PATHS.ground_truth / evalset.NEAR_MISS_CSV
+    near = PATHS.interim / evalset.NEAR_MISS_CSV
     print("\nrejected candidates (recall denominator the eval file cannot see):")
     if not near.exists():
         print("  none captured — re-run `--phase dedup` to sample them")
@@ -415,9 +455,39 @@ def cmd_gate(args: argparse.Namespace) -> int:
     ).fetchall():
         print(f"  {fam:<18} {flagged:>9,} / {tot:>9,}  {flagged / tot:6.2%}")
 
+    if args.disputed:
+        _print_disputed(con, run_id, rows)
     if args.read:
         _print_reading_material(con, run_id, args.read)
     return 0
+
+
+def _print_disputed(con, run_id: str, rows: list[dict]) -> None:
+    """Every pair the detector and the reference label disagree on, with text.
+
+    Precision is the gated quantity and the labels are an exact-Jaccard proxy,
+    not a judgement about whether two complaints are the same filing. So the
+    false positives get read by a human before the gate is called either way —
+    that is the part of ROADMAP Phase 2's "hand-label" the proxy cannot supply.
+    """
+    print(f"\n{'=' * 72}\nDISPUTED PAIRS — read these before calling the gate\n{'=' * 72}")
+    for row in rows:
+        merged = con.execute(
+            "SELECT count(*) = 2 AND count(DISTINCT group_id) = 1 FROM dup_groups "
+            "WHERE run_id = ? AND complaint_id IN (?, ?)",
+            [run_id, row["complaint_id_a"], row["complaint_id_b"]],
+        ).fetchone()[0]
+        if merged == (row["label"] == "dup"):
+            continue
+        kind = "FALSE POSITIVE (merged, labelled not_dup)" if merged else \
+               "false negative (not merged, labelled dup)"
+        print(f"\n--- {kind}  tj={row['true_jaccard']:.4f}  {row['stratum']}")
+        for key in ("complaint_id_a", "complaint_id_b"):
+            text = con.execute(
+                "SELECT text_redacted FROM narratives WHERE complaint_id = ?",
+                [row[key]],
+            ).fetchone()
+            print(f"  [{row[key]}] " + " ".join((text[0] if text else "").split())[:600])
 
 
 def _print_reading_material(con, run_id: str, n: int) -> None:
@@ -559,6 +629,9 @@ def main(argv: list[str] | None = None) -> int:
     p_gate = sub.add_parser("gate", help="Phase 2 gate report: precision, recall, "
                                          "campaign share")
     p_gate.add_argument("--run-id", help="default: latest successful dedup run")
+    p_gate.add_argument("--disputed", action="store_true",
+                        help="print every pair the detector and the label "
+                             "disagree on, with narrative text, for hand reading")
     p_gate.add_argument("--read", type=int, default=0, metavar="N",
                         help="also print N flagged campaigns and N unflagged "
                              "groups for the manual read (trap T2)")

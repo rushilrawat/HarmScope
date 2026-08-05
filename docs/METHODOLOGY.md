@@ -37,6 +37,12 @@ small. **Star clustering**, not union-find, over the surviving pairs → `group_
 Character shingles beat word shingles here because templates vary mainly in inserted account
 numbers and dates.
 
+The threshold was swept once on the labelled pairs (0.85 → 0.88, see `ENGINEERING_NOTES.md`
+Phase 2) and is now frozen. **The labels are not re-derived when it moves.** They were fixed at
+the 0.85 reference and stay there, so precision keeps measuring over-merge against an
+independent bar rather than against whatever the detector currently does. The cost is that
+recall counts pairs in [0.85, 0.88) as misses; the gate report separates those from real ones.
+
 Union-find was the original design and it failed on the full corpus: transitive closure merges
 A and Z whenever a chain A~B~…~Z exists with each consecutive link above threshold, even where
 A and Z share nothing. That produced a single "duplicate group" of 84,657 members and 1.8M

@@ -28,8 +28,28 @@ Selection protocol (`docs/DATA.md` §4, trap T5):
 
 ## `dedup_eval_pairs.csv`
 
-300 hand-labelled narrative pairs, stratified 100 obvious duplicates / 100 hard
-near-duplicates / 100 unrelated (`docs/METHODOLOGY.md` §2.4).
+300 narrative pairs, stratified 100 obvious duplicates / 100 hard near-duplicates
+/ 100 unrelated (`docs/METHODOLOGY.md` §2.4).
+
+**These are not hand labels.** `label` is the exact character-5-shingle Jaccard
+thresholded at 0.85, and `label_source` records that per row. It is a genuinely
+independent reference for a detector that sees only a 128-permutation estimate
+and an LSH bucketing, but it does not answer "is this the same filing?", which
+is the judgement ROADMAP Phase 2 asks for. The frozen bar stays at 0.85 even
+though `jaccard_threshold` moved to 0.88, so precision keeps measuring
+over-merge against a fixed reference rather than against the detector's current
+operating point.
+
+Hand adjudication of the pairs the detector gets wrong is recorded in
+`dedup_eval_adjudicated.csv` when it exists — see `ENGINEERING_NOTES.md` Phase 2.
+
+## Not ground truth
+
+`dedup_near_misses.csv` is **detector output**, regenerated on every dedup run,
+and lives in `data/interim/`. It is the sample of LSH candidates the verifier
+rejected, which recall needs as a denominator and which nothing persists
+otherwise. It must never move into this directory: everything here is frozen
+before detection runs, and a file that rewrites itself cannot be.
 
 **Ids only — never narrative text.** This file is committed; `docs/DATA.md` §6
 forbids narrative text in git. Join the text from DuckDB at evaluation time.

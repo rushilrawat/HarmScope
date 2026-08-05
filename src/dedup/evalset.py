@@ -54,8 +54,14 @@ def write_near_misses(
     The rejected candidates exist only as an in-memory array inside the dedup
     run, so they are sampled here or they are gone. Deterministic stride sample
     over the near-miss band, ordered by similarity.
+
+    Written to `data/interim/`, **not** `data/ground_truth/`: this is detector
+    output regenerated on every run, and the ground-truth directory is frozen
+    before any detection runs (trap T5). A file that rewrites itself has no
+    business living behind a freeze protocol.
     """
-    path = path or PATHS.ground_truth / NEAR_MISS_CSV
+    path = path or PATHS.interim / NEAR_MISS_CSV
+    path.parent.mkdir(parents=True, exist_ok=True)
     lo = threshold - band
     keep = [i for i, s in enumerate(sims) if lo <= s < threshold]
     keep.sort(key=lambda i: (float(sims[i]), int(pairs[i, 0]), int(pairs[i, 1])))
