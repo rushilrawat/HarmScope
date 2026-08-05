@@ -135,25 +135,26 @@ CREATE TABLE IF NOT EXISTS dup_groups (
 );
 
 CREATE TABLE IF NOT EXISTS campaigns (        -- suspected mass filings; refit per cutoff
-  campaign_id                 VARCHAR PRIMARY KEY,  -- '{run_id}:campaign:{local_id}', see src/ids.py
-  run_id                      VARCHAR NOT NULL REFERENCES runs(run_id),
-  n_complaints                BIGINT NOT NULL,
-  n_groups                    BIGINT NOT NULL,
-  first_seen                  DATE, last_seen DATE,
-  top_company_id              VARCHAR,
-  product_family              VARCHAR NOT NULL,
-  -- All six signals from docs/METHODOLOGY.md §2.2. The flag is a count of how
-  -- many fire, not a trained model: too few labels, and the features are
-  -- readable enough that a human can audit a flag.
-  burstiness                  DOUBLE,   -- Fano factor of daily counts
-  state_concentration         DOUBLE,   -- HHI over state
-  company_concentration       DOUBLE,   -- HHI over company_id
-  submitted_via_concentration DOUBLE,   -- HHI over submission channel
-  length_cv                   DOUBLE,   -- coefficient of variation of char_len
-  boilerplate_score           DOUBLE,   -- share of members citing statute
-  n_signals                   INTEGER NOT NULL,
-  flagged                     BOOLEAN NOT NULL,
-  as_of                       DATE NOT NULL     -- features are time-windowed; docs/EVALUATION.md §1.1.1
+  campaign_id           VARCHAR PRIMARY KEY,  -- '{run_id}:campaign:{local_id}', see src/ids.py
+  run_id                VARCHAR NOT NULL REFERENCES runs(run_id),
+  n_complaints          BIGINT NOT NULL,
+  n_groups              BIGINT NOT NULL,
+  first_seen            DATE, last_seen DATE,
+  top_company_id        VARCHAR,
+  product_family        VARCHAR NOT NULL,
+  -- Five signals, not the six docs/METHODOLOGY.md §2.2 specifies: submission
+  -- channel is a constant over narratives ('Web', all 3,830,002 — DATA.md §5),
+  -- so it was dropped in migration 003. The flag is a count of how many fire,
+  -- not a trained model: too few labels, and the features are readable enough
+  -- that a human can audit a flag.
+  burstiness            DOUBLE,   -- Fano factor of daily counts
+  state_concentration   DOUBLE,   -- HHI over state
+  company_concentration DOUBLE,   -- HHI over company_id
+  length_cv             DOUBLE,   -- coefficient of variation of char_len
+  boilerplate_score     DOUBLE,   -- share of members citing statute
+  n_signals             INTEGER NOT NULL,
+  flagged               BOOLEAN NOT NULL,
+  as_of                 DATE NOT NULL     -- features are time-windowed; docs/EVALUATION.md §1.1.1
 );
 
 CREATE TABLE IF NOT EXISTS campaign_members (

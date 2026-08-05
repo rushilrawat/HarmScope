@@ -188,7 +188,10 @@ def assign_groups(
         for cid, gid in sorted(assignment.items())
     ]
     # Singletons are groups of one; they must still appear so that downstream
-    # "distinct groups" counts are correct.
+    # "distinct groups" counts are correct. `rep_of` is built from every
+    # narrative, so `assignment` already covers the whole corpus — a backfill
+    # pass for narratives missing from dup_groups used to run here and was
+    # verified to insert 0 rows of 3,830,002.
     con.execute(f"DELETE FROM dup_groups WHERE run_id = '{run_id}'")
     if rows:
         con.executemany(
@@ -196,17 +199,6 @@ def assign_groups(
             "is_representative, group_size, as_of) VALUES (?, ?, ?, false, ?, ?)",
             rows,
         )
-    con.execute(
-        f"""
-        INSERT INTO dup_groups (run_id, complaint_id, group_id,
-                                is_representative, group_size, as_of)
-        SELECT '{run_id}', n.complaint_id, 'g' || n.complaint_id, false, 1, ?
-        FROM narratives n
-        WHERE NOT EXISTS (SELECT 1 FROM dup_groups d
-                          WHERE d.run_id = '{run_id}' AND d.complaint_id = n.complaint_id)
-        """,
-        [as_of],
-    )
     con.execute(
         f"""
         UPDATE dup_groups SET is_representative = true
@@ -240,7 +232,6 @@ def build_campaigns(
     for name, expr in (
         ("_hhi_state", "c.state"),
         ("_hhi_company", "c.company_id"),
-        ("_hhi_via", "r.submitted_via"),
     ):
         con.execute(f"DROP TABLE IF EXISTS {name}")
         con.execute(
@@ -251,20 +242,17 @@ def build_campaigns(
         "group_id", "n_complaints", "first_seen", "last_seen", "product_family",
         "top_company_id", "burstiness", "length_cv", "boilerplate_score",
         "state_concentration", "company_concentration",
-        "submitted_via_concentration",
     ]
     records = con.execute(
         f"""
-        SELECT f.*, s.hhi AS state_concentration, co.hhi AS company_concentration,
-               v.hhi AS submitted_via_concentration
+        SELECT f.*, s.hhi AS state_concentration, co.hhi AS company_concentration
         FROM ({campaign.feature_sql(run_id)}) f
         LEFT JOIN _hhi_state   s  USING (group_id)
         LEFT JOIN _hhi_company co USING (group_id)
-        LEFT JOIN _hhi_via     v  USING (group_id)
         WHERE f.n_complaints >= {cfg.dedup.campaign_min_size}
         """
     ).fetchall()
-    for name in ("_hhi_state", "_hhi_company", "_hhi_via"):
+    for name in ("_hhi_state", "_hhi_company"):
         con.execute(f"DROP TABLE IF EXISTS {name}")
     if not records:
         return 0, 0
@@ -281,8 +269,7 @@ def build_campaigns(
             rec["first_seen"], rec["last_seen"], rec["top_company_id"],
             rec["product_family"], rec["burstiness"],
             rec["state_concentration"], rec["company_concentration"],
-            rec["submitted_via_concentration"], rec["length_cv"],
-            rec["boilerplate_score"], n_sig, flagged, as_of,
+            rec["length_cv"], rec["boilerplate_score"], n_sig, flagged, as_of,
         ))
         members.append((rec["group_id"], cid))
 
@@ -291,9 +278,9 @@ def build_campaigns(
     con.executemany(
         "INSERT INTO campaigns (campaign_id, run_id, n_complaints, n_groups, "
         "first_seen, last_seen, top_company_id, product_family, burstiness, "
-        "state_concentration, company_concentration, submitted_via_concentration, "
+        "state_concentration, company_concentration, "
         "length_cv, boilerplate_score, n_signals, flagged, as_of) "
-        "VALUES (" + ", ".join("?" * 17) + ")",
+        "VALUES (" + ", ".join("?" * 16) + ")",
         rows,
     )
     con.execute("DROP TABLE IF EXISTS _cmap")

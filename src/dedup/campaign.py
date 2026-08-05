@@ -113,31 +113,52 @@ def concentration_sql(run_id: str, column: str) -> str:
     """
 
 
+def expected_hhi(family_hhi: float, n: int) -> float:
+    """Expected HHI of `n` members drawn at random from a distribution of
+    concentration `family_hhi`.
+
+    For multinomial draws, `E[sum (n_i/n)^2] = H + (1 - H)/n`. Comparing a
+    20-member group's HHI against the family's raw H is not comparing like with
+    like: a 20-member group cannot have an HHI below 1/20 = 0.05 whatever it
+    does, so small groups clear a concentration bar by arithmetic. Measured on
+    the 2026-08-04 run, `state_concentration` fired for 84.7% of unflagged
+    candidates — the bar (1.5 x 0.0674 = 0.101) sat *below* the null
+    expectation for a 20-member group (0.114). The signal was firing on group
+    size, and the bias shrinks as n grows, so it was weakest on exactly the
+    large groups that are the real campaigns.
+    """
+    return family_hhi + (1.0 - family_hhi) / max(n, 1)
+
+
 def count_signals(
     row: dict, cfg: DedupConfig, baseline: dict[str, float] | None = None
 ) -> int:
-    """How many of the six signals fire. Stored so a flag is auditable.
+    """How many of the five signals fire. Stored so a flag is auditable.
 
-    `baseline` maps `{family: hhi}` per concentration column; a concentration
-    signal fires when the group exceeds its own family's baseline by
-    `concentration_ratio`. Absolute thresholds were measured degenerate — see
+    `baseline` maps `{column:family -> hhi}`; a concentration signal fires when
+    the group exceeds `concentration_ratio` times what a group of its size
+    would show by chance. Absolute thresholds were measured degenerate — see
     the note on `DedupConfig.concentration_ratio`.
+
+    Five, not six: `METHODOLOGY §2.2` specifies a `submitted_via` concentration
+    signal, and every narrative-bearing complaint in the corpus is `Web`
+    (`DATA.md §5`). It was a constant, never fired, and is gone.
     """
     baseline = baseline or {}
     family = row.get("product_family")
+    n = row.get("n_complaints") or 1
 
     def concentrated(col: str) -> bool:
         value = row.get(col)
         base = baseline.get(f"{col}:{family}")
         if value is None or not base:
             return False
-        return value > base * cfg.concentration_ratio
+        return value > expected_hhi(base, n) * cfg.concentration_ratio
 
     checks = (
         (row.get("burstiness") or 0) > cfg.burstiness_threshold,
         concentrated("state_concentration"),
         concentrated("company_concentration"),
-        concentrated("submitted_via_concentration"),
         # Templates have unnaturally LOW length variance — note the direction.
         (row.get("length_cv") if row.get("length_cv") is not None else 1.0)
         < cfg.length_cv_threshold,
@@ -147,24 +168,23 @@ def count_signals(
 
 
 def family_baselines(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
-    """`{"<column>:<family>": hhi}` over every complaint in the family.
+    """`{"<column>:<family>": hhi}` over every narrative in the family.
 
-    This is what "concentrated" is measured against: a credit-reporting group
-    split across three bureaus is normal for its family, the same split in
-    mortgage would be extraordinary.
+    This is what "concentrated" is measured against, after `expected_hhi()`
+    adjusts it for group size: a credit-reporting group split across three
+    bureaus is normal for its family, the same split in mortgage would be
+    extraordinary.
     """
     out: dict[str, float] = {}
     for col, expr in (
         ("state_concentration", "c.state"),
         ("company_concentration", "c.company_id"),
-        ("submitted_via_concentration", "r.submitted_via"),
     ):
         rows = con.execute(
             f"""
             WITH per AS (
               SELECT c.product_family AS f, {expr} AS v, count(*) AS n
-              FROM complaints c JOIN complaints_raw r USING (complaint_id)
-              JOIN narratives USING (complaint_id) GROUP BY 1, 2
+              FROM complaints c JOIN narratives USING (complaint_id) GROUP BY 1, 2
             ), tot AS (SELECT f, sum(n) AS t FROM per GROUP BY 1)
             SELECT per.f, sum(pow(per.n::DOUBLE / tot.t, 2))
             FROM per JOIN tot USING (f) GROUP BY 1
