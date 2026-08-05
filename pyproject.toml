@@ -13,6 +13,14 @@ requires-python = ">=3.11"
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+# faiss ships SWIG bindings that trip Python 3.12's check for __module__ on
+# builtin types. Third-party, harmless, and three lines of it per test session
+# drowns out warnings that are ours. Matched on the message so a real
+# DeprecationWarning from our own code still shows.
+filterwarnings = [
+  "ignore:builtin type Swig.* has no __module__ attribute:DeprecationWarning",
+  "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100

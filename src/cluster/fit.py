@@ -22,6 +22,7 @@ UMAP's seed as much as the data.
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -112,14 +113,22 @@ def fit_family(
 
     t0 = time.time()
     X = read_vectors(vectors, take)
-    reduced = umap.UMAP(
-        n_neighbors=cfg.umap_n_neighbors,
-        n_components=cfg.umap_n_components,
-        min_dist=cfg.umap_min_dist,
-        metric=cfg.umap_metric,
-        random_state=seed,
-        verbose=False,
-    ).fit_transform(X)
+    with warnings.catch_warnings():
+        # UMAP warns that `random_state` forces n_jobs=1. That is the trade this
+        # module exists to make — see the module docstring — so the warning is
+        # reporting intended behaviour, once per family. Matched narrowly: any
+        # other UMAP warning still surfaces.
+        warnings.filterwarnings(
+            "ignore", message=r"n_jobs value .* overridden", category=UserWarning
+        )
+        reduced = umap.UMAP(
+            n_neighbors=cfg.umap_n_neighbors,
+            n_components=cfg.umap_n_components,
+            min_dist=cfg.umap_min_dist,
+            metric=cfg.umap_metric,
+            random_state=seed,
+            verbose=False,
+        ).fit_transform(X)
 
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=cfg.hdbscan_min_cluster_size,
