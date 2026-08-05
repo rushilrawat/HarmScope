@@ -32,9 +32,9 @@ def test_cluster_total_row_inserts_with_sentinel(seeded):
     con, _run_id, cid = seeded
     con.execute(
         "INSERT INTO cluster_timeseries "
-        "(cluster_id, company_id, period_month, n, denom, share, as_of) "
-        "VALUES (?, ?, ?, 40, 1000, 0.04, ?)",
-        [cid, COMPANY_TOTAL, date(2018, 5, 1), date(2019, 1, 1)],
+        "(run_id, cluster_id, company_id, period_month, n, denom, share, as_of) "
+        "VALUES (?, ?, ?, ?, 40, 1000, 0.04, ?)",
+        [_run_id, cid, COMPANY_TOTAL, date(2018, 5, 1), date(2019, 1, 1)],
     )
     got = con.execute(
         "SELECT company_id, n FROM cluster_timeseries WHERE cluster_id = ?", [cid]
@@ -44,18 +44,18 @@ def test_cluster_total_row_inserts_with_sentinel(seeded):
 
 def test_null_company_id_is_rejected(seeded):
     """The sentinel is load-bearing, not decorative."""
-    con, _run_id, cid = seeded
+    con, run_id, cid = seeded
     with pytest.raises(duckdb.ConstraintException):
         con.execute(
             "INSERT INTO cluster_timeseries "
-            "(cluster_id, company_id, period_month, n, denom, share, as_of) "
-            "VALUES (?, NULL, ?, 40, 1000, 0.04, ?)",
-            [cid, date(2018, 5, 1), date(2019, 1, 1)],
+            "(run_id, cluster_id, company_id, period_month, n, denom, share, as_of) "
+            "VALUES (?, ?, NULL, ?, 40, 1000, 0.04, ?)",
+            [run_id, cid, date(2018, 5, 1), date(2019, 1, 1)],
         )
 
 
 def test_company_total_and_per_company_rows_coexist(seeded):
-    con, _run_id, cid = seeded
+    con, run_id, cid = seeded
     rows = [
         (cid, COMPANY_TOTAL, date(2018, 5, 1), 40, 1000, 0.040),
         (cid, "co-equifax", date(2018, 5, 1), 25, 400, 0.0625),
@@ -64,9 +64,9 @@ def test_company_total_and_per_company_rows_coexist(seeded):
     for r in rows:
         con.execute(
             "INSERT INTO cluster_timeseries "
-            "(cluster_id, company_id, period_month, n, denom, share, as_of) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [*r, date(2019, 1, 1)],
+            "(run_id, cluster_id, company_id, period_month, n, denom, share, as_of) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [run_id, *r, date(2019, 1, 1)],
         )
     total = con.execute(
         "SELECT n FROM cluster_timeseries WHERE company_id = ?", [COMPANY_TOTAL]
@@ -85,9 +85,9 @@ def test_cluster_level_signal_joins_its_timeseries_total(seeded):
     period, asof = date(2018, 5, 1), date(2019, 1, 1)
     con.execute(
         "INSERT INTO cluster_timeseries "
-        "(cluster_id, company_id, period_month, n, denom, share, as_of) "
-        "VALUES (?, ?, ?, 40, 1000, 0.04, ?)",
-        [cid, COMPANY_TOTAL, period, asof],
+        "(run_id, cluster_id, company_id, period_month, n, denom, share, as_of) "
+        "VALUES (?, ?, ?, ?, 40, 1000, 0.04, ?)",
+        [run_id, cid, COMPANY_TOTAL, period, asof],
     )
     con.execute(
         "INSERT INTO signals (signal_id, run_id, cluster_id, company_id, period_month, "
@@ -97,7 +97,7 @@ def test_cluster_level_signal_joins_its_timeseries_total(seeded):
     )
     joined = con.execute(
         "SELECT s.signal_id, t.n FROM signals s JOIN cluster_timeseries t "
-        "USING (cluster_id, company_id, period_month)"
+        "USING (run_id, cluster_id, company_id, period_month)"
     ).fetchall()
     assert joined == [("s1", 40)]
 

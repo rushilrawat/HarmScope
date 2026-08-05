@@ -71,7 +71,8 @@ def build_expanded(
 
 
 def build_panel(
-    con: duckdb.DuckDBPyConnection, cluster_run: str, as_of, min_groups: int = 1
+    con: duckdb.DuckDBPyConnection, run_id: str, cluster_run: str, as_of,
+    min_groups: int = 1,
 ) -> tuple[int, int]:
     """Write `cluster_timeseries` — cluster-level and per-company series.
 
@@ -84,8 +85,10 @@ def build_panel(
     `changepoint.py`, and storing 2,821 x 140 x every company would be tens of
     millions of rows that are almost all zero.
     """
-    con.execute("DELETE FROM cluster_timeseries WHERE cluster_id IN "
-                "(SELECT cluster_id FROM clusters WHERE run_id = ?)", [cluster_run])
+    # Scoped to the SIGNALS run. Keyed on cluster_id alone, the negative control
+    # — same clusters, permuted labels — overwrote the real panel in place and
+    # left the table holding shuffled data with nothing raising. Migration 006.
+    con.execute("DELETE FROM cluster_timeseries WHERE run_id = ?", [run_id])
 
     # Exposure: distinct groups in the same family/month, and the same
     # family/company/month, over the identical population as the numerator.
@@ -103,23 +106,24 @@ def build_panel(
 
     con.execute("""
         INSERT INTO cluster_timeseries
-          (cluster_id, company_id, period_month, n, denom, share, as_of)
-        SELECT e.cluster_id, '__ALL__', e.period_month,
+          (run_id, cluster_id, company_id, period_month, n, denom, share, as_of)
+        SELECT ?, e.cluster_id, '__ALL__', e.period_month,
                count(DISTINCT e.group_id) AS n, any_value(d.denom) AS denom,
                count(DISTINCT e.group_id) / any_value(d.denom)::DOUBLE, ?
         FROM _expanded e
         JOIN _denom_family d USING (product_family, period_month)
         WHERE e.cluster_id IS NOT NULL
         GROUP BY e.cluster_id, e.period_month
-    """, [as_of])
+    """, [run_id, as_of])
     n_cluster = con.execute(
-        "SELECT count(*) FROM cluster_timeseries WHERE company_id = '__ALL__'"
+        "SELECT count(*) FROM cluster_timeseries WHERE run_id = ? AND company_id = '__ALL__'",
+        [run_id],
     ).fetchone()[0]
 
     con.execute("""
         INSERT INTO cluster_timeseries
-          (cluster_id, company_id, period_month, n, denom, share, as_of)
-        SELECT e.cluster_id, e.company_id, e.period_month,
+          (run_id, cluster_id, company_id, period_month, n, denom, share, as_of)
+        SELECT ?, e.cluster_id, e.company_id, e.period_month,
                count(DISTINCT e.group_id), any_value(d.denom),
                count(DISTINCT e.group_id) / any_value(d.denom)::DOUBLE, ?
         FROM _expanded e
@@ -127,8 +131,10 @@ def build_panel(
         WHERE e.cluster_id IS NOT NULL AND e.company_id IS NOT NULL
         GROUP BY e.cluster_id, e.company_id, e.period_month
         HAVING count(DISTINCT e.group_id) >= ?
-    """, [as_of, min_groups])
-    total = con.execute("SELECT count(*) FROM cluster_timeseries").fetchone()[0]
+    """, [run_id, as_of, min_groups])
+    total = con.execute(
+        "SELECT count(*) FROM cluster_timeseries WHERE run_id = ?", [run_id]
+    ).fetchone()[0]
     return n_cluster, total - n_cluster
 
 
@@ -184,15 +190,13 @@ def contingency(con: duckdb.DuckDBPyConnection) -> list[tuple]:
     """).fetchall()
 
 
-def series(con: duckdb.DuckDBPyConnection, cluster_run: str) -> dict:
+def series(con: duckdb.DuckDBPyConnection, run_id: str) -> dict:
     """`{(cluster_id, company_id): [(month, n, denom, share), ...]}`, month-sorted."""
     rows = con.execute("""
-        SELECT t.cluster_id, t.company_id, t.period_month, t.n, t.denom, t.share
-        FROM cluster_timeseries t
-        JOIN clusters c USING (cluster_id)
-        WHERE c.run_id = ?
-        ORDER BY t.cluster_id, t.company_id, t.period_month
-    """, [cluster_run]).fetchall()
+        SELECT cluster_id, company_id, period_month, n, denom, share
+        FROM cluster_timeseries WHERE run_id = ?
+        ORDER BY cluster_id, company_id, period_month
+    """, [run_id]).fetchall()
     out: dict = {}
     for cluster_id, company_id, month, n, denom, share in rows:
         out.setdefault((cluster_id, company_id), []).append((month, n, denom, share))

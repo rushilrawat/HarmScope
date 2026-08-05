@@ -658,15 +658,32 @@ def _write_related(con, centroids: dict, cluster_ids: dict) -> int:
 
 
 def latest_run(con, phase: str) -> str:
-    """The most recent successful run of `phase`. Everything Phase 2 reports is
-    run-scoped, so reading the wrong run is silently wrong, not an error."""
+    """The most recent successful *real* run of `phase`.
+
+    Runs over a deliberately altered input are excluded, and that is not a
+    nicety. The Phase 5 negative control permutes cluster labels and writes a
+    fully-formed `signals` run; being the newest, it became what
+    `latest_run('signals')` returned, so `pipeline alerts` with no arguments
+    reported alerts computed on shuffled data with nothing in the output saying
+    so. Same for a `--limit` smoke run. Everything downstream is run-scoped, so
+    reading the wrong run is silently wrong rather than an error — which is the
+    entire failure mode this project keeps rediscovering.
+    """
     row = con.execute(
-        "SELECT run_id FROM runs WHERE phase = ? AND status = 'ok' "
-        "ORDER BY started_at DESC LIMIT 1",
+        """
+        SELECT run_id FROM runs
+        WHERE phase = ? AND status = 'ok'
+          AND coalesce(json_extract(params_json, '$.params.shuffle'), '0') = '0'
+          AND coalesce(json_extract(params_json, '$.params.limit'), 'null') = 'null'
+        ORDER BY started_at DESC LIMIT 1
+        """,
         [phase],
     ).fetchone()
     if not row:
-        raise SystemExit(f"no successful '{phase}' run — run it first")
+        raise SystemExit(
+            f"no successful full-input '{phase}' run — run it first "
+            f"(runs over --limit or --shuffle inputs do not count)"
+        )
     return row[0]
 
 
@@ -1101,7 +1118,7 @@ def phase_signals(args: argparse.Namespace) -> int:
                   f"({n_shuffled:,} rows, seed offset {args.shuffle})")
         print(f"expanded   : {n_expanded:,} non-campaign complaints")
 
-        n_total, n_company = timeseries.build_panel(con, cluster_run, as_of)
+        n_total, n_company = timeseries.build_panel(con, r.run_id, cluster_run, as_of)
         print(f"panel      : {n_total:,} cluster-level rows, "
               f"{n_company:,} company-level")
 
@@ -1110,7 +1127,7 @@ def phase_signals(args: argparse.Namespace) -> int:
         print(f"2x2 tests  : {len(scored):,} pairs with a >= {CONFIG.signals.min_a} "
               f"(of {len(cells):,} company x cluster pairs)")
 
-        series = timeseries.series(con, cluster_run)
+        series = timeseries.series(con, r.run_id)
         changes = changepoint.detect(
             series, months, CONFIG.signals, CONFIG.signals.min_supporting_groups
         )

@@ -124,3 +124,25 @@ def test_runs_listing_marks_truncated_runs(con, capsys):
     assert truncated and truncated[0].startswith("embed*"), "truncated run unmarked"
     assert full and not full[0].startswith("embed*"), "full run wrongly marked"
     assert "--limit" in out, "no legend explaining the marker"
+
+
+def test_latest_run_skips_controls_and_truncated_runs(con):
+    """`pipeline alerts` defaulted to the negative control's output.
+
+    The Phase 5 control permutes cluster labels and writes a fully-formed
+    signals run. Being newest, it was what latest_run returned, so the default
+    invocation reported alerts computed on shuffled data and said nothing about
+    it. A --limit smoke run is the same hazard.
+    """
+    from src import pipeline
+    from src.config import CONFIG
+
+    with db.run(con, "signals", CONFIG, params={"shuffle": 0, "limit": None}) as r:
+        real = r.run_id
+        r.finish(output_rows=10)
+    with db.run(con, "signals", CONFIG, params={"shuffle": 1, "limit": None}) as r:
+        r.finish(output_rows=99)          # newer, and a control
+    with db.run(con, "signals", CONFIG, params={"shuffle": 0, "limit": 500}) as r:
+        r.finish(output_rows=5)           # newer still, and truncated
+
+    assert pipeline.latest_run(con, "signals") == real

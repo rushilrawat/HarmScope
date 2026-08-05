@@ -239,15 +239,20 @@ CREATE TABLE IF NOT EXISTS cluster_labels (   -- LLM output; descriptive only
 -- company_id uses the sentinel '__ALL__' for the cluster total across companies.
 -- DuckDB enforces NOT NULL on primary-key columns, so a NULL marker row cannot
 -- be inserted at all. See tests/test_schema.py for the regression test.
+-- Keyed on the SIGNALS run, not on cluster_id alone. cluster_id is scoped to
+-- the CLUSTER run, so two signals runs over one clustering shared a slot —
+-- which is how the negative control silently overwrote the real panel. Same
+-- collision dup_groups and campaigns were fixed for on 2026-08-03. Migration 006.
 CREATE TABLE IF NOT EXISTS cluster_timeseries (
+  run_id       VARCHAR NOT NULL REFERENCES runs(run_id),
   cluster_id   VARCHAR NOT NULL REFERENCES clusters(cluster_id),
   company_id   VARCHAR NOT NULL,        -- '__ALL__' = cluster total across companies
   period_month DATE NOT NULL,
-  n            BIGINT NOT NULL,
+  n            BIGINT NOT NULL,         -- distinct dup-groups, not complaints
   denom        BIGINT NOT NULL,         -- exposure: complaints in same family/period/company
   share        DOUBLE NOT NULL,
   as_of        DATE NOT NULL,           -- point-in-time guard
-  PRIMARY KEY (cluster_id, company_id, period_month)
+  PRIMARY KEY (run_id, cluster_id, company_id, period_month)
 );
 
 CREATE TABLE IF NOT EXISTS signals (
@@ -296,6 +301,24 @@ CREATE TABLE IF NOT EXISTS backtest_results (
   detected          BOOLEAN NOT NULL,
   first_signal_date DATE,
   lead_time_days    INTEGER,
+  PRIMARY KEY (run_id, system, action_id)
+);
+
+-- Per-system backtest outcome, one row per (run, system, action). EVALUATION §2
+-- puts all five systems through the identical harness; this is where that
+-- comparison lands. Referenced by ARCHITECTURE §3's data flow since Phase 0 and
+-- defined in no schema until migration 006 — the same gap related_clusters had,
+-- and invisible to the doc/schema drift test because the reference is in a
+-- diagram rather than in the SQL block that test compares.
+CREATE TABLE IF NOT EXISTS baseline_results (
+  run_id         VARCHAR NOT NULL REFERENCES runs(run_id),
+  system         VARCHAR NOT NULL CHECK (system IN ('B0', 'B1', 'B2', 'B3', 'harmscope')),
+  action_id      VARCHAR NOT NULL REFERENCES enforcement_actions(action_id),
+  cutoff         DATE NOT NULL,
+  detected       BOOLEAN NOT NULL,
+  first_signal   DATE,                  -- null when not detected
+  lead_time_days INTEGER,               -- filed_date - first_signal; null when not detected
+  match_quality  VARCHAR CHECK (match_quality IN ('strong', 'partial', 'none')),
   PRIMARY KEY (run_id, system, action_id)
 );
 

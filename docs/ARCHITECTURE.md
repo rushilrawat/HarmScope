@@ -326,7 +326,8 @@ CREATE TABLE cluster_labels (           -- LLM output; descriptive only
 );
 
 -- ============ signals ============
-CREATE TABLE cluster_timeseries (
+CREATE TABLE cluster_timeseries (      -- keyed on the SIGNALS run; migration 006
+  run_id       VARCHAR NOT NULL REFERENCES runs(run_id),
   cluster_id   VARCHAR NOT NULL,
   company_id   VARCHAR NOT NULL,        -- '__ALL__' = cluster total across companies
   period_month DATE NOT NULL,
@@ -334,7 +335,18 @@ CREATE TABLE cluster_timeseries (
   denom        BIGINT NOT NULL,         -- exposure: complaints in same family/period/company
   share        DOUBLE NOT NULL,
   as_of        DATE NOT NULL,           -- point-in-time guard
-  PRIMARY KEY (cluster_id, company_id, period_month)
+  PRIMARY KEY (run_id, cluster_id, company_id, period_month)
+);
+CREATE TABLE baseline_results (        -- EVALUATION §2: five systems, one harness
+  run_id         VARCHAR NOT NULL REFERENCES runs(run_id),
+  system         VARCHAR NOT NULL,     -- B0 | B1 | B2 | B3 | harmscope
+  action_id      VARCHAR NOT NULL REFERENCES enforcement_actions(action_id),
+  cutoff         DATE NOT NULL,
+  detected       BOOLEAN NOT NULL,
+  first_signal   DATE,
+  lead_time_days INTEGER,
+  match_quality  VARCHAR,
+  PRIMARY KEY (run_id, system, action_id)
 );
 
 CREATE TABLE signals (
