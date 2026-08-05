@@ -140,3 +140,37 @@ def test_analyse_drops_pairs_below_min_a():
     got = dp.analyse(rows, min_a=5)
     assert [g.company_id for g in got] == ["co1"]
     assert 0.0 <= got[0].q_value <= 1.0
+
+
+def test_contingency_margins_must_partition_the_units():
+    """The bug the negative control found, at the scale it is checkable.
+
+    A 2x2 is a test of association only if every unit is in exactly one cell.
+    Counting distinct dup-groups in the cluster margin while the company margin
+    counted (group, company) pairs made c = n_cluster - a too small, inflating
+    every PRR built on it. One template mailed to three bureaus is one group and
+    three units.
+    """
+    import duckdb
+
+    from src.signals import timeseries
+
+    con = duckdb.connect()
+    con.execute("""
+        CREATE TEMP TABLE _expanded AS SELECT * FROM (VALUES
+          ('f', 'g1', 'equifax',    'c1'),   -- one template, three bureaus,
+          ('f', 'g1', 'experian',   'c1'),   -- one group: three units
+          ('f', 'g1', 'transunion', 'c1'),
+          ('f', 'g2', 'equifax',    'c2'),
+          ('f', 'g3', 'experian',   'c2')
+        ) t(product_family, group_id, company_id, cluster_id)
+    """)
+    con.execute("ALTER TABLE _expanded ADD COLUMN complaint_id BIGINT")
+    con.execute("ALTER TABLE _expanded ADD COLUMN period_month DATE")
+
+    cells = {(r[1], r[2]): r[3:] for r in timeseries.contingency(con)}
+    total = 5  # (group, company) pairs
+    for (_company, _cluster), (a, b, c, d) in cells.items():
+        assert a + b + c + d == total, f"margins do not partition: {a},{b},{c},{d}"
+    # equifax x c1: a=1; equifax has 2 units; c1 has 3 units.
+    assert cells[("equifax", "c1")] == (1, 1, 2, 1)

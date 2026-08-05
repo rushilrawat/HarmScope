@@ -1071,38 +1071,48 @@ def phase_signals(args: argparse.Namespace) -> int:
 
 
 def _shuffle_clusters(con, seed: int) -> int:
-    """Permute cluster labels among complaints, within product family.
+    """Permute cluster labels among **dup-groups**, within product family.
 
     The negative control ROADMAP Phase 5 makes mandatory. Permuting *within*
     family preserves every marginal that is not the thing under test — family
-    volume, monthly totals, company mix, group structure — so anything that
-    still fires is the machinery inventing signal rather than finding it.
-    Shuffling globally would instead destroy the family structure and make the
-    test easier to pass for the wrong reason.
+    volume, monthly totals, company mix, group sizes — so anything that still
+    fires is the machinery inventing signal rather than finding it.
+
+    Groups, not complaints. In production a group's cluster comes from its
+    representative, so every complaint in a group shares one cluster; permuting
+    per complaint breaks that invariant and scatters each group across many
+    clusters, which the first attempt did. That inflates every count, makes a
+    unit fall in several cells at once, and produced a 10.7% false-alert rate
+    that looked like broken statistics rather than a broken control. A null has
+    to preserve the structure of the thing it is a null for.
     """
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE _shuffled AS
-        WITH labelled AS (
-          SELECT complaint_id, product_family, cluster_id,
-                 row_number() OVER (PARTITION BY product_family
-                                    ORDER BY hash(complaint_id * 2654435761 + {seed})) AS src
+        WITH grp AS (
+          SELECT DISTINCT product_family, group_id, cluster_id
           FROM _expanded WHERE cluster_id IS NOT NULL
         ),
-        slots AS (
+        src AS (
+          SELECT product_family, group_id,
+                 row_number() OVER (PARTITION BY product_family
+                                    ORDER BY hash(group_id || '{seed}')) AS pos
+          FROM grp
+        ),
+        dst AS (
           SELECT product_family, cluster_id,
                  row_number() OVER (PARTITION BY product_family
-                                    ORDER BY complaint_id) AS dst
-          FROM _expanded WHERE cluster_id IS NOT NULL
+                                    ORDER BY group_id) AS pos
+          FROM grp
         )
-        SELECT l.complaint_id, s.cluster_id
-        FROM labelled l JOIN slots s
-          ON s.product_family = l.product_family AND s.dst = l.src
+        SELECT s.group_id, d.cluster_id
+        FROM src s JOIN dst d
+          ON d.product_family = s.product_family AND d.pos = s.pos
     """)
     con.execute("""
         CREATE OR REPLACE TEMP TABLE _expanded AS
         SELECT e.complaint_id, e.company_id, e.period_month, e.product_family,
                e.group_id, s.cluster_id
-        FROM _expanded e LEFT JOIN _shuffled s USING (complaint_id)
+        FROM _expanded e LEFT JOIN _shuffled s USING (group_id)
     """)
     return con.execute("SELECT count(*) FROM _shuffled").fetchone()[0]
 

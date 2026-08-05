@@ -133,30 +133,44 @@ def build_panel(
 
 
 def contingency(con: duckdb.DuckDBPyConnection) -> list[tuple]:
-    """The 2x2 counts per (family, company, cluster), in dup-groups.
+    """The 2x2 counts per (family, company, cluster).
 
     `a` company-and-cluster, `b` company-not-cluster, `c` other-companies-and-
     cluster, `d` the rest — all within one product family, which is the stratum
     METHODOLOGY §6.1 defines the comparison inside.
+
+    **The unit is a `(group, company)` pair, not a group.** A 2x2 table is only
+    a test of association if every unit falls in exactly one cell, and a bare
+    dup-group does not: one credit-repair template mailed to all three bureaus
+    is three complaints against three companies sharing one `group_id`. Counting
+    distinct groups in the cluster margin therefore counted that template once
+    while the company margin counted it three times, so `c = n_cluster - a` came
+    out too small and every PRR built on it was inflated. Found by the Phase 5
+    negative control, which is exactly the defect it exists to find.
+
+    `(group, company)` is also the right unit on its own terms: 24,507 identical
+    complaints against one bureau are one allegation, and the same template sent
+    to three bureaus is three — one per company it accuses.
     """
     return con.execute("""
-        WITH pair AS (
-          SELECT product_family, company_id, cluster_id,
-                 count(DISTINCT group_id) AS a
-          FROM _expanded WHERE cluster_id IS NOT NULL AND company_id IS NOT NULL
-          GROUP BY 1, 2, 3
+        WITH unit AS (   -- one row per (group, company); the cell a unit belongs to
+          SELECT DISTINCT product_family, group_id, company_id, cluster_id
+          FROM _expanded WHERE company_id IS NOT NULL
+        ),
+        pair AS (
+          SELECT product_family, company_id, cluster_id, count(*) AS a
+          FROM unit WHERE cluster_id IS NOT NULL GROUP BY 1, 2, 3
         ),
         by_company AS (
-          SELECT product_family, company_id, count(DISTINCT group_id) AS n_company
-          FROM _expanded WHERE company_id IS NOT NULL GROUP BY 1, 2
+          SELECT product_family, company_id, count(*) AS n_company
+          FROM unit GROUP BY 1, 2
         ),
         by_cluster AS (
-          SELECT product_family, cluster_id, count(DISTINCT group_id) AS n_cluster
-          FROM _expanded WHERE cluster_id IS NOT NULL GROUP BY 1, 2
+          SELECT product_family, cluster_id, count(*) AS n_cluster
+          FROM unit WHERE cluster_id IS NOT NULL GROUP BY 1, 2
         ),
         by_family AS (
-          SELECT product_family, count(DISTINCT group_id) AS n_family
-          FROM _expanded GROUP BY 1
+          SELECT product_family, count(*) AS n_family FROM unit GROUP BY 1
         )
         SELECT p.product_family, p.company_id, p.cluster_id,
                p.a,
