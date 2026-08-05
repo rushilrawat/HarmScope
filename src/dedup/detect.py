@@ -1,4 +1,4 @@
-"""Phase 2 driver: exact grouping, MinHash near-dup, union-find, campaigns.
+"""Phase 2 driver: exact grouping, MinHash near-dup, star clustering, campaigns.
 
 docs/METHODOLOGY.md §2. The order matters — Tier 1 runs first and collapses
 35% of the corpus on the 2026-08-03 snapshot, which is what makes Tier 2
@@ -32,7 +32,7 @@ def exact_pairs(con: duckdb.DuckDBPyConnection) -> int:
     """Tier 1. Star-link every exact-duplicate group to its lowest id.
 
     Star rather than all-pairs: identical text is transitive by definition, so
-    a spanning set is enough for union-find and n-1 edges beats n(n-1)/2.
+    a spanning set is enough to recover the group and n-1 edges beats n(n-1)/2.
     """
     con.execute(
         """
@@ -126,7 +126,9 @@ def candidate_pairs(
     return np.array(sorted(pairs), dtype=np.int64)
 
 
-def verify(sig: np.ndarray, pairs: np.ndarray, threshold: float) -> np.ndarray:
+def verify(
+    sig: np.ndarray, pairs: np.ndarray, threshold: float
+) -> tuple[np.ndarray, np.ndarray]:
     """Keep only candidate pairs whose estimated Jaccard clears the threshold.
 
     Band collisions cost time, never correctness — this is where that is made

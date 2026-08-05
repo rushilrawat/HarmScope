@@ -33,10 +33,40 @@ from src.config import PATHS
 from src.dedup.minhash import shingles
 
 EVAL_CSV = "dedup_eval_pairs.csv"
+NEAR_MISS_CSV = "dedup_near_misses.csv"
 HEADER = [
     "complaint_id_a", "complaint_id_b", "label", "stratum",
     "true_jaccard", "label_source", "notes",
 ]
+
+
+def write_near_misses(
+    ids, pairs, sims, threshold: float, n: int = 300, band: float = 0.30,
+    path: Path | None = None,
+) -> Path:
+    """Sample LSH candidates the verifier **rejected**, during the run.
+
+    Every pair in `EVAL_CSV` was drawn from `dup_pairs`, which only ever holds
+    pairs that already cleared the threshold. Recall measured from that file
+    alone can only miss pairs lost in grouping — never a pair the verifier
+    threw away — and is biased upward by construction.
+
+    The rejected candidates exist only as an in-memory array inside the dedup
+    run, so they are sampled here or they are gone. Deterministic stride sample
+    over the near-miss band, ordered by similarity.
+    """
+    path = path or PATHS.ground_truth / NEAR_MISS_CSV
+    lo = threshold - band
+    keep = [i for i, s in enumerate(sims) if lo <= s < threshold]
+    keep.sort(key=lambda i: (float(sims[i]), int(pairs[i, 0]), int(pairs[i, 1])))
+    step = max(1, len(keep) // n)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["complaint_id_a", "complaint_id_b", "est_similarity"])
+        for i in keep[::step][:n]:
+            a, b = int(ids[pairs[i, 0]]), int(ids[pairs[i, 1]])
+            w.writerow([min(a, b), max(a, b), round(float(sims[i]), 4)])
+    return path
 
 
 def true_jaccard(text_a: str, text_b: str, k: int) -> float:
@@ -140,23 +170,34 @@ def write(rows: list[dict], path: Path | None = None) -> Path:
 
 
 def score(
-    con: duckdb.DuckDBPyConnection, rows: list[dict]
+    con: duckdb.DuckDBPyConnection, rows: list[dict], run_id: str
 ) -> dict[str, float]:
     """Precision / recall / F1 of the detector against the labelled set.
 
     "Predicted duplicate" means the detector put the two complaints in the same
     `dup_group` — the thing that actually has downstream consequences — not
     merely that the pair survived verification.
+
+    `run_id` is required, not optional. `dup_groups` is keyed
+    `(run_id, complaint_id)` and holds one row per complaint per refit, so an
+    unscoped query counts group ids across runs: `count(DISTINCT group_id) = 1`
+    is then almost never true, `tp + fp` is 0, and `precision = 1.0` is
+    returned by the empty-denominator guard. A precision gate that reports a
+    perfect pass when the query is wrong is trap T1 wearing a rosette — hence
+    the asserts below.
     """
     tp = fp = fn = tn = 0
     for row in rows:
-        same_group = con.execute(
+        # Both ids must be present: with only one row matching, the distinct
+        # count is trivially 1 and a missing complaint scores as a merge.
+        n_rows, n_groups = con.execute(
             """
-            SELECT count(DISTINCT group_id) = 1
-            FROM dup_groups WHERE complaint_id IN (?, ?)
+            SELECT count(*), count(DISTINCT group_id) FROM dup_groups
+            WHERE run_id = ? AND complaint_id IN (?, ?)
             """,
-            [row["complaint_id_a"], row["complaint_id_b"]],
-        ).fetchone()[0]
+            [run_id, row["complaint_id_a"], row["complaint_id_b"]],
+        ).fetchone()
+        same_group = n_rows == 2 and n_groups == 1
         actual = row["label"] == "dup"
         if same_group and actual:
             tp += 1
@@ -166,10 +207,28 @@ def score(
             fn += 1
         else:
             tn += 1
-    precision = tp / (tp + fp) if tp + fp else 1.0
-    recall = tp / (tp + fn) if tp + fn else 1.0
+    if tp + fp == 0 or tp + fn == 0:
+        raise ValueError(
+            f"degenerate scoring: tp={tp} fp={fp} fn={fn} tn={tn}. Either the "
+            f"run_id {run_id!r} has no dup_groups rows or the eval pairs are "
+            f"not in this corpus — not a precision of 1.0."
+        )
+    precision = tp / (tp + fp)
+    recall = tp / (tp + fn)
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return {
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
         "precision": precision, "recall": recall, "f1": f1,
     }
+
+
+def read(path: Path | None = None) -> list[dict]:
+    """The committed eval pairs, ids coerced to int."""
+    path = path or PATHS.ground_truth / EVAL_CSV
+    with path.open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    for row in rows:
+        row["complaint_id_a"] = int(row["complaint_id_a"])
+        row["complaint_id_b"] = int(row["complaint_id_b"])
+        row["true_jaccard"] = float(row["true_jaccard"])
+    return rows

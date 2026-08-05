@@ -45,7 +45,8 @@ Effort estimates assume part-time work alongside coursework and an internship.
 ## Phase 2 — Dedup & campaign detection **[GATE]**
 **~1 week**
 
-- Exact hash grouping; MinHash + LSH near-dup; union-find grouping.
+- Exact hash grouping; MinHash + LSH near-dup; star-clustered grouping (union-find chained —
+  see `METHODOLOGY §2.2`).
 - Campaign features and flagging per `METHODOLOGY §2.2`.
 - Hand-label 300 pairs → `data/ground_truth/dedup_eval_pairs.csv`.
 

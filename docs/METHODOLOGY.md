@@ -30,19 +30,33 @@ campaign. **Solve this before touching embeddings.**
 **Tier 1 — exact.** `sha256` of normalized text (lowercase, collapse whitespace, strip
 punctuation, replace digit runs with `#`). Group identical hashes. Fast, catches pure copies.
 
-**Tier 2 — near-duplicate.** MinHash (`datasketch`, 128 permutations) over character 5-shingles,
-LSH banded for Jaccard threshold ~0.85. Blocked by `product_family` to keep candidate sets small.
-Union-find over LSH candidate pairs → `group_id`.
+**Tier 2 — near-duplicate.** MinHash (128 permutations) over character 5-shingles, LSH banded,
+verified against `jaccard_threshold` (0.88). Blocked by `product_family` to keep candidate sets
+small. **Star clustering**, not union-find, over the surviving pairs → `group_id`.
 
-Tune the threshold on hand-labeled pairs. Character shingles beat word shingles here because
-templates vary mainly in inserted account numbers and dates.
+Character shingles beat word shingles here because templates vary mainly in inserted account
+numbers and dates.
+
+Union-find was the original design and it failed on the full corpus: transitive closure merges
+A and Z whenever a chain A~B~…~Z exists with each consecutive link above threshold, even where
+A and Z share nothing. That produced a single "duplicate group" of 84,657 members and 1.8M
+narratives sitting in groups over 1,000. Star clustering bounds group diameter at one hop — a
+member must clear the threshold against the **seed**, not against some other member — so
+chaining cannot happen by construction rather than by tuning. Seeds are taken highest-degree
+first, ties on lowest id: the canonical copy of a template has the most neighbours, and the
+ordering is deterministic. Exact duplicates are collapsed first and only their representatives
+are seeded, so a seed cannot admit half of a byte-identical group.
+
+The cost is recall: two genuine copies of one template that both differ from the seed can land
+in different groups. That trade is deliberate (precision is the gate, §2.4) and its size is
+reported, not assumed — see `ENGINEERING_NOTES.md` Phase 2.
 
 **Pairs and groups are stored separately**, because only one of them depends on
 the cutoff. `dup_pairs` holds the pairwise similarities — computed once over the
 whole corpus, since Jaccard similarity between two narratives does not depend on
-what else exists. `dup_groups` holds the connected components, refit per cutoff:
-transitive closure *is* date-dependent, because if A~B and B~C but B arrives
-after the cutoff, A and C are separate groups at that cutoff.
+what else exists. `dup_groups` holds the grouping, refit per cutoff: seed
+selection *is* date-dependent, because a document's degree — and therefore
+whether it becomes a seed — depends on which of its neighbours have arrived.
 
 **Tier 3 — campaign detection.** Groups are not enough; a campaign may vary phrasing enough to
 evade MinHash. Compute per candidate campaign (a dup_group, or a tight embedding neighborhood):
@@ -80,10 +94,16 @@ This mirrors the MAUDE follow-up-report problem: the count is not the number of 
 
 ### 2.4 Acceptance criteria (gate — do not proceed without)
 
-- Hand-label 300 narrative pairs (stratified: 100 obvious dups, 100 hard near-dups, 100
-  unrelated). Store as `data/ground_truth/dedup_eval_pairs.csv`.
+- 300 pairs (stratified: 100 obvious dups, 100 hard near-dups, 100 unrelated), stored as
+  `data/ground_truth/dedup_eval_pairs.csv`. The label is the exact character-5-shingle Jaccard,
+  not a human judgement — `label_source` records this per row, and what the resulting precision
+  does and does not cover is stated in `ENGINEERING_NOTES.md` Phase 2.
 - Report precision, recall, F1 at the chosen threshold. Target: precision ≥ 0.95 (false merges
   are worse than misses — a false merge destroys real signal).
+- Recall from that file alone is biased upward: every positive in it was drawn from `dup_pairs`,
+  which only ever holds pairs that already cleared the threshold. `dedup_near_misses.csv` is a
+  seeded sample of the LSH candidates the verifier **rejected**, captured during the run because
+  they are never persisted, and gives recall a denominator that can see verifier loss.
 - Report what fraction of the corpus is campaign-flagged, per product family. Sanity check: if
   credit reporting is not substantially higher than mortgage, the detector is not working.
 

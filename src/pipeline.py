@@ -231,10 +231,10 @@ def phase_normalize(args: argparse.Namespace) -> int:
 
 
 def phase_dedup(args: argparse.Namespace) -> int:
-    """Phase 2 [GATE] — exact + MinHash dedup, union-find, campaign detection."""
+    """Phase 2 [GATE] — exact + MinHash dedup, star clustering, campaigns."""
     import numpy as np
 
-    from src.dedup import campaign, detect
+    from src.dedup import campaign, detect, evalset
 
     con = db.bootstrap()
     as_of = con.execute("SELECT max(date_received) FROM complaints").fetchone()[0]
@@ -256,6 +256,11 @@ def phase_dedup(args: argparse.Namespace) -> int:
         if len(pairs):
             keep, sims = detect.verify(sig, pairs, CONFIG.dedup.jaccard_threshold)
             good = pairs[keep]
+            # Rejected candidates are never persisted; sample them now or the
+            # gate's recall has no denominator. See evalset.write_near_misses.
+            evalset.write_near_misses(
+                ids, pairs[~keep], sims[~keep], CONFIG.dedup.jaccard_threshold
+            )
             print(f"verified >= {CONFIG.dedup.jaccard_threshold}: {len(good):,} "
                   f"({len(good) / max(len(pairs), 1):.1%} of candidates)", flush=True)
             if len(good):
@@ -295,6 +300,172 @@ def phase_dedup(args: argparse.Namespace) -> int:
     ).fetchall():
         print(f"  {fam:<18} {flagged:>9,} / {tot:>9,}  {flagged / tot:6.2%}")
     return 0
+
+
+def latest_run(con, phase: str) -> str:
+    """The most recent successful run of `phase`. Everything Phase 2 reports is
+    run-scoped, so reading the wrong run is silently wrong, not an error."""
+    row = con.execute(
+        "SELECT run_id FROM runs WHERE phase = ? AND status = 'ok' "
+        "ORDER BY started_at DESC LIMIT 1",
+        [phase],
+    ).fetchone()
+    if not row:
+        raise SystemExit(f"no successful '{phase}' run — run it first")
+    return row[0]
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """ROADMAP Phase 2 [GATE] — precision, recall, campaign share by family.
+
+    Reports; never tunes. If precision is under the bound the correct response
+    is to fix the detector, not `jaccard_threshold` (trap T4).
+    """
+    import csv as _csv
+
+    from src.dedup import evalset
+
+    con = db.connect(read_only=True)
+    run_id = args.run_id or latest_run(con, "dedup")
+    print(f"run           : {run_id}\n")
+
+    rows = evalset.read()
+    m = evalset.score(con, rows, run_id)
+    if len(rows) != 300:
+        print(f"WARNING: eval set has {len(rows)} pairs, not the specified 300")
+    print(f"pairs scored  : {m['tp'] + m['fp'] + m['fn'] + m['tn']}")
+    print(f"tp/fp/fn/tn   : {m['tp']} / {m['fp']} / {m['fn']} / {m['tn']}")
+    verdict = "PASS" if m["precision"] >= CONFIG.dedup.min_precision else "FAIL"
+    print(f"precision     : {m['precision']:.4f}  "
+          f"(gate >= {CONFIG.dedup.min_precision})  {verdict}")
+    print(f"recall        : {m['recall']:.4f}   (reported, not gated)")
+    print(f"f1            : {m['f1']:.4f}")
+
+    for stratum in ("obvious", "hard", "unrelated"):
+        sub = [r for r in rows if r["stratum"] == stratum]
+        if sub:
+            s = evalset.score(con, sub, run_id) if any(
+                r["label"] == "dup" for r in sub) else None
+            wrong = sum(
+                1 for r in sub
+                if (con.execute(
+                    "SELECT count(*) = 2 AND count(DISTINCT group_id) = 1 "
+                    "FROM dup_groups WHERE run_id = ? AND complaint_id IN (?, ?)",
+                    [run_id, r["complaint_id_a"], r["complaint_id_b"]],
+                ).fetchone()[0]) != (r["label"] == "dup")
+            )
+            note = f"P={s['precision']:.3f} R={s['recall']:.3f}" if s else "negatives"
+            print(f"  {stratum:<10} n={len(sub):<4} errors={wrong:<3} {note}")
+
+    near = PATHS.ground_truth / evalset.NEAR_MISS_CSV
+    print("\nrejected candidates (recall denominator the eval file cannot see):")
+    if not near.exists():
+        print("  none captured — re-run `--phase dedup` to sample them")
+    else:
+        with near.open(encoding="utf-8") as fh:
+            sample = list(_csv.DictReader(fh))
+        missed = 0
+        for r in sample:
+            texts = dict(con.execute(
+                "SELECT complaint_id, text_redacted FROM narratives "
+                "WHERE complaint_id IN (?, ?)",
+                [int(r["complaint_id_a"]), int(r["complaint_id_b"])],
+            ).fetchall())
+            if len(texts) < 2:
+                continue
+            tj = evalset.true_jaccard(*texts.values(), CONFIG.dedup.shingle_size)
+            r["true_jaccard"] = tj
+            missed += tj >= CONFIG.dedup.jaccard_threshold
+        print(f"  {len(sample)} sampled, {missed} were true duplicates by exact "
+              f"Jaccard ({missed / max(len(sample), 1):.1%} of near misses)")
+
+    print("\ngroup sizes (chaining check — one hop from the seed, by construction):")
+    for bucket, n_groups, n_rows in con.execute(
+        """
+        SELECT CASE WHEN group_size = 1 THEN '1'
+                    WHEN group_size <= 10 THEN '2-10'
+                    WHEN group_size <= 100 THEN '11-100'
+                    WHEN group_size <= 1000 THEN '101-1000'
+                    ELSE '>1000' END AS b,
+               count(DISTINCT group_id), count(*)
+        FROM dup_groups WHERE run_id = ? GROUP BY 1
+        ORDER BY min(group_size)
+        """,
+        [run_id],
+    ).fetchall():
+        print(f"  {bucket:<10} {n_groups:>9,} groups  {n_rows:>10,} narratives")
+    print(f"  largest    {con.execute('SELECT max(group_size) FROM dup_groups '
+                                      'WHERE run_id = ?', [run_id]).fetchone()[0]:,}"
+          " members")
+
+    print("\ncampaign-flagged share by product family "
+          "(METHODOLOGY §2.4: credit reporting must be clearly highest):")
+    for fam, tot, flagged in con.execute(
+        """
+        SELECT c.product_family, count(*) AS tot,
+               count(*) FILTER (WHERE cm.complaint_id IS NOT NULL) AS flagged
+        FROM complaints c
+        JOIN narratives n USING (complaint_id)
+        LEFT JOIN (SELECT DISTINCT m.complaint_id FROM campaign_members m
+                   JOIN campaigns ca USING (campaign_id)
+                   WHERE ca.run_id = ? AND ca.flagged) cm USING (complaint_id)
+        GROUP BY 1 ORDER BY flagged::DOUBLE / count(*) DESC
+        """,
+        [run_id],
+    ).fetchall():
+        print(f"  {fam:<18} {flagged:>9,} / {tot:>9,}  {flagged / tot:6.2%}")
+
+    if args.read:
+        _print_reading_material(con, run_id, args.read)
+    return 0
+
+
+def _print_reading_material(con, run_id: str, n: int) -> None:
+    """Trap T2's countermeasure: the excerpts have to be read by a human.
+
+    `n` flagged campaigns and `n` unflagged high-volume groups, largest first,
+    with one excerpt from the group's representative. No statistic substitutes
+    for seeing whether the flagged set is obviously templated.
+    """
+    print(f"\n{'=' * 72}\nREAD: {n} flagged campaigns, largest first\n{'=' * 72}")
+    for cid, nc, fam, sigs, boiler, cv, burst in con.execute(
+        "SELECT campaign_id, n_complaints, product_family, n_signals, "
+        "boilerplate_score, length_cv, burstiness FROM campaigns "
+        "WHERE run_id = ? AND flagged ORDER BY n_complaints DESC LIMIT ?",
+        [run_id, n],
+    ).fetchall():
+        text = con.execute(
+            "SELECT n.text_redacted FROM campaign_members m "
+            "JOIN narratives n USING (complaint_id) "
+            "WHERE m.campaign_id = ? ORDER BY n.complaint_id LIMIT 1",
+            [cid],
+        ).fetchone()
+        print(f"\n[{nc:,} complaints] {fam}  signals={sigs} "
+              f"boiler={boiler:.2f} cv={cv:.2f} burst={burst:.1f}")
+        print("  " + " ".join((text[0] if text else "").split())[:400])
+
+    print(f"\n{'=' * 72}\nREAD: {n} unflagged groups, largest first\n{'=' * 72}")
+    for gid, size, fam in con.execute(
+        """
+        SELECT d.group_id, any_value(d.group_size), any_value(c.product_family)
+        FROM dup_groups d JOIN complaints c USING (complaint_id)
+        WHERE d.run_id = ? AND d.group_id NOT IN (
+          SELECT DISTINCT m.group_id FROM campaign_members mm
+          JOIN campaigns ca USING (campaign_id)
+          JOIN dup_groups m ON m.complaint_id = mm.complaint_id AND m.run_id = ?
+          WHERE ca.run_id = ? AND ca.flagged)
+        GROUP BY 1 ORDER BY any_value(d.group_size) DESC LIMIT ?
+        """,
+        [run_id, run_id, run_id, n],
+    ).fetchall():
+        text = con.execute(
+            "SELECT n.text_redacted FROM dup_groups d "
+            "JOIN narratives n USING (complaint_id) "
+            "WHERE d.run_id = ? AND d.group_id = ? AND d.is_representative",
+            [run_id, gid],
+        ).fetchone()
+        print(f"\n[{size:,} complaints] {fam}  {gid}")
+        print("  " + " ".join((text[0] if text else "").split())[:400])
 
 
 def cmd_taxonomy(args: argparse.Namespace) -> int:
@@ -384,6 +555,14 @@ def main(argv: list[str] | None = None) -> int:
                        help="restream the snapshot as .csv.gz (DuckDB reads it directly)")
     p_run.add_argument("--csv", help="load from this CSV instead of the snapshot")
     p_run.set_defaults(func=cmd_run)
+
+    p_gate = sub.add_parser("gate", help="Phase 2 gate report: precision, recall, "
+                                         "campaign share")
+    p_gate.add_argument("--run-id", help="default: latest successful dedup run")
+    p_gate.add_argument("--read", type=int, default=0, metavar="N",
+                        help="also print N flagged campaigns and N unflagged "
+                             "groups for the manual read (trap T2)")
+    p_gate.set_defaults(func=cmd_gate)
 
     p_tax = sub.add_parser("taxonomy", help="label vocabulary by volume")
     p_tax.set_defaults(func=cmd_taxonomy)
