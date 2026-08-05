@@ -23,6 +23,20 @@ clustered, so dividing by all complaints would make every share a function of
 narrative-consent rates rather than of harm. The exposure is the population the
 numerator could have come from.
 
+**A cluster's exposure is its own family's, on both sides.** A dup-group's
+complaints can be filed under different products — the same template appears
+under credit reporting and debt collection, which Phase 3's neighbour read found
+directly — and a cluster is assigned from its group's *representative*. So 671
+of 2,821 clusters (23.8%) contain complaints from more than one family. Grouping
+the panel by cluster while joining exposure on the complaint's family matched
+several denominator rows for those, and `any_value` picked one arbitrarily:
+`share` had a randomly chosen denominator, and two runs on identical input
+disagreed on 1,114 panel rows and 81 changepoint signals. The numerator is now
+restricted to members in the cluster's own family, so numerator is a subset of
+denominator by construction, `share` stays in [0, 1], and the result is
+deterministic. Cross-family membership is not lost — it is what
+`related_clusters` (METHODOLOGY §4.2) exists to represent.
+
 **Campaign-flagged complaints are excluded** (§6.3), from numerator and
 denominator alike. Dropping them from one side only would inflate or deflate
 every share in a family by the campaign rate of that family, which runs from
@@ -51,7 +65,7 @@ flagged AS (
 )
 SELECT
   c.complaint_id, c.company_id, c.period_month, c.product_family,
-  d.group_id, r.cluster_id
+  d.group_id, r.cluster_id, r.product_family AS cluster_family
 FROM dup_groups d
 JOIN complaints c USING (complaint_id)
 LEFT JOIN dup_groups dr
@@ -112,7 +126,7 @@ def build_panel(
                count(DISTINCT e.group_id) / any_value(d.denom)::DOUBLE, ?
         FROM _expanded e
         JOIN _denom_family d USING (product_family, period_month)
-        WHERE e.cluster_id IS NOT NULL
+        WHERE e.cluster_id IS NOT NULL AND e.product_family = e.cluster_family
         GROUP BY e.cluster_id, e.period_month
     """, [run_id, as_of])
     n_cluster = con.execute(
@@ -129,6 +143,7 @@ def build_panel(
         FROM _expanded e
         JOIN _denom_company d USING (product_family, company_id, period_month)
         WHERE e.cluster_id IS NOT NULL AND e.company_id IS NOT NULL
+          AND e.product_family = e.cluster_family
         GROUP BY e.cluster_id, e.company_id, e.period_month
         HAVING count(DISTINCT e.group_id) >= ?
     """, [run_id, as_of, min_groups])
@@ -160,7 +175,8 @@ def contingency(con: duckdb.DuckDBPyConnection) -> list[tuple]:
     """
     return con.execute("""
         WITH unit AS (   -- one row per (group, company); the cell a unit belongs to
-          SELECT DISTINCT product_family, group_id, company_id, cluster_id
+          SELECT DISTINCT product_family, group_id, company_id,
+                 CASE WHEN product_family = cluster_family THEN cluster_id END AS cluster_id
           FROM _expanded WHERE company_id IS NOT NULL
         ),
         pair AS (

@@ -158,12 +158,12 @@ def test_contingency_margins_must_partition_the_units():
     con = duckdb.connect()
     con.execute("""
         CREATE TEMP TABLE _expanded AS SELECT * FROM (VALUES
-          ('f', 'g1', 'equifax',    'c1'),   -- one template, three bureaus,
-          ('f', 'g1', 'experian',   'c1'),   -- one group: three units
-          ('f', 'g1', 'transunion', 'c1'),
-          ('f', 'g2', 'equifax',    'c2'),
-          ('f', 'g3', 'experian',   'c2')
-        ) t(product_family, group_id, company_id, cluster_id)
+          ('f', 'g1', 'equifax',    'c1', 'f'),  -- one template, three bureaus,
+          ('f', 'g1', 'experian',   'c1', 'f'),  -- one group: three units
+          ('f', 'g1', 'transunion', 'c1', 'f'),
+          ('f', 'g2', 'equifax',    'c2', 'f'),
+          ('f', 'g3', 'experian',   'c2', 'f')
+        ) t(product_family, group_id, company_id, cluster_id, cluster_family)
     """)
     con.execute("ALTER TABLE _expanded ADD COLUMN complaint_id BIGINT")
     con.execute("ALTER TABLE _expanded ADD COLUMN period_month DATE")
