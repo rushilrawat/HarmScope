@@ -129,3 +129,30 @@ def test_ari_is_nan_when_nothing_is_comparable():
     a = np.array([assign.NOISE, assign.NOISE])
     value, n = stability.ari(a, np.array([0, 1]))
     assert n == 0 and np.isnan(value)
+
+
+def test_dominant_share_denominator_is_the_cluster_not_the_survivors():
+    """The defect that made the most-unexplained cluster score zero.
+
+    A 100-member cluster with 99 labels ablated away left one survivor whose
+    label was trivially 100% of survivors, so novelty came out 0.000 — the
+    cluster no taxonomy label explains, scored as perfectly explained.
+    METHODOLOGY §5 says "fraction of members", and members is the whole cluster.
+    """
+    got = novelty.score_cluster(["a"], family_label_space=65, cfg=CFG, n_members=100)
+    assert got.dominant_share == 0.01
+    assert got.score > 0.49, got.score
+
+    # Unablated, the denominators coincide and nothing changes.
+    same = novelty.score_cluster(["a"] * 100, 65, CFG, n_members=100)
+    assert same.dominant_share == 1.0
+    assert same.score == 0.0
+
+
+def test_partial_ablation_ranks_above_an_untouched_concentrated_cluster():
+    members = {
+        "mostly_hidden": [("fraud", "s")] * 90 + [("billing", "s")] * 10,
+        "untouched": [("billing", "s")] * 90 + [("other", "s")] * 10,
+    }
+    scored = novelty.score_all(members, 65, CFG, hidden_issue="fraud")
+    assert scored["mostly_hidden"].score > scored["untouched"].score

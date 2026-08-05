@@ -52,20 +52,40 @@ class Novelty:
 
 
 def score_cluster(
-    labels: list[str], family_label_space: int, cfg: NoveltyConfig
+    labels: list[str],
+    family_label_space: int,
+    cfg: NoveltyConfig,
+    n_members: int | None = None,
 ) -> Novelty:
     """Novelty for one cluster from its members' label tuples.
 
     `labels` excludes members whose label was ablated away — that is how §5.1
     hides an issue, and why an empty list is meaningful rather than an error.
+    `n_members` is the cluster's true size, which is larger than `len(labels)`
+    exactly when labels have been ablated.
+
+    **The denominator is the cluster, not the labelled part of it.** §5 defines
+    `dominant_label_share` as the "fraction of members carrying the modal label
+    tuple"; dividing by surviving labels instead answers "among the members we
+    could match, how concentrated are they", which discards the one thing that
+    matters — how much of the cluster no label explains at all.
+
+    That deviation was not academic. On the 2026-08-05 run it gave a 101-member
+    bank_account cluster, 99% of it the hidden issue, a novelty of **0.000**:
+    one member survived, that member's label was trivially 100% of the
+    survivors, and the most completely unexplained cluster in the family scored
+    as perfectly explained. It is invisible outside ablation, because every
+    complaint in the corpus carries an `issue_std`, so `n_members == len(labels)`
+    and this changes no production score.
     """
+    n_members = len(labels) if n_members is None else n_members
     if not labels:
         return Novelty(NO_LABEL, 0.0, 1.0, 1.0, 0)
 
     counts = Counter(labels)
     total = len(labels)
     dominant_label, dominant_n = counts.most_common(1)[0]
-    dominant_share = dominant_n / total
+    dominant_share = dominant_n / max(n_members, 1)
 
     entropy = -sum(
         (n / total) * math.log(n / total) for n in counts.values() if n
@@ -99,7 +119,9 @@ def score_all(
             for issue, sub in pairs
             if hidden_issue is None or issue != hidden_issue
         ]
-        out[cluster_id] = score_cluster(labels, family_label_space, cfg)
+        out[cluster_id] = score_cluster(
+            labels, family_label_space, cfg, n_members=len(pairs)
+        )
     return out
 
 
