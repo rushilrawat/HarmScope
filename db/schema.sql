@@ -164,12 +164,19 @@ CREATE TABLE IF NOT EXISTS campaign_members (
 );
 
 -- ============ embeddings & clusters ============
-CREATE TABLE IF NOT EXISTS embedding_map (    -- complaint_id <-> row index in .npy / faiss
-  complaint_id BIGINT PRIMARY KEY,
+-- complaint_id <-> row index in .npy / faiss. Keyed per model: METHODOLOGY §3
+-- names two (bge-base default, MiniLM for dev iteration) and with complaint_id
+-- alone as the key they could not coexist. Identical narratives share a row —
+-- the memmap is keyed on text_hash, since an embedding is a pure function of
+-- the text, and 3,830,002 narratives are 2,477,937 distinct texts.
+CREATE TABLE IF NOT EXISTS embedding_map (
+  complaint_id BIGINT NOT NULL,
   row_idx      BIGINT NOT NULL,
   model        VARCHAR NOT NULL,
-  dim          INTEGER NOT NULL
+  dim          INTEGER NOT NULL,
+  PRIMARY KEY (complaint_id, model)
 );
+CREATE INDEX IF NOT EXISTS idx_embedding_row ON embedding_map(model, row_idx);
 
 CREATE TABLE IF NOT EXISTS clusters (
   cluster_id     VARCHAR PRIMARY KEY,   -- '{run_id}:{product_family}:{local_id}'

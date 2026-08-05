@@ -302,6 +302,110 @@ def phase_dedup(args: argparse.Namespace) -> int:
     return 0
 
 
+def phase_embed(args: argparse.Namespace) -> int:
+    """Phase 3 — encode distinct narratives, build the ANN index."""
+    from src.embed import encode
+    from src.embed import index as faiss_index
+
+    con = db.bootstrap()
+    model_name = args.model or CONFIG.embed.model
+    memmap = PATHS.artifacts / f"embeddings.{model_name.split('/')[-1]}.npy"
+    index_path = PATHS.artifacts / f"faiss.{model_name.split('/')[-1]}.index"
+
+    with db.run(con, "embed", CONFIG, params={"model": model_name}) as r:
+        stats = encode.encode_all(
+            con, model_name, memmap, batch_size=args.batch or CONFIG.embed.batch_size,
+            device=args.device, limit=args.limit,
+            checkpoint_every=CONFIG.embed.checkpoint_every,
+        )
+        n_mapped, n_unmapped = encode.build_map(
+            con, model_name, stats["dim"], stats["n_total"]
+        )
+        if n_unmapped and not args.limit:
+            raise checks.CheckFailed(
+                f"{n_unmapped:,} narratives have no embedding row after a full "
+                f"encode — every narrative's text must be in the memmap"
+            )
+        checks.expect_rows(con, "embedding_map", min=1)
+        # A row of zeros is what a crashed or skipped batch leaves behind, and
+        # it is invisible downstream: it clusters happily as noise. Norms are 1
+        # by construction (METHODOLOGY §3), so anything else is a gap.
+        vectors = encode.np.load(memmap, mmap_mode="r")
+        sample = vectors[:: max(1, len(vectors) // 20_000)]
+        norms = encode.np.linalg.norm(sample, axis=1)
+        if not encode.np.allclose(norms, 1.0, atol=1e-3):
+            raise checks.CheckFailed(
+                f"{int((~encode.np.isclose(norms, 1.0, atol=1e-3)).sum())} of "
+                f"{len(sample):,} sampled vectors are not unit length "
+                f"(min {norms.min():.4f}) — a zero row is an unencoded row"
+            )
+        n_indexed = faiss_index.build(memmap, index_path)
+        if n_indexed != stats["n_total"]:
+            raise checks.CheckFailed(
+                f"index holds {n_indexed:,} vectors, memmap has {stats['n_total']:,}"
+            )
+        r.finish(output_rows=n_mapped, input_rows=stats["n_total"])
+
+    print(f"model      : {model_name} ({stats['dim']}-d) on {stats['device']}")
+    print(f"texts      : {stats['n_total']:,} distinct narratives")
+    print(f"encoded    : {stats['encoded']:,} this run "
+          f"(resumed at {stats['resumed_at']:,})")
+    if stats["encoded"]:
+        print(f"throughput : {stats.get('rate', 0):,.0f} texts/s, "
+              f"{stats['seconds'] / 60:.1f} min wall")
+    print(f"memmap     : {memmap} ({memmap.stat().st_size / 1e9:.2f} GB)")
+    print(f"index      : {index_path} ({n_indexed:,} vectors)")
+    print(f"map rows   : {n_mapped:,} complaint_ids -> {stats['n_total']:,} rows"
+          + (f"  ({n_unmapped:,} unmapped, --limit run)" if n_unmapped else ""))
+    return 0
+
+
+def cmd_neighbours(args: argparse.Namespace) -> int:
+    """ROADMAP Phase 3 acceptance: are the 5 nearest neighbours topically right?
+
+    Deliberately prints text rather than a similarity number. The criterion is
+    "correct on inspection", and a cosine of 0.94 tells you nothing about whether
+    two complaints are about the same thing.
+    """
+    import random
+
+    from src.embed import encode
+    from src.embed import index as faiss_index
+
+    con = db.connect(read_only=True)
+    model_name = args.model or CONFIG.embed.model
+    memmap = PATHS.artifacts / f"embeddings.{model_name.split('/')[-1]}.npy"
+    index_path = PATHS.artifacts / f"faiss.{model_name.split('/')[-1]}.index"
+    if not index_path.exists():
+        raise SystemExit(f"no index at {index_path} — run `--phase embed` first")
+
+    vectors = encode.np.load(memmap, mmap_mode="r")
+    idx = faiss_index.load(index_path)
+    rng = random.Random(CONFIG.seed)  # noqa: S311 - sampling, not cryptography
+
+    rows = con.execute(
+        """
+        SELECT e.row_idx, any_value(n.text_redacted), any_value(c.product_family)
+        FROM embedding_map e
+        JOIN narratives n USING (complaint_id)
+        JOIN complaints c USING (complaint_id)
+        WHERE e.model = ? GROUP BY e.row_idx
+        """,
+        [model_name],
+    ).fetchall()
+    by_row = {r[0]: (r[1], r[2]) for r in rows}
+    picked = rng.sample(sorted(by_row), min(args.n, len(by_row)))
+
+    for row in picked:
+        text, family = by_row[row]
+        print(f"\n{'=' * 72}\n[{family}] {' '.join(text.split())[:280]}")
+        print("-" * 72)
+        for neighbour, score in faiss_index.neighbours(idx, vectors, row, args.k):
+            ntext, nfamily = by_row.get(neighbour, ("<not mapped>", "?"))
+            print(f"  {score:.3f} [{nfamily}] {' '.join(ntext.split())[:220]}")
+    return 0
+
+
 def latest_run(con, phase: str) -> str:
     """The most recent successful run of `phase`. Everything Phase 2 reports is
     run-scoped, so reading the wrong run is silently wrong, not an error."""
@@ -658,10 +762,10 @@ PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
     "load": phase_load,
     "normalize": phase_normalize,
     "dedup": phase_dedup,
+    "embed": phase_embed,
 }
 
 PLANNED: dict[str, str] = {
-    "embed": "ROADMAP Phase 3 — encode representatives, build FAISS index",
     "cluster": "ROADMAP Phase 4 [GATE] — UMAP + HDBSCAN + novelty scoring",
     "signals": "ROADMAP Phase 5 — disproportionality, changepoint, FDR",
     "backtest": "ROADMAP Phase 6 [GATE] — point-in-time harness",
@@ -718,6 +822,10 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--gzip", action="store_true",
                        help="restream the snapshot as .csv.gz (DuckDB reads it directly)")
     p_run.add_argument("--csv", help="load from this CSV instead of the snapshot")
+    p_run.add_argument("--model", help="embedding model (default: config)")
+    p_run.add_argument("--batch", type=int, help="encode batch size")
+    p_run.add_argument("--device", help="cpu | mps | cuda (default: autodetect)")
+    p_run.add_argument("--limit", type=int, help="encode only the first N texts")
     p_run.set_defaults(func=cmd_run)
 
     p_gate = sub.add_parser("gate", help="Phase 2 gate report: precision, recall, "
@@ -740,6 +848,12 @@ def main(argv: list[str] | None = None) -> int:
     p_adj.add_argument("--limit", type=int, default=25)
     p_adj.add_argument("--chars", type=int, default=700)
     p_adj.set_defaults(func=cmd_adjudicate)
+
+    p_nn = sub.add_parser("neighbours", help="Phase 3 acceptance: nearest-neighbour read")
+    p_nn.add_argument("-n", type=int, default=10, help="how many query narratives")
+    p_nn.add_argument("-k", type=int, default=5, help="neighbours per query")
+    p_nn.add_argument("--model")
+    p_nn.set_defaults(func=cmd_neighbours)
 
     p_tax = sub.add_parser("taxonomy", help="label vocabulary by volume")
     p_tax.set_defaults(func=cmd_taxonomy)
