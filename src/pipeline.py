@@ -13,6 +13,7 @@ a dispatch table is exactly how that trap gets sprung.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -312,7 +313,12 @@ def phase_embed(args: argparse.Namespace) -> int:
     memmap = PATHS.artifacts / f"embeddings.{model_name.split('/')[-1]}.npy"
     index_path = PATHS.artifacts / f"faiss.{model_name.split('/')[-1]}.index"
 
-    with db.run(con, "embed", CONFIG, params={"model": model_name}) as r:
+    # `limit` belongs in params even when it is None. A --limit smoke run wrote a
+    # runs row that was indistinguishable from a full encode — same phase, same
+    # config_hash, just a smaller output_rows that nothing interprets. Provenance
+    # that cannot tell a test from the real thing is the registry lying quietly.
+    params = {"model": model_name, "limit": args.limit}
+    with db.run(con, "embed", CONFIG, params=params) as r:
         stats = encode.encode_all(
             con, model_name, memmap, batch_size=args.batch or CONFIG.embed.batch_size,
             device=args.device, limit=args.limit,
@@ -794,18 +800,27 @@ def cmd_runs(args: argparse.Namespace) -> int:
     con = db.connect(read_only=True)
     rows = con.execute(
         "SELECT run_id, phase, status, output_rows, started_at, "
-        "substr(git_sha, 1, 12), substr(config_hash, 1, 8), error "
+        "substr(git_sha, 1, 12), substr(config_hash, 1, 8), error, params_json "
         "FROM runs ORDER BY started_at DESC LIMIT ?",
         [args.n],
     ).fetchall()
     if not rows:
         print("no runs recorded")
         return 0
-    print(f"{'phase':<12} {'status':<8} {'rows':>10}  {'started':<20} "
+    print(f"{'phase':<13} {'status':<8} {'rows':>10}  {'started':<20} "
           f"{'git':<13} {'cfg':<9} error")
-    for _run_id, phase, status, out_rows, started, sha, cfg, err in rows:
-        print(f"{phase:<12} {status:<8} {out_rows if out_rows is not None else '-':>10}"
+    partial = False
+    for _run_id, phase, status, out_rows, started, sha, cfg, err, params in rows:
+        # A run over a deliberately truncated input is not a run of the phase.
+        # Without this marker a --limit smoke test and the real thing differ
+        # only by output_rows, which nothing reads as a warning.
+        capped = bool(json.loads(params or "{}").get("limit"))
+        partial |= capped
+        label = f"{phase}{'*' if capped else ''}"
+        print(f"{label:<13} {status:<8} {out_rows if out_rows is not None else '-':>10}"
               f"  {str(started)[:19]:<20} {sha:<13} {cfg:<9} {err or ''}")
+    if partial:
+        print("\n* ran over a truncated input (--limit); not a full run of the phase")
     return 0
 
 

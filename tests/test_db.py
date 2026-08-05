@@ -88,3 +88,42 @@ def test_run_ids_sort_by_creation_time():
     time.sleep(0.005)
     later = db.new_run_id()
     assert earlier < later
+
+
+def test_runs_listing_marks_truncated_runs(con, capsys):
+    """A --limit smoke run must not read as a full run of the phase.
+
+    The embed smoke test wrote a runs row identical in shape to the real thing —
+    same phase, same config_hash, differing only in output_rows, which nothing
+    interprets as "this was a test".
+    """
+    import argparse
+
+    from src import pipeline
+
+    for run_id, params, rows in (
+        ("0000000000001-aaaaaaaa", '{"model": "m", "limit": 5000}', 7822),
+        ("0000000000002-bbbbbbbb", '{"model": "m", "limit": null}', 2477937),
+    ):
+        con.execute(
+            "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+            "started_at, finished_at, status, output_rows) "
+            "VALUES (?, 'embed', 'sha', 'cfg', ?, now(), now(), 'ok', ?)",
+            [run_id, params, rows],
+        )
+
+    original = pipeline.db.connect
+    pipeline.db.connect = lambda **kw: con
+    try:
+        pipeline.cmd_runs(argparse.Namespace(n=10))
+    finally:
+        pipeline.db.connect = original
+
+    out = capsys.readouterr().out
+    assert "embed*" in out, "the truncated run is not marked"
+    assert "--limit" in out, "no legend explaining the marker"
+    # The full run must NOT be marked.
+    assert [ln for ln in out.splitlines() if "2477937" in ln or "2,477,937" in ln]
+    assert not any(
+        "embed*" in ln and "2477937" in ln for ln in out.splitlines()
+    ), "the full run was marked as truncated"
