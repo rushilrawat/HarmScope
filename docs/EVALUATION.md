@@ -99,6 +99,73 @@ disqualification — hidden single-adjudicator is a credibility problem.
 
 ---
 
+### 1.4 Curation protocol (pre-registered 2026-08-05, before any curation code was written)
+
+**The problem this section exists to bound.** `enforcement_candidates.csv` — 212 actions — was
+scraped and committed at `2d4ee04` on 2026-08-04, *before* any cluster or signal existed, which
+is verifiable from the git history and satisfies the spirit of trap T5 for the candidate pool.
+But every judgement column in it is empty, and Phases 4 and 5 have since run. Curation is
+therefore happening **after** the curator has seen which companies produce the strongest
+signals — Lexington Law, Chime, Freedom Financial, Credit Karma, Coinbase, PNC, Klarna among
+them. That contamination cannot be undone. It can only be bounded, by removing discretion from
+every step that decides which actions are evaluated, and by auditing the result.
+
+Both rules below are fixed **here, in this commit, before the code that applies them exists**.
+Whatever counts they produce are the counts that get reported. Wanting to adjust either after
+seeing its yield is the tell that the adjustment is contamination, and any such change must be
+a `Reversed decisions` entry in `ENGINEERING_NOTES.md` naming the number that prompted it.
+
+#### Rule 1 — `usable` has no free parameter
+
+An action is usable if and only if:
+
+1. `filed_date` falls in 2017-01-01 → 2024-12-31 (it has an annual cutoff strictly before it, §1.2), **and**
+2. `company_raw` resolves to a `company_id` present in `complaints` under Rule 2, **and**
+3. that company has at least one narrative-bearing complaint before the action's cutoff.
+
+Otherwise `usable = false` with a mechanical `exclusion_reason`. **There is deliberately no
+minimum-volume threshold.** A company with three complaints stays in and produces an honest
+miss for every system. A threshold would have been a free parameter chosen by someone who
+already knows which companies alerted, and it would have removed exactly the hard cases —
+`DATA.md §4` warns against a set of only easy ones. Excluding undetectable actions would also
+flatter HarmScope specifically, since the natural threshold to reach for is
+`min_supporting_groups`, which is HarmScope's own gate and not B0's.
+
+#### Rule 2 — company resolution is mechanical and conservative
+
+Enforcement filings name companies as `"TransUnion Interactive, Inc., TransUnion, LLC, and
+TransUnion"`; the complaint corpus names them `"TRANSUNION INTERMEDIATE HOLDINGS, INC."`. Exact
+normalized matching, the Phase 1 standard, resolves **0 of 212**. The replacement is still
+conservative — ambiguity resolves to *no match*, never to a guess — because trap T6 has not
+gone away and a wrong company attaches an action to the wrong complaint stream, making every
+lead time computed from it meaningless.
+
+1. Uppercase, strip punctuation, strip trailing legal suffixes (`INC`, `LLC`, `LP`, `LTD`,
+   `CORP`, `CORPORATION`, `CO`, `NA`, `PLLC`, `PC`, `COMPANY`, `HOLDINGS`).
+2. Split the filing's company string on `,` and ` AND ` into fragments; try each.
+3. A fragment matches if the normalized fragment equals a normalized canonical name, **or** is
+   a whole-token prefix of exactly one canonical name. More than one candidate is ambiguity and
+   yields no match.
+4. Ties, empties, and unresolved fragments leave `company_id` NULL and the action unusable with
+   `exclusion_reason = company-unresolved`.
+
+#### The audit that makes this checkable
+
+Contamination in Rule 2 would show up as resolution succeeding more often on companies that
+alert than on comparable companies that do not. After resolution is committed as its own
+artifact, report: the share of resolved companies appearing in the Phase 5 alert list, against
+the share expected from complaint volume alone. A large excess is evidence the matching was
+steered; the absence of one is not proof it was not, but it is the strongest available check
+and it is cheap.
+
+**Anti-leakage item 4 will fail, and is expected to.** The curated `enforcement_actions.csv`
+cannot have a git SHA predating a detection run that already happened. The test asserts the real
+requirement rather than being weakened to check the candidates file instead, and the exemption
+is argued in `ENGINEERING_NOTES.md`. A failing test with a stated reason is worth more than a
+passing test pointed at the wrong file.
+
+---
+
 ## 2. Baselines
 
 Implement all four. The project's contribution is defined entirely by the gap to **B1**.
