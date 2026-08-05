@@ -156,6 +156,9 @@ hand-labelling ROADMAP Phase 2 originally specified — see the Reversed decisio
 ## 3. Embedding
 
 - Default: `BAAI/bge-base-en-v1.5` (768-d). Dev/iteration: `all-MiniLM-L6-v2` (384-d).
+  Measured 2026-08-05 on an M3 Pro: 41 vs 386 texts/s, i.e. 16.8 h vs 2.1 h for the corpus.
+  Phases 3-4 ran on the dev model; every gate number they produced is provisional until
+  reproduced on the default (`ENGINEERING_NOTES.md`, Phases 3-4).
 - Input: `narratives.text_redacted`, **keyed on `text_hash`** — one vector per distinct text,
   not per complaint and not per dup-group representative. "Representatives only" cannot hold:
   representative selection is refit per cutoff, while embeddings are computed once and
@@ -181,10 +184,16 @@ fine-tuned one without a supervised objective is unjustifiable. Note it as a v2 
 ```
 representatives (per product_family)
    → UMAP (n_neighbors=30, n_components=10, metric=cosine, min_dist=0.0)
-   → HDBSCAN (min_cluster_size ∝ family size, min_samples=10, cluster_selection_method='leaf')
+   → HDBSCAN (min_cluster_size=50 fixed, min_samples=10, cluster_selection_method='leaf')
    → exemplars per cluster
    → full-corpus assignment via approximate_predict / FAISS nearest-exemplar + threshold
 ```
+
+`min_cluster_size` is a **fixed 50**, not proportional to family size as earlier drafts of this
+section said. `src/config.py` is what `runs.config_hash` fingerprints, so it is the authority,
+and a threshold that varies with family size would make cluster granularity incomparable
+between families — which is exactly what the novelty score compares. Proportional sizing stays
+available as a deliberate change, not a silent divergence between prose and code.
 
 `min_dist=0.0` and `n_components=10` because UMAP here is a preprocessing step for density
 clustering, not a visualization. `cluster_selection_method='leaf'` yields finer-grained, more

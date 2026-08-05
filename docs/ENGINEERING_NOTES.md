@@ -470,12 +470,135 @@ read with `json_extract` in SQL, so there is one parser and the path is visible
 in the query.
 
 ### Phase 4 — Clustering & novelty [GATE]
-_Params per family:_
-_ARI disjoint halves:_
-_Noise fraction:_
-_Label-ablation AUC:_
-_Could you name 15 random clusters?_
-_Gate passed:_ Y / N
+_Run:_ `1785937994715-d5418cb5` (2026-08-05, git 0c9e16c). **On the dev model —
+see the Phase 3 caveat; the same one applies here.**
+
+_Params per family:_ config as declared — UMAP(30, 10, min_dist 0, cosine),
+HDBSCAN(min_cluster_size 50, min_samples 10, leaf), fit sample 500k,
+`assign_max_distance` 0.35. `min_cluster_size` is the declared constant 50 for
+every family, **not** `METHODOLOGY §4.1`'s "∝ family size". The config is what
+`runs.config_hash` fingerprints, so it is the authority; the prose is
+aspirational and should be corrected or implemented deliberately, not silently.
+
+    family              reps    clusters  fit-noise  assigned  coherence
+    credit_reporting   742,298      959      68.6%     96.6%     0.836
+    debt_collection    329,311      425      71.5%     93.8%     0.792
+    credit_card        205,327      338      64.6%     93.2%     0.784
+    bank_account       192,827      293      68.5%     93.7%     0.789
+    mortgage           144,577      220      67.3%     91.8%     0.772
+    money_service       84,292      182      61.3%     91.8%     0.809
+    vehicle_loan        57,395      118      63.3%     89.2%     0.764
+    student_loan        60,957      111      68.5%     92.1%     0.779
+    personal_loan       39,689       92      67.1%     84.7%     0.752
+    prepaid_card        20,928       61      60.8%     90.9%     0.784
+    debt_relief          5,171       19      49.0%     68.7%     0.758
+    other                  290        3       9.3%     64.8%     0.747
+
+2,821 clusters over 1,883,062 representatives, 94.1% assigned, 15,257
+cross-family `related_clusters` links.
+
+_Noise fraction:_ two numbers, because they answer different questions.
+**HDBSCAN fit-noise is 49-72%** — its own judgement about the sample it saw, and
+the honest measure of how much of this corpus sits in a dense region at all.
+**Final unassigned is 3.4-35.2%** (94.1% assigned overall) — how much is beyond
+`assign_max_distance` of every centroid. The gap between them is the design
+decision recorded in `cluster/fit.py`: HDBSCAN discovers, the threshold decides
+membership, and it decides identically for sampled and unsampled points so that
+a cluster's size does not depend on who got drawn.
+
+_ARI disjoint halves:_ **0.5051** (credit_reporting), **0.5411** (mortgage).
+Each half fit independently, both assigning a held-out set neither had seen.
+
+    credit_reporting   346,149 / 346,149    688 vs 693 clusters   ARI 0.5051 over 47,723
+    mortgage            54,216 /  54,217    121 vs 116 clusters   ARI 0.5411 over 31,780
+
+**What that means, stated plainly:** the *granularity* and *coverage* of the
+partition are highly reproducible — 688 vs 693 clusters is under 1% apart, and
+assignment fractions match to the decimal (96.1% / 96.1%) — while *which cluster
+a given complaint lands in* agrees only about half the time. Leaf selection cuts
+the condensed tree at its finest nodes, so boundaries between hundreds of
+adjacent clusters are exactly where two samples will disagree, and ARI is
+unforgiving about that.
+
+Usable, with the claim capped accordingly: a cluster here is a region of a dense
+neighbourhood, not a canonical object, and nothing downstream may treat cluster
+identity as stable across refits. The architecture already assumes this —
+`cluster_id` is `{run_id}:...` and clusters are refit per cutoff, so the
+backtest never carries an identity between runs. `METHODOLOGY §4.3`'s remedy
+(raise `min_cluster_size`, or switch to excess-of-mass for fewer coarser
+clusters) is available and **not taken**: changing granularity while looking at
+the gate number is how T4 happens.
+
+_Sample-size sweep (credit_reporting; the only family with ≥ 500k):_
+
+    size      clusters  fit noise  assigned  ARI vs largest
+    100,000       254     63.4%     94.0%        0.3253
+    250,000       533     65.8%     95.8%        0.4967
+    500,000       937     67.6%     96.6%        1.0000  (self)
+
+Cluster count is still climbing roughly linearly with sample size at 500k, so
+the partition has **not converged** — the 500k fit is a sample of the structure,
+not the structure. The 250k-vs-500k figure (0.4967) lands on the independent
+half-vs-half figure (0.5051), which is the consistency check that makes both
+believable.
+
+_Label-ablation AUC:_ **0.7909 mean across 11 families, bound 0.7 — PASS.**
+10 of 11 pass; `vehicle_loan` fails at 0.660.
+
+    credit_reporting 0.9171   money_service 0.8706   debt_relief   0.8425
+    credit_card      0.8014   mortgage      0.8012   student_loan  0.7964
+    prepaid_card     0.7848   debt_collection 0.7695 personal_loan 0.7317
+    bank_account     0.7246   vehicle_loan  0.6600 (FAIL)
+
+**It failed first, at 0.6658, and the diagnosis is the useful part.**
+`dominant_label_share` divided by *surviving* labels rather than by cluster
+size, so ablation shrank numerator and denominator together. A 101-member
+bank_account cluster, 99% of it the hidden issue, scored novelty **0.000**: one
+member survived, that member's label was trivially 100% of survivors, and the
+least-explained cluster in the family read as perfectly explained. §5 says
+"fraction of members" — the whole cluster — so this was conformance, not tuning.
+
+Verified rather than asserted, because changing a metric that just failed a gate
+is precisely the T4 shape: recomputing all 2,821 production novelty scores under
+the fix gives a largest difference of **0.00e+00**. Zero moved. Every complaint
+carries an `issue_std` (7 NULLs corpus-wide, none in a cluster), so the two
+denominators coincide outside ablation and the fix cannot have been steered
+toward an outcome it does not touch.
+
+_Could you name 15 random clusters?_ **Yes, 15/15.** Read with narratives:
+
+- Venmo accounts frozen, funds inaccessible, no reason given (454 members)
+- Vanilla gift cards drained before first use (259)
+- Barclays online savings locked after verification documents (130) — flagged novel
+- Navient private student loans and bankruptcy discharge (188)
+- Fortiva retail financing still reporting after payoff (334)
+
+And the negative control §5 asks for: the Convergent FCRA template scores
+novelty **0.141** with 87% of members on one existing label. The score is not
+simply high everywhere.
+
+_Gate passed:_ **Y**, on the four ROADMAP criteria — ARI reported, noise
+reported per family, ablation AUC above 0.7, 15 clusters nameable. The ARI is
+the number to carry forward as a limitation, per §4.3's instruction to report it
+in the README whatever it says.
+
+_A finding recorded rather than fixed:_ both `§5.2` guards are miscalibrated, in
+opposite directions.
+
+    novelty_score >= 0.60   1,254 / 2,821   44.5%
+    coherence     >= 0.45   2,821 / 2,821  100.0%   <- excludes nothing
+    persistence   >= 0.05     305 / 2,821   10.8%   <- median persistence 0.0049
+    all three (is_novel)      124 / 2,821    4.4%
+
+The coherence floor is inert: observed coherence runs 0.74-0.93, so the guard
+against calling an *incoherent* cluster novel never fires. The persistence floor
+does all the filtering and is calibrated for excess-of-mass, while §4.1
+specifies leaf — leaf clusters are the finest nodes in the condensed tree, so
+short lifetimes are structural rather than a quality signal. Both numbers were
+written in Phase 0 before any data existed. Calibrating them against the
+observed distribution is legitimate; calibrating them against which clusters
+they admit is not, so the distribution is recorded and the change left as a
+stated decision.
 
 ### Phase 5 — Signal detection
 _Negative-control (shuffled labels) false-alert rate:_

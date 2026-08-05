@@ -14,13 +14,22 @@ lead time.
 
 ## Status
 
-**Phase 3 complete.** Nothing downstream has run, so there are no results yet —
-see the empty table at the bottom, which stays empty until Phase 9.
+**Phase 4 complete (gate passed).** Nothing downstream has run, so there are no
+results yet — see the empty table at the bottom, which stays empty until Phase 9.
 
-Phase 3 ran on `all-MiniLM-L6-v2`, the model `METHODOLOGY §3` names for
-iteration, not on the `bge-base-en-v1.5` default — measured at 2.1 h versus
-16.8 h for the full corpus. Phase 4 is developed against it; **the Phase 4 gate
-may not be declared on it.**
+`METHODOLOGY §4.3` requires the stability ARI to appear here whatever it says.
+**Disjoint-halves ARI is 0.505** (credit_reporting) and **0.541** (mortgage).
+The partition's granularity and coverage are highly reproducible — 688 vs 693
+clusters, assignment 96.1% vs 96.1% — but which cluster a given complaint lands
+in agrees about half the time. A cluster here is a region of a dense
+neighbourhood, not a canonical object, and nothing downstream may treat cluster
+identity as stable across refits. Cluster count was still climbing at the 500k
+fit sample, so the partition has not converged.
+
+Phases 3 and 4 both ran on `all-MiniLM-L6-v2`, the model `METHODOLOGY §3` names
+for iteration, not the `bge-base-en-v1.5` default — 2.1 h versus 16.8 h measured
+for the full corpus. **The Phase 4 gate numbers above are therefore provisional**
+and must be reproduced on bge-base before Phase 6 freezes anything.
 
 The Phase 2 gate passed on a **changed** criterion: ROADMAP asked for 300
 hand-labelled pairs, and no human was available, so the disagreements were
@@ -34,7 +43,7 @@ decisions rather than presented as satisfying the original bar.
 | 1 — Ingestion & normalization | ✅ 16.5M complaints, 3.83M narratives, crosswalk covers both schema eras |
 | 2 — Dedup & campaign detection **[GATE]** | ✅ gate passed — precision 1.000 on blind-adjudicated labels, recall 0.765 |
 | 3 — Embedding & index | ✅ 2.48M vectors, 10/10 neighbour checks — on the dev model, see note |
-| 4 — Clustering & novelty **[GATE]** | ⬜ |
+| 4 — Clustering & novelty **[GATE]** | ✅ gate passed — ablation AUC 0.791; **disjoint-halves ARI 0.505** |
 | 5 — Signal detection | ⬜ |
 | 6 — Ground truth & backtest **[GATE]** | ⬜ |
 | 7 — Baselines | ⬜ |
