@@ -26,7 +26,7 @@ harmscope/
 │   │   ├── enforcement_actions.csv        # hand-curated, COMMITTED
 │   │   ├── company_canonical_manual.csv   # top-300 hand review, COMMITTED
 │   │   ├── taxonomy_crosswalk.csv         # old->new labels, COMMITTED
-│   │   └── dedup_eval_pairs.csv           # 300 hand-labeled pairs, COMMITTED
+│   │   └── dedup_eval_pairs.csv           # 300 pairs, exact-Jaccard labels, COMMITTED
 │   ├── interim/                 # gitignored
 │   └── artifacts/               # embeddings .npy, faiss index (gitignored)
 │
@@ -39,15 +39,19 @@ harmscope/
 │   ├── db.py                    # DuckDB connection, run registry
 │   ├── ingestion/
 │   │   ├── download.py
-│   │   ├── load.py              # CSV -> complaints_raw -> complaints
+│   │   ├── load.py              # CSV -> complaints_raw
+│   │   ├── build.py             # complaints, narratives, PII sweep
 │   │   └── enforcement.py       # scrape + load ground truth
 │   ├── normalization/
 │   │   ├── company.py           # canonical company resolution
-│   │   └── taxonomy.py          # crosswalk application
+│   │   ├── taxonomy.py          # crosswalk application
+│   │   ├── pii.py               # secondary redaction sweep
+│   │   └── text.py              # normalize + hash for exact dedup
 │   ├── dedup/
-│   │   ├── exact.py             # hash-based
-│   │   ├── minhash.py           # MinHash + LSH near-dup
-│   │   └── template.py          # mass-filing campaign detection
+│   │   ├── minhash.py           # MinHash, LSH banding, star clustering
+│   │   ├── detect.py            # phase driver: exact -> near-dup -> campaigns
+│   │   ├── campaign.py          # the five campaign-scoring signals
+│   │   └── evalset.py           # the gate's 300-pair scoring
 │   ├── embed/
 │   │   ├── encode.py            # sentence-transformers -> .npy memmap
 │   │   └── index.py             # FAISS build / query
@@ -126,15 +130,17 @@ readability, not its correctness.
 ```sql
 -- ============ provenance ============
 CREATE TABLE runs (
-  run_id        VARCHAR PRIMARY KEY,   -- ulid
+  run_id        VARCHAR PRIMARY KEY,   -- lexicographically time-sortable, see src/db.py
   phase         VARCHAR NOT NULL,
-  git_sha       VARCHAR NOT NULL,
+  git_sha       VARCHAR NOT NULL,      -- '-dirty' suffix if the tree had uncommitted changes
+  config_hash   VARCHAR NOT NULL,      -- sha256 of the frozen Config; proves thresholds were not retuned (trap T4)
   params_json   JSON NOT NULL,
   input_rows    BIGINT,
   output_rows   BIGINT,
   started_at    TIMESTAMP NOT NULL,
   finished_at   TIMESTAMP,
-  status        VARCHAR NOT NULL       -- running | ok | failed
+  status        VARCHAR NOT NULL CHECK (status IN ('running', 'ok', 'failed')),
+  error         VARCHAR
 );
 
 -- ============ core ============
@@ -171,11 +177,19 @@ CREATE TABLE company_alias (
   method      VARCHAR
 );
 
+-- Keyed on (product, sub_product), not product alone: two of the 2017/2023
+-- restructurings are splits rather than renames (Consumer Loan -> vehicle/payday;
+-- Credit card or prepaid card -> credit card/prepaid), so the sub-product decides
+-- the target. Migration 001. Issue/sub-issue are not crosswalked -- the novelty
+-- score is measured against the raw labels, so remapping them would destroy the
+-- thing being measured.
 CREATE TABLE taxonomy_crosswalk (
-  product_raw VARCHAR, issue_raw VARCHAR, sub_issue_raw VARCHAR,
-  product_std VARCHAR, issue_std VARCHAR, sub_issue_std VARCHAR,
-  product_family VARCHAR NOT NULL,     -- coarse grouping used for stratification
-  effective_from DATE, effective_to DATE
+  product_raw     VARCHAR NOT NULL,
+  sub_product_raw VARCHAR NOT NULL,    -- '*' = applies to every sub-product
+  product_std     VARCHAR NOT NULL,    -- current-era name for this family
+  product_family  VARCHAR NOT NULL,    -- coarse grouping used for stratification
+  era             VARCHAR,             -- which schema era the raw label belongs to
+  PRIMARY KEY (product_raw, sub_product_raw)
 );
 
 CREATE TABLE complaints (               -- analysis-ready
@@ -224,16 +238,33 @@ CREATE TABLE campaigns (                -- suspected mass filings; refit per cut
   campaign_id   VARCHAR PRIMARY KEY,    -- '{run_id}:campaign:{local_id}'
   run_id        VARCHAR NOT NULL REFERENCES runs(run_id),
   n_complaints  BIGINT NOT NULL,
+  n_groups      BIGINT NOT NULL,
   first_seen    DATE, last_seen DATE,
   top_company_id VARCHAR,
+  product_family VARCHAR NOT NULL,
+  -- Five scoring signals (migration 003 dropped submitted_via_concentration:
+  -- every narrative-bearing complaint is 'Web', so it was a constant).
   burstiness    DOUBLE,
   state_concentration DOUBLE,
+  company_concentration DOUBLE,
+  length_cv     DOUBLE,
   boilerplate_score DOUBLE,
+  n_signals     INTEGER NOT NULL,       -- how many fired, so a flag is auditable
   flagged       BOOLEAN NOT NULL,
   as_of         DATE NOT NULL
 );
-CREATE TABLE campaign_members (
-  complaint_id BIGINT PRIMARY KEY, campaign_id VARCHAR NOT NULL
+CREATE TABLE campaign_members (         -- a complaint can be in one campaign per run
+  complaint_id BIGINT NOT NULL,
+  campaign_id  VARCHAR NOT NULL REFERENCES campaigns(campaign_id),
+  PRIMARY KEY (complaint_id, campaign_id)
+);
+
+CREATE TABLE redaction_stats (          -- per-pattern PII sweep counts, per run
+  run_id      VARCHAR NOT NULL REFERENCES runs(run_id),
+  pattern     VARCHAR NOT NULL,
+  n_hits      BIGINT NOT NULL,
+  n_documents BIGINT NOT NULL,          -- documents touched, not total hits
+  PRIMARY KEY (run_id, pattern)
 );
 
 -- ============ embeddings & clusters ============
@@ -250,6 +281,7 @@ CREATE TABLE clusters (
   product_family VARCHAR NOT NULL,      -- clustering is stratified
   n_members      BIGINT NOT NULL,
   persistence    DOUBLE,                -- HDBSCAN cluster persistence
+  coherence      DOUBLE,                -- mean intra-cluster cosine similarity
   centroid_idx   BIGINT,                -- medoid complaint row_idx
   as_of          DATE NOT NULL          -- point-in-time guard
 );
@@ -279,6 +311,8 @@ CREATE TABLE cluster_labels (           -- LLM output; descriptive only
   consumer_impact   VARCHAR,
   distinct_from_taxonomy BOOLEAN,
   rationale         VARCHAR,
+  confidence        VARCHAR,
+  is_likely_template BOOLEAN,           -- the LLM's own campaign suspicion, never a detector input
   model             VARCHAR, prompt_version VARCHAR,
   input_hash        VARCHAR,            -- cache key
   human_verified    BOOLEAN DEFAULT FALSE,
@@ -309,7 +343,8 @@ CREATE TABLE signals (
   ci_low        DOUBLE, ci_high DOUBLE,
   p_value       DOUBLE,
   q_value       DOUBLE,                 -- BH-corrected
-  n_supporting  BIGINT NOT NULL,
+  n_supporting  BIGINT NOT NULL,        -- raw complaint count
+  n_supporting_groups BIGINT,           -- distinct dup_groups; 400 complaints in 3 groups is weak
   as_of         DATE NOT NULL           -- point-in-time guard
 );
 
@@ -328,7 +363,7 @@ CREATE TABLE backtest_links (           -- human-adjudicated cluster <-> action 
   action_id  VARCHAR NOT NULL,
   cluster_id VARCHAR NOT NULL,
   match_quality VARCHAR NOT NULL,       -- strong | partial | none
-  adjudicated_by VARCHAR, notes VARCHAR,
+  adjudicated_by VARCHAR, notes VARCHAR, adjudicated_at TIMESTAMP,
   PRIMARY KEY (action_id, cluster_id)
 );
 

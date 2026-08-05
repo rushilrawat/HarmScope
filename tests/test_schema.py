@@ -164,3 +164,58 @@ def test_run_status_is_constrained(con):
             "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
             "started_at, status) VALUES ('x', 'p', 's', 'c', '{}', now(), 'finished')"
         )
+
+
+def test_architecture_doc_matches_the_real_schema():
+    """ARCHITECTURE.md §4 says it is a defect when it disagrees with schema.sql.
+
+    Nothing checked that. Migration 002 added five columns to `campaigns` and
+    changed `campaign_members`' primary key; the doc kept the old listing for
+    three commits, still describing a table that had not existed since Phase 1.
+    Column names only — types and constraints are schema.sql's business, and a
+    check that strict would fail on whitespace.
+    """
+    import re
+
+    from src.config import PATHS
+
+    def columns(sql: str) -> dict[str, set[str]]:
+        out = {}
+        for table, body in re.findall(
+            r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)\s*\((.*?)\n\);", sql, re.S
+        ):
+            names = set()
+            for line in body.splitlines():
+                line = line.split("--")[0].strip().rstrip(",")
+                token = line.split()[0] if line else ""
+                if token and token.upper() not in {
+                    "PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT"
+                }:
+                    names.add(token)
+                    # `first_seen DATE, last_seen DATE` shares a line.
+                    for extra in re.findall(r",\s*(\w+)\s+\w+", line):
+                        names.add(extra)
+            out[table] = names
+        return out
+
+    real = columns((PATHS.root / "db" / "schema.sql").read_text())
+    doc_sql = re.search(
+        r"```sql\n(.*?)```", (PATHS.root / "docs" / "ARCHITECTURE.md").read_text(), re.S
+    )
+    assert doc_sql, "ARCHITECTURE.md §4 no longer contains a sql block"
+    documented = columns(doc_sql.group(1))
+
+    assert documented, "parsed no tables out of the ARCHITECTURE.md sql block"
+    # Both directions. `redaction_stats` existed since Phase 0 and appeared in
+    # no version of the doc, which the one-directional check could not see.
+    assert set(real) == set(documented), (
+        f"undocumented in ARCHITECTURE.md: {sorted(set(real) - set(documented))}; "
+        f"documented but not in schema.sql: {sorted(set(documented) - set(real))}"
+    )
+    for table, doc_cols in documented.items():
+        assert table in real, f"ARCHITECTURE.md documents table {table!r}, schema.sql has no such table"
+        assert doc_cols == real[table], (
+            f"{table}: ARCHITECTURE.md and db/schema.sql disagree. "
+            f"only in the doc: {sorted(doc_cols - real[table])}; "
+            f"missing from the doc: {sorted(real[table] - doc_cols)}"
+        )

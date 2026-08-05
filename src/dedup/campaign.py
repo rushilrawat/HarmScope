@@ -56,13 +56,12 @@ def feature_sql(run_id: str) -> str:
     return f"""
     WITH members AS (
       SELECT g.group_id, g.complaint_id, c.date_received, c.product_family,
-             c.company_id, c.state, r.submitted_via, n.char_len,
+             c.company_id, c.state, n.char_len,
              CASE WHEN regexp_matches(n.text_redacted, '{BOILERPLATE_RE}')
                   THEN 1 ELSE 0 END AS boiler
       FROM dup_groups g
-      JOIN complaints      c USING (complaint_id)
-      JOIN complaints_raw  r USING (complaint_id)
-      JOIN narratives      n USING (complaint_id)
+      JOIN complaints c USING (complaint_id)
+      JOIN narratives n USING (complaint_id)
       WHERE g.run_id = '{run_id}'
     ),
     daily AS (           -- Fano factor needs the per-day counts, zeros included
@@ -101,7 +100,6 @@ def concentration_sql(run_id: str, column: str) -> str:
       SELECT g.group_id, {column} AS v
       FROM dup_groups g
       JOIN complaints c USING (complaint_id)
-      JOIN complaints_raw r USING (complaint_id)
       WHERE g.run_id = '{run_id}'
     ), per AS (
       SELECT group_id, v, count(*) AS n FROM m GROUP BY 1, 2
