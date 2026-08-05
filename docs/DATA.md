@@ -34,7 +34,7 @@ whichever comes first. The database generally updates daily.
 | `State` | categorical | Consumer mailing address state |
 | `ZIP code` | text | **Privacy-suppressed.** 5-digit published unless the consumer is in a Census ZCTA under 20,000 people *and* consented to narrative publication — then 3-digit, or nothing. This means ZIP presence correlates with narrative consent. Do not use ZIP as a feature. |
 | `Tags` | text | `Older American`, `Servicemember` — used for subgroup analysis |
-| `Submitted via` | categorical | Web, phone, referral, etc. |
+| `Submitted via` | categorical | Web, phone, referral, etc. **Constant once you filter to narratives** — see §5 |
 
 ## 3. The five quirks that will break naive analysis
 
@@ -174,7 +174,15 @@ Measured from the **2026-08-03** snapshot (sha256 `841c146e…`, 1,409,256,676 b
 | `complaints` (≥ 2015-01-01) | 16,564,967 | Analysis-ready, crosswalked, company-resolved |
 | `narratives` (≥ 2015-01-01) | 3,830,002 | PII-swept; 0.296% needed any redaction |
 | Canonical companies | 7,991 from 8,042 raw strings | Exact-normalization merges only (§3.5) |
-| 2015+, with narrative, post-dedup | target ≤ 3×10⁶ | This is the embedding workload |
+| 2015+, with narrative, post-dedup | 1,883,062 groups | Measured 2026-08-04; this is the embedding workload |
+| `Submitted via` over narratives | **`Web`, 100%** | All 3,830,002. Constant — see below |
+
+**`Submitted via` is not a usable feature over narratives.** The full corpus has
+six channels and is 96% web; the narrative-bearing subset is 100% web, all
+3,830,002 rows, in every product family. CFPB collects narrative consent on the
+web form only, so conditioning on "has a narrative" silently conditions on
+"arrived by web". Anything keyed on submission channel is a constant here — this
+already cost `METHODOLOGY §2.2` one of its six campaign-detection features.
 
 Family volume, 2015+ — credit reporting dominates exactly as §3.3 warns, at
 **82.5%** of the corpus. Never report a single global cluster count as a headline:

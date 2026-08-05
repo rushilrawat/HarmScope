@@ -186,14 +186,32 @@ over the 151 pairs at or above the detector's own 0.88 threshold. 22 pairs were
 merged despite true Jaccard below 0.88 — MinHash overestimating near the bar,
 the effect `d9ead66` identified.
 
-_What star clustering actually cost:_ nothing measurable in recall, and it fixed
-the blowup. Union-find at the same threshold: precision 0.9112, largest group
-84,657, mean group size 3,709, 1.8M narratives in groups over 1,000. Star
-clustering: precision 0.9477, largest group 49,457, 702,032 narratives in groups
-over 1,000. Group-level recall at threshold (0.8675) lands on the *pairwise*
-recall measured during the sweep (0.8674), i.e. bounding group diameter to one
-hop from the seed costs essentially none of the recall the pairwise decisions
-had to give — the chaining it removed was all false merges.
+_What star clustering actually cost:_ **21 pairs of recall, bought with 7 fewer
+false merges.** Measured directly rather than inferred: of the 163 eval pairs
+carrying a verified edge in `dup_pairs`, star clustering puts **23 in different
+groups** (21 of them labelled `dup`) because A was admitted to one seed's star
+and B to another's. Union-find cannot do that — every verified edge lies inside
+one component — so its group recall on this set would have been 166/181 =
+0.9171 against star's 145/181 = 0.8011.
+
+    union-find, threshold 0.88   precision 0.9112   recall ceiling 0.9171
+    star clustering              precision 0.9477   recall         0.8011
+    largest group   84,657 -> 49,457
+    in groups >1000  1.8M   -> 702,032
+
+The false-merge side reconciles with `d9ead66`'s split of "6 direct + 9
+transitive-only": star removed 7 of the 9 transitive false merges and left 2.
+Those 2 survive because **star groups are 2 hops wide between members, not 1** —
+13 of the 153 merged pairs have no verified edge between them at all and are
+together only by way of a shared seed. "Bounds group diameter at one hop" means
+one hop *from the seed*; two arbitrary members are two.
+
+An earlier version of this note claimed star clustering cost no recall, on the
+grounds that group recall at threshold (0.8675) matched the pairwise recall from
+the sweep (0.8674). Those are different denominators — 131/151 and something
+over 181 — that agree to four decimals by coincidence. The trade is real and it
+is the honest argument for the change: 21 pairs of recall is a fair price for
+removing a 84,657-member chain, and unlike "free" it is checkable.
 
 _Gate passed:_ **N.**
 
@@ -239,12 +257,16 @@ Every one of the twelve largest unflagged candidates scores exactly **2**
 signals against a bar of 3, and the two dead signals are structural, not
 threshold choices:
 
-1. **`submitted_via_concentration` cannot fire in credit reporting.** The family
-   baseline HHI is **1.0** — essentially every credit-reporting complaint
-   arrives through one channel — and the rule asks a group to exceed
-   `1.5 × baseline`. An HHI cannot exceed 1.0. It fired 0 times in 2,841
-   unflagged candidates. The flag is really "3 of 5" in the family that matters
-   most.
+1. **`submitted_via_concentration` is a constant, not a weak signal.** All
+   **3,830,002** narrative-bearing complaints have `submitted_via = 'Web'` —
+   every one, in every family. CFPB only collects narrative consent on the web
+   form, so conditioning on "has a narrative" conditions on "arrived by web".
+   The corpus as a whole is 96% web and 6 channels; the population this detector
+   actually sees is 100% web and 1. Family baseline HHI is exactly 1.0 in all 12
+   families, the rule asks a group to exceed `1.5 × baseline`, and an HHI cannot
+   exceed 1.0. It fired **0 times in 2,841** unflagged candidates and cannot
+   ever fire. `METHODOLOGY §2.2` specifies six campaign features; there have
+   only ever been five, so `campaign_min_signals = 3` has always been 3-of-5.
 2. **`company_concentration` is backwards for tri-bureau blasts.** The family
    baseline is 0.2674 and the bar is 0.401. A template mailed to all three
    bureaus scores ≈ 0.33 — *below* the bar. The single most characteristic
@@ -270,13 +292,24 @@ _What the gate still needs, in order:_
    made this decidable: among the 111 pairs labelled `not_dup` and left
    unmerged, exactly **1** has 50%+ of the shorter narrative verbatim-identical
    to the other, against 3 of the 8 disputed merges and 91 of the 145 agreed
-   merges. So the proxy is sound on the negatives and the asymmetry is real —
-   but the adjudication is a human's to make and is recorded here unapplied.
+   merges. That is a lower bound, not a measurement — a shared-prefix metric
+   misses any template that varies early, and it scored 5 of the 8 disputed
+   merges below 50% even though reading them says otherwise. So: **the proxy is
+   not shown to be broken on the negatives**, by a metric that would miss most
+   templated ones. The adjudication is a human's to make and is recorded here
+   unapplied either way.
 2. Fix the two dead campaign signals, then re-read.
 3. `data/interim/dedup_near_misses.csv` — 300 rejected LSH candidates sampled
-   during the run, of which **14 (4.7%) were true duplicates** by exact Jaccard.
-   That is the verifier's loss in the band below threshold, and it is the only
-   recall figure in this section that the eval file could not have produced.
+   during the run, the only recall figure here the eval file could not have
+   produced. Stratified, because the pooled 4.7% averages two different
+   populations and hides where the loss is:
+
+       est_sim in [0.85, 0.88)   12 / 50   24.0% were true duplicates
+       est_sim in [0.58, 0.85)    2 / 250   0.8% were true duplicates
+
+   The loss is entirely in the sliver just under the bar, which is what MinHash
+   estimation error predicts and what raising the threshold from 0.85 to 0.88
+   bought the precision with. Nothing is being lost further down.
 
 ### Phase 3 — Embedding & index
 _Model, throughput, wall time:_

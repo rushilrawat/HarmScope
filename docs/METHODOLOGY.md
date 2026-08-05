@@ -53,9 +53,18 @@ first, ties on lowest id: the canonical copy of a template has the most neighbou
 ordering is deterministic. Exact duplicates are collapsed first and only their representatives
 are seeded, so a seed cannot admit half of a byte-identical group.
 
-The cost is recall: two genuine copies of one template that both differ from the seed can land
-in different groups. That trade is deliberate (precision is the gate, §2.4) and its size is
-reported, not assumed — see `ENGINEERING_NOTES.md` Phase 2.
+One hop is measured **from the seed**. Two arbitrary members of a star are two hops apart and
+need not clear the threshold against each other — 13 of the 153 merged eval pairs have no
+verified edge between them at all.
+
+The cost is recall, and it is paid in both directions. A verified edge can be *split*: if A is
+admitted to one seed's star and B to another's, they land in different groups even though the
+pair cleared the threshold. Union-find cannot do that — every verified edge lies inside one
+component — so union-find's group recall is always ≥ pairwise recall, and star's is not.
+Measured on the 300-pair set: 23 of the 163 pairs with a verified edge are split, costing 21
+dup-labelled pairs (recall 0.9171 → 0.8011) and buying 7 fewer false merges
+(precision 0.9112 → 0.9477). Deliberate — precision is the gate, §2.4 — and measured rather
+than assumed. See `ENGINEERING_NOTES.md` Phase 2.
 
 **Pairs and groups are stored separately**, because only one of them depends on
 the cutoff. `dup_pairs` holds the pairwise similarities — computed once over the
@@ -74,10 +83,17 @@ evade MinHash. Compute per candidate campaign (a dup_group, or a tight embedding
 | `boilerplate_score` | density of statutory citations + formulaic legal phrasing |
 | `company_concentration` | HHI over `company_id` |
 | `length_variance` | templates have unnaturally low length variance |
-| `submitted_via_concentration` | campaigns come through one channel |
+| ~~`submitted_via_concentration`~~ | **dead — see below.** Every narrative-bearing complaint is `Web` |
 
 Combine into a flag with a hand-tuned threshold, validated on the labeled sample. Do not train
 a supervised model here — you do not have enough labels and the features are interpretable.
+
+**There are five features, not six.** All 3,830,002 narrative-bearing complaints have
+`submitted_via = 'Web'` — CFPB only collects narrative consent on the web form, so conditioning
+on "has a narrative" conditions on "arrived by web". The HHI is 1.0 for every group and every
+family baseline, and a rule asking for `1.5 × baseline` can never fire. `campaign_min_signals`
+is therefore 3-of-5. Two further defects in the remaining five are diagnosed in
+`ENGINEERING_NOTES.md` Phase 2 and are **not yet fixed**.
 
 ### 2.3 Handling, not deletion
 
