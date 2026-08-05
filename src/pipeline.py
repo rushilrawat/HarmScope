@@ -987,6 +987,93 @@ def cmd_adjudicate(args: argparse.Namespace) -> int:
     return 0
 
 
+ALERT_SQL = """
+WITH fired AS (
+  SELECT cluster_id, company_id,
+         max(CASE WHEN method = 'ebgm' THEN statistic END)   AS eb05,
+         min(CASE WHEN method = 'ebgm' THEN q_value END)     AS q_value,
+         max(CASE WHEN method IN ('ewma', 'pelt') THEN 1 ELSE 0 END) AS changed,
+         min(CASE WHEN method IN ('ewma', 'pelt') THEN period_month END) AS change_month,
+         max(n_supporting)        AS n_supporting,
+         max(n_supporting_groups) AS n_groups
+  FROM signals WHERE run_id = ? GROUP BY 1, 2
+)
+SELECT c.product_family, f.company_id, f.cluster_id, f.eb05, f.q_value,
+       f.changed, f.change_month, f.n_supporting, f.n_groups,
+       c.coherence, c.persistence, n.novelty_score, n.is_novel, n.dominant_label
+FROM fired f
+JOIN clusters c USING (cluster_id)
+LEFT JOIN cluster_novelty n USING (cluster_id)
+WHERE c.coherence >= ?
+  AND f.n_groups >= ?
+  AND (f.q_value <= ? OR f.changed = 1)
+  AND (? = 'all'
+       OR (? = 'novel' AND n.novelty_score >= ?)
+       OR (? = 'known' AND n.novelty_score <  ?))
+ORDER BY f.eb05 DESC NULLS LAST, f.n_groups DESC
+LIMIT ?
+"""
+
+
+def cmd_alerts(args: argparse.Namespace) -> int:
+    """METHODOLOGY §6.3 — the joint criteria, ranked by EB05.
+
+    An alert is not a significant test. It is a coherent cluster, carrying
+    enough distinct dup-groups to not be one filing, that either fires
+    disproportionality below the FDR bound or shows a changepoint. Campaign
+    -flagged complaints never entered the panel, so that criterion is satisfied
+    upstream rather than filtered here.
+
+    Two tracks, labelled separately as §6.3 allows: `novel` is the contribution,
+    `known` is the sanity check that the machinery finds things anyone would
+    already know about.
+    """
+    con = db.connect(read_only=True)
+    run_id = args.run_id or latest_run(con, "signals")
+    track = args.track
+    rows = con.execute(ALERT_SQL, [
+        run_id, CONFIG.novelty.min_coherence, CONFIG.signals.min_supporting_groups,
+        CONFIG.signals.fdr_alpha, track, track, CONFIG.novelty.threshold,
+        track, CONFIG.novelty.threshold, args.n,
+    ]).fetchall()
+
+    print(f"run    : {run_id}")
+    print(f"track  : {track}   (coherence >= {CONFIG.novelty.min_coherence}, "
+          f"groups >= {CONFIG.signals.min_supporting_groups}, "
+          f"q <= {CONFIG.signals.fdr_alpha} or changepoint)")
+    print(f"alerts : {len(rows)} shown\n")
+    if not rows:
+        print("none — which is a finding, not an error")
+        return 0
+
+    for (family, company, cluster, eb05, q, changed, change_month,
+         n_sup, n_groups, coh, _pers, novelty, is_novel, dominant) in rows:
+        name = con.execute(
+            "SELECT canonical_name FROM company_canonical WHERE company_id = ?",
+            [company],
+        ).fetchone()
+        label = (name[0] if name else company)[:38]
+        print(f"[{family}] {label}")
+        print(f"  EB05 {eb05 if eb05 is None else round(eb05, 2)}  "
+              f"q={'—' if q is None else f'{q:.2e}'}  "
+              f"{'changepoint ' + str(change_month) if changed else 'no changepoint'}")
+        print(f"  {n_groups:,} groups / {n_sup:,} complaints   "
+              f"coherence {coh:.2f}  novelty {novelty:.2f}"
+              f"{'  NOVEL' if is_novel else ''}")
+        print(f"  nearest existing label: {dominant}")
+        if args.evidence:
+            for (text,) in con.execute(
+                """
+                SELECT n.text_redacted FROM cluster_members m
+                JOIN narratives n USING (complaint_id)
+                WHERE m.cluster_id = ? ORDER BY m.is_exemplar DESC LIMIT 2
+                """, [cluster],
+            ).fetchall():
+                print("    • " + " ".join(text.split())[:200])
+        print()
+    return 0
+
+
 def _months(con) -> list:
     return [r[0] for r in con.execute(
         "SELECT DISTINCT period_month FROM complaints ORDER BY 1"
@@ -1024,7 +1111,9 @@ def phase_signals(args: argparse.Namespace) -> int:
               f"(of {len(cells):,} company x cluster pairs)")
 
         series = timeseries.series(con, cluster_run)
-        changes = changepoint.detect(series, months, CONFIG.signals)
+        changes = changepoint.detect(
+            series, months, CONFIG.signals, CONFIG.signals.min_supporting_groups
+        )
         print(f"changepoint: {len(changes):,} series fired of {len(series):,}")
 
         rows = _build_signals(con, r.run_id, cluster_run, scored, changes,
@@ -1118,13 +1207,21 @@ def _shuffle_clusters(con, seed: int) -> int:
 
 
 def _build_signals(con, run_id, cluster_run, scored, changes, as_of, make_id):
-    """Assemble signal rows, carrying both support counts on every one."""
+    """Assemble signal rows, carrying both support counts on every one.
+
+    `n_supporting_groups` is **distinct** groups over the whole window, not the
+    sum of monthly group counts. Summing the panel counted a group once per
+    month it stayed active, so a single template running for two years reported
+    24 supporting groups and sailed past the `min_supporting_groups` gate that
+    exists precisely to stop one filing from looking like many.
+    """
     support = dict(con.execute("""
-        SELECT (cluster_id, company_id),
-               (sum(n), count(DISTINCT period_month))
-        FROM cluster_timeseries t JOIN clusters c USING (cluster_id)
-        WHERE c.run_id = ? GROUP BY 1
-    """, [cluster_run]).fetchall())
+        SELECT (cluster_id, coalesce(company_id, '__ALL__')), n FROM (
+          SELECT cluster_id, company_id, count(DISTINCT group_id) AS n
+          FROM _expanded WHERE cluster_id IS NOT NULL
+          GROUP BY GROUPING SETS ((cluster_id, company_id), (cluster_id))
+        )
+    """).fetchall())
     raw = dict(con.execute("""
         SELECT (cluster_id, coalesce(company_id, '__ALL__')), n FROM (
           SELECT cluster_id, company_id, count(*) AS n FROM _expanded
@@ -1137,7 +1234,7 @@ def _build_signals(con, run_id, cluster_run, scored, changes, as_of, make_id):
         "SELECT DISTINCT period_month FROM complaints").fetchall())
     for s in scored:
         key = (s.cluster_id, s.company_id)
-        groups = support.get(key, (0, 0))[0] or 0
+        groups = support.get(key, 0)
         rows.append((
             make_id(run_id, i), run_id, s.cluster_id, s.company_id, latest,
             "ebgm", s.eb05, s.prr_low, s.prr_high, s.p_value, s.q_value,
@@ -1147,7 +1244,7 @@ def _build_signals(con, run_id, cluster_run, scored, changes, as_of, make_id):
     for (cluster_id, company_id), fired in changes.items():
         for change in fired:
             key = (cluster_id, company_id)
-            groups = support.get(key, (0, 0))[0] or 0
+            groups = support.get(key, 0)
             rows.append((
                 make_id(run_id, i), run_id, cluster_id, company_id, change.period,
                 change.method, change.statistic, None, None, None, None,
@@ -1487,6 +1584,13 @@ def main(argv: list[str] | None = None) -> int:
     p_cl.add_argument("--run-id")
     p_cl.add_argument("--novel-only", action="store_true")
     p_cl.set_defaults(func=cmd_clusters)
+
+    p_al = sub.add_parser("alerts", help="Phase 5: the joint alert criteria (§6.3)")
+    p_al.add_argument("-n", type=int, default=20)
+    p_al.add_argument("--run-id")
+    p_al.add_argument("--track", default="novel", choices=["novel", "known", "all"])
+    p_al.add_argument("--evidence", action="store_true", help="show exemplar text")
+    p_al.set_defaults(func=cmd_alerts)
 
     p_tax = sub.add_parser("taxonomy", help="label vocabulary by volume")
     p_tax.set_defaults(func=cmd_taxonomy)

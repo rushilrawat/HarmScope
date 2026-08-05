@@ -122,11 +122,20 @@ def pelt_alarm(
 
 
 def detect(
-    series: dict, months: list[date], cfg
+    series: dict, months: list[date], cfg, min_groups: int = 0
 ) -> dict[tuple[str, str], list[Change]]:
-    """Run both detectors over every series. Returns only series that fired."""
+    """Run both detectors over every series. Returns only series that fired.
+
+    Series carrying fewer than `min_groups` distinct groups are skipped, not
+    scored. METHODOLOGY §6.3 requires `n_supporting_groups >= minimum` for an
+    alert, so a changepoint on a series below it can never become one — and PELT
+    over ~200,000 mostly-tiny series is the dominant cost of the phase, which
+    Phase 6 pays eight times over for its eight cutoffs.
+    """
     out: dict[tuple[str, str], list[Change]] = {}
     for key, points in series.items():
+        if min_groups and sum(n for _m, n, _d, _s in points) < min_groups:
+            continue
         values = densify(points, months)
         fired = [
             change for change in (
