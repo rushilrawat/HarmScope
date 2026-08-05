@@ -322,9 +322,44 @@ representatives, 41,161,012 LSH candidates, 12,935,450 verified, 1,883,062
 groups, and the same 145/8/36/111 confusion matrix. The campaign fix changed
 only the campaign layer, as intended.
 
+_Adjudication, and the measurement gap it exposed (2026-08-05):_
+
+All 100 `hard` pairs were read blind under the rule pre-registered in
+`METHODOLOGY §2.4.1` — shuffled, with the detector's decision, the proxy label
+and `true_jaccard` withheld. **All 100 are instances of one template.** Not 82,
+which is what the proxy says. The stratum was drawn from `dup_pairs`, i.e. from
+pairs that had already cleared LSH banding and Jaccard verification, so every
+pair in it is a genuine near-duplicate and **the stratum contains no true
+negatives at all**. Its 18 `not_dup` labels are all wrong.
+
+    against adjudicated labels   precision 1.0000 (153/153)   recall 0.7650
+
+That 1.0000 is not the good news it looks like, and the merge audit is why.
+`dedup_eval_pairs.csv` samples pairs *with a verified edge*. Star clustering
+admits members to a **seed**, so two arbitrary members of a group need no edge
+between them — in the 49,457-member star, 49,456 of roughly 1.2 billion
+member-pairs are edges. Sampling 40 same-group pairs the way the corpus actually
+holds them:
+
+    3 of 40 have a verified edge; 37 are seed-mediated.
+    The eval set can only ever sample the first kind — 8% of real merges.
+
+So every precision figure in this section, including the 0.9477 that failed the
+gate and the 1.0000 that passes it, was computed on 8% of the merge population,
+and no number computed from that file could have said so. Reading 12 of the
+seed-mediated merges by hand: **all 12 are the same template**, including pairs
+from the 5,683- and 4,139-member groups. Star clustering's 2-hop merges hold up
+where the eval set cannot look. `gate --merge-audit N` makes this repeatable.
+
+_Gate verdict:_ **PASS**, on the criteria as restated in ROADMAP Phase 2 — with
+the adjudication recorded as `model_adjudicated_blind`, not hand-labelled. See
+the Reversed decisions entry; this is a changed criterion, not a satisfied one.
+
 _What the gate still needs, in order:_
 
-1. **Hand-adjudicate the 8 false positives.** Read as template variants that the
+1. ~~**Hand-adjudicate the 8 false positives.**~~ Done blind across all 100 hard
+   pairs, 2026-08-05; all 8 were template variants, as read. Original note kept
+   below for the reasoning that made it decidable. Read as template variants that the
    exact-Jaccard proxy misses because CFPB's own `XXXX` redaction runs differ in
    length, which moves character-5-shingle overlap a long way while changing
    nothing a reader would call a difference. **Not applied.** Relabelling only
@@ -411,6 +446,40 @@ _What got cut:_
 
 _Record anything decided in the docs and later changed, with the reason. A doc that was never
 wrong was never load-bearing._
+
+### 2026-08-05 — "Hand-label 300 pairs" → blind model adjudication
+
+ROADMAP Phase 2 specified hand-labelled pairs. `d9ead66` flagged in advance that
+the committed labels are an exact-Jaccard reference and "cannot yet stand in for
+the hand-labelling ROADMAP Phase 2 requires". No human was available to label,
+so the 100 `hard` pairs were adjudicated by the model instead, and the criterion
+is changed rather than quietly treated as met.
+
+What makes it worth anything: the rule was written into `METHODOLOGY §2.4.1`
+**before any pair was read**, and adjudication is blind — pairs shuffled by seed,
+with the detector's decision, the proxy label and `true_jaccard` all withheld.
+`label_source` is `model_adjudicated_blind` on every row, so no reader can
+mistake it for human judgement. A human re-reading the same 100 pairs would
+supersede it; the file is structured for that.
+
+What it does not fix: the adjudicator and the system share an author. The
+independent evidence is the merge audit, which is a *measurement* rather than a
+judgement — 3 of 40 same-group pairs have a verified edge — and it holds
+whatever anyone thinks about any individual pair.
+
+### 2026-08-05 — Campaign flag left as is; template inflation handled in Phase 5
+
+Four options were written down for the large templates that score 2 of 5 signals
+and go unflagged. Chose the one that adds no threshold: leave the flag, and make
+Phase 5 count distinct `dup_groups` rather than raw complaints.
+
+The reasoning is that the exposure is narrower than it looks. Dedup already
+collapses each of these groups to one representative and clustering consumes
+representatives only, so nothing reaches Phase 4 inflated. The only place a
+24,507-member unflagged template can distort anything is a growth statistic that
+counts complaints — and `signals.n_supporting_groups` was already in the schema
+for exactly that. Every other option required picking a size bound while looking
+at which groups it would move, which is trap T4.
 
 ### 2026-08-03 — Ground-truth window 2016–2024 → 2017–2024
 

@@ -120,6 +120,28 @@ This mirrors the MAUDE follow-up-report problem: the count is not the number of 
   `data/ground_truth/dedup_eval_pairs.csv`. The label is the exact character-5-shingle Jaccard,
   not a human judgement — `label_source` records this per row, and what the resulting precision
   does and does not cover is stated in `ENGINEERING_NOTES.md` Phase 2.
+
+#### 2.4.1 Adjudication protocol (pre-registered 2026-08-05, before any pair was read)
+
+The proxy label answers "do these two narratives overlap by ≥ 0.85 Jaccard?". The gate needs
+"are these the same filing?". Where the two disagree, the second question wins, and it is
+answered under this rule — written down **before** looking at any pair, so it cannot be shaped
+to a result:
+
+> **Two narratives are the same filing when both are instances of one template** — produced from
+> a shared source rather than independently composed. Differences that do **not** make them
+> distinct: redaction-run length (`XXXX` vs `XXXX XXXX`), account numbers, dates, dollar amounts,
+> names, addresses, capitalization, punctuation, whitespace, and inserted or dropped clauses that
+> leave the surrounding sentences verbatim identical.
+>
+> They are **distinct** when the shared material is generic consumer-complaint phrasing or shared
+> statutory quotation, and the specific narrative content was composed separately. Two people
+> quoting the same FCRA section, or both writing "my credit report is inaccurate", are distinct.
+
+Adjudication is **blind**: pairs are shuffled by seed, and the detector's decision, the proxy
+label, and `true_jaccard` are all withheld from the adjudicator. `label_source` records who
+adjudicated. A model adjudication is recorded as `model_adjudicated_blind` and is **not** the
+hand-labelling ROADMAP Phase 2 originally specified — see the Reversed decisions entry.
 - Report precision, recall, F1 at the chosen threshold. Target: precision ≥ 0.95 (false merges
   are worse than misses — a false merge destroys real signal).
 - Recall from that file alone is biased upward: every positive in it was drawn from `dup_pairs`,

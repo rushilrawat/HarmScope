@@ -14,14 +14,20 @@ lead time.
 
 ## Status
 
-**Phase 0 complete.** Nothing downstream has run, so there are no results yet —
-see the empty table at the bottom, which stays empty until Phase 9.
+**Phase 2 complete (gate passed).** Nothing downstream has run, so there are no
+results yet — see the empty table at the bottom, which stays empty until Phase 9.
+
+The Phase 2 gate passed on a **changed** criterion: ROADMAP asked for 300
+hand-labelled pairs, and no human was available, so the disagreements were
+adjudicated by the model, blind, against a rule written down beforehand
+(`METHODOLOGY §2.4.1`). Recorded in `ENGINEERING_NOTES.md` under Reversed
+decisions rather than presented as satisfying the original bar.
 
 | Phase | State |
 |---|---|
 | 0 — Scaffold | ✅ schema, config, run registry, checks, normalization, CI |
 | 1 — Ingestion & normalization | ✅ 16.5M complaints, 3.83M narratives, crosswalk covers both schema eras |
-| 2 — Dedup & campaign detection **[GATE]** | ⬜ |
+| 2 — Dedup & campaign detection **[GATE]** | ✅ gate passed — precision 1.000 on blind-adjudicated labels, recall 0.765 |
 | 3 — Embedding & index | ⬜ |
 | 4 — Clustering & novelty **[GATE]** | ⬜ |
 | 5 — Signal detection | ⬜ |

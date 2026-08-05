@@ -438,6 +438,8 @@ def cmd_gate(args: argparse.Namespace) -> int:
                                       'WHERE run_id = ?', [run_id]).fetchone()[0]:,}"
           " members")
 
+    _merge_audit(con, run_id, args.merge_audit, show=args.read)
+
     print("\ncampaign-flagged share by product family "
           "(METHODOLOGY §2.4: credit reporting must be clearly highest):")
     for fam, tot, flagged in con.execute(
@@ -460,6 +462,60 @@ def cmd_gate(args: argparse.Namespace) -> int:
     if args.read:
         _print_reading_material(con, run_id, args.read)
     return 0
+
+
+def _merge_audit(con, run_id: str, n: int, show: int = 0) -> None:
+    """What fraction of real merges does the eval set actually cover?
+
+    `dedup_eval_pairs.csv` samples from `dup_pairs`, so every pair in it has a
+    verified edge. Star clustering merges by admitting members to a *seed*, so
+    two arbitrary members of a group need no edge between them — in a
+    49,457-member star only 49,456 of ~1.2 billion member-pairs are edges. The
+    eval set therefore measures precision on a population that is almost none of
+    the merges the corpus contains, and no number computed from it can say so.
+    This samples same-group pairs the way the corpus holds them.
+    """
+    import random
+
+    rng = random.Random(CONFIG.seed)  # noqa: S311 - sampling, not cryptography
+    groups = con.execute(
+        "SELECT group_id, any_value(group_size) FROM dup_groups "
+        "WHERE run_id = ? AND group_size >= 100 GROUP BY 1 ORDER BY 1",
+        [run_id],
+    ).fetchall()
+    if not groups:
+        return
+    picked = rng.sample(groups, min(n, len(groups)))
+
+    direct = 0
+    two_hop: list[tuple] = []
+    for gid, size in picked:
+        members = [
+            r[0] for r in con.execute(
+                "SELECT complaint_id FROM dup_groups WHERE run_id = ? AND group_id = ? "
+                "ORDER BY complaint_id", [run_id, gid],
+            ).fetchall()
+        ]
+        a, b = sorted(rng.sample(members, 2))
+        if con.execute(
+            "SELECT count(*) FROM dup_pairs WHERE complaint_id_a = ? AND complaint_id_b = ?",
+            [a, b],
+        ).fetchone()[0]:
+            direct += 1
+        else:
+            two_hop.append((gid, size, a, b))
+
+    print(f"\nmerge audit — {len(picked)} random same-group pairs from groups of 100+:")
+    print(f"  {direct} have a verified edge, {len(two_hop)} are seed-mediated (2 hops).")
+    print(f"  The eval set can only ever sample the first kind, i.e. "
+          f"{direct / len(picked):.0%} of merges as the corpus actually holds them.")
+    for gid, size, a, b in two_hop[:show]:
+        print(f"\n  === {gid} ({size:,} members), no edge between these two")
+        for cid in (a, b):
+            text = con.execute(
+                "SELECT text_redacted FROM narratives WHERE complaint_id = ?", [cid]
+            ).fetchone()
+            print(f"    [{cid}] " + " ".join((text[0] if text else "").split())[:300])
 
 
 def _print_disputed(con, run_id: str, rows: list[dict]) -> None:
@@ -536,6 +592,44 @@ def _print_reading_material(con, run_id: str, n: int) -> None:
         ).fetchone()
         print(f"\n[{size:,} complaints] {fam}  {gid}")
         print("  " + " ".join((text[0] if text else "").split())[:400])
+
+
+def cmd_adjudicate(args: argparse.Namespace) -> int:
+    """Print a stratum of eval pairs for blind judgement (METHODOLOGY §2.4.1).
+
+    Withholds the detector's decision, the proxy label, and `true_jaccard`.
+    Showing any of them anchors the adjudicator to the answer being checked,
+    which is the whole reason the disagreement is worth adjudicating at all.
+    Order is shuffled by `CONFIG.seed` so position carries no information.
+    """
+    import random
+
+    from src.dedup import evalset
+
+    con = db.connect(read_only=True)
+    rows = [r for r in evalset.read() if r["stratum"] == args.stratum]
+    if not rows:
+        raise SystemExit(f"no pairs in stratum {args.stratum!r}")
+    random.Random(CONFIG.seed).shuffle(rows)  # noqa: S311 - ordering, not cryptography
+    rows = rows[args.offset : args.offset + args.limit]
+
+    print(f"# {len(rows)} pairs from stratum '{args.stratum}', "
+          f"offset {args.offset}, seed {CONFIG.seed}")
+    print("# blind: detector decision, proxy label and true_jaccard withheld")
+    print("# rule: METHODOLOGY §2.4.1\n")
+    for row in rows:
+        print(f"=== {row['complaint_id_a']} / {row['complaint_id_b']}")
+        for key in ("complaint_id_a", "complaint_id_b"):
+            text = con.execute(
+                "SELECT text_redacted FROM narratives WHERE complaint_id = ?",
+                [row[key]],
+            ).fetchone()
+            body = " ".join((text[0] if text else "").split())
+            clipped = body[: args.chars]
+            print(f"  [{row[key]}] {clipped}"
+                  + (f" …(+{len(body) - args.chars} chars)" if len(body) > args.chars else ""))
+        print()
+    return 0
 
 
 def cmd_taxonomy(args: argparse.Namespace) -> int:
@@ -629,6 +723,9 @@ def main(argv: list[str] | None = None) -> int:
     p_gate = sub.add_parser("gate", help="Phase 2 gate report: precision, recall, "
                                          "campaign share")
     p_gate.add_argument("--run-id", help="default: latest successful dedup run")
+    p_gate.add_argument("--merge-audit", type=int, default=40, metavar="N",
+                        help="sample N same-group pairs to measure how much of "
+                             "the merge population the eval set can see")
     p_gate.add_argument("--disputed", action="store_true",
                         help="print every pair the detector and the label "
                              "disagree on, with narrative text, for hand reading")
@@ -636,6 +733,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="also print N flagged campaigns and N unflagged "
                              "groups for the manual read (trap T2)")
     p_gate.set_defaults(func=cmd_gate)
+
+    p_adj = sub.add_parser("adjudicate", help="print eval pairs for blind judgement")
+    p_adj.add_argument("--stratum", default="hard", choices=["obvious", "hard", "unrelated"])
+    p_adj.add_argument("--offset", type=int, default=0)
+    p_adj.add_argument("--limit", type=int, default=25)
+    p_adj.add_argument("--chars", type=int, default=700)
+    p_adj.set_defaults(func=cmd_adjudicate)
 
     p_tax = sub.add_parser("taxonomy", help="label vocabulary by volume")
     p_tax.set_defaults(func=cmd_taxonomy)

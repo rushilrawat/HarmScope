@@ -48,10 +48,16 @@ Effort estimates assume part-time work alongside coursework and an internship.
 - Exact hash grouping; MinHash + LSH near-dup; star-clustered grouping (union-find chained —
   see `METHODOLOGY §2.2`).
 - Campaign features and flagging per `METHODOLOGY §2.2`.
-- Hand-label 300 pairs → `data/ground_truth/dedup_eval_pairs.csv`.
+- 300 pairs → `data/ground_truth/dedup_eval_pairs.csv`, exact-Jaccard reference labels.
+- Adjudicate the strata where the detector and the reference disagree, blind, per the
+  pre-registered rule in `METHODOLOGY §2.4.1` → `dedup_eval_adjudicated.csv`.
 
 **Accept (gate):**
 - Precision ≥ 0.95, recall reported, on the labeled pair set.
+- **Merge audit**: report what fraction of same-group pairs the eval set can actually sample.
+  Star clustering merges through a seed, so most members of a group share no verified edge and
+  the eval set — drawn from `dup_pairs` — cannot see them. A precision figure without this
+  number is a figure about 8% of the merges. Read a sample of the seed-mediated merges by hand.
 - Campaign-flagged fraction reported per product family, and credit reporting is clearly the
   highest.
 - Manually read 20 flagged campaigns and 20 unflagged high-volume groups. Write findings into
@@ -95,6 +101,12 @@ Effort estimates assume part-time work alongside coursework and an internship.
 **~1 week**
 
 - `cluster_timeseries` panels with correct exposure denominators.
+- **Growth statistics count distinct `dup_groups`, not raw complaints.** Phase 2's campaign flag
+  misses large templates that cite no statute — a 24,507-member group scored 2 of 5 signals and
+  went unflagged (`ENGINEERING_NOTES.md` Phase 2). Counting groups makes that miss harmless:
+  the template contributes 1 regardless of the flag. `signals.n_supporting_groups` exists for
+  this; report it alongside `n_supporting` so a signal backed by 400 complaints in 3 groups is
+  visibly weak.
 - PRR / ROR + shrinkage; BH FDR within family.
 - EWMA + PELT changepoint on share series with NB overdispersion handling.
 - Alert construction with the joint criteria.
