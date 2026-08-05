@@ -14,8 +14,13 @@ lead time.
 
 ## Status
 
-**Phase 2 complete (gate passed).** Nothing downstream has run, so there are no
-results yet — see the empty table at the bottom, which stays empty until Phase 9.
+**Phase 3 complete.** Nothing downstream has run, so there are no results yet —
+see the empty table at the bottom, which stays empty until Phase 9.
+
+Phase 3 ran on `all-MiniLM-L6-v2`, the model `METHODOLOGY §3` names for
+iteration, not on the `bge-base-en-v1.5` default — measured at 2.1 h versus
+16.8 h for the full corpus. Phase 4 is developed against it; **the Phase 4 gate
+may not be declared on it.**
 
 The Phase 2 gate passed on a **changed** criterion: ROADMAP asked for 300
 hand-labelled pairs, and no human was available, so the disagreements were
@@ -28,7 +33,7 @@ decisions rather than presented as satisfying the original bar.
 | 0 — Scaffold | ✅ schema, config, run registry, checks, normalization, CI |
 | 1 — Ingestion & normalization | ✅ 16.5M complaints, 3.83M narratives, crosswalk covers both schema eras |
 | 2 — Dedup & campaign detection **[GATE]** | ✅ gate passed — precision 1.000 on blind-adjudicated labels, recall 0.765 |
-| 3 — Embedding & index | ⬜ |
+| 3 — Embedding & index | ✅ 2.48M vectors, 10/10 neighbour checks — on the dev model, see note |
 | 4 — Clustering & novelty **[GATE]** | ⬜ |
 | 5 — Signal detection | ⬜ |
 | 6 — Ground truth & backtest **[GATE]** | ⬜ |

@@ -156,7 +156,13 @@ hand-labelling ROADMAP Phase 2 originally specified — see the Reversed decisio
 ## 3. Embedding
 
 - Default: `BAAI/bge-base-en-v1.5` (768-d). Dev/iteration: `all-MiniLM-L6-v2` (384-d).
-- Input: `narratives.text_redacted`, representatives only.
+- Input: `narratives.text_redacted`, **keyed on `text_hash`** — one vector per distinct text,
+  not per complaint and not per dup-group representative. "Representatives only" cannot hold:
+  representative selection is refit per cutoff, while embeddings are computed once and
+  date-filtered (`ENGINEERING_NOTES.md`, reversed decision 2026-08-03). An embedding is a pure
+  function of its text, so text is the key that satisfies both — a superset of every cutoff's
+  representatives, 2,477,937 vectors against 3,830,002 narratives, and leakage-immune for the
+  same reason MinHash is. `embedding_map` still resolves `complaint_id -> row_idx` directly.
 - Truncate at model max tokens; for long narratives, embed first + last window and mean-pool.
   Complaint narratives often state the core problem at both ends.
 - Normalize to unit length (cosine == inner product; FAISS `IndexFlatIP`).

@@ -388,8 +388,86 @@ _What the gate still needs, in order:_
    bought the precision with. Nothing is being lost further down.
 
 ### Phase 3 — Embedding & index
-_Model, throughput, wall time:_
-_Nearest-neighbour spot checks:_
+_Run:_ `1785913348…` (2026-08-05, git 8b5eab7). **Accepted on the dev model; see
+the caveat at the end.**
+
+_Model, throughput, wall time:_ `all-MiniLM-L6-v2` (384-d) on MPS.
+2,477,937 distinct narratives, 3.81 GB memmap, FAISS `IndexFlatIP` with
+2,477,937 vectors, 3,830,002 complaint_ids mapped and **0 unmapped**. Wall time
+~131 min across an interrupt: 1,700,096 texts at 283/s, then 777,841 at 418/s
+after resuming. The 1.5× difference is unexplained and most likely thermal — the
+machine was cold on restart — which is worth knowing before any throughput
+number here is treated as a property of the model.
+
+_Model choice, measured rather than assumed:_
+
+    all-MiniLM-L6-v2   386 texts/s    2.1 h for 2.48M
+    bge-base-en-v1.5    41 texts/s   16.8 h for 2.48M
+
+Also tested length-sorting the corpus to cut padding waste before accepting the
+bge figure: **7%**, because sentence-transformers already sorts within each
+`encode` call. Not worth scatter-writes and a harder resume, so not built.
+
+_What gets encoded, and why it is not what METHODOLOGY §3 says:_ the unit is a
+distinct `text_hash`, not a dup-group representative. §3 says "representatives
+only", but representative selection is refit per cutoff while the 2026-08-03
+reversed decision says embeddings are computed once and date-filtered — both
+cannot be true of a representative-keyed memmap. An embedding is a pure function
+of its text, so text is the honest key: a superset of every cutoff's
+representatives (2,477,937 against 1,883,062 for one cutoff), never refit, and
+leakage-immune for the same reason MinHash is.
+
+_Nearest-neighbour spot checks:_ 10 narratives, 5 neighbours each,
+**10/10 topically correct**. Three observations worth more than the pass:
+
+1. **It recovers company identity through redaction.** A USAA deposit-hold
+   complaint returns five USAA deposit-hold complaints; a Firstmark forbearance
+   complaint returns four explicit Firstmark forbearance complaints; a Discover
+   identity-theft dispute returns three Discover ones. The names survive because
+   CFPB redacts inconsistently, and the encoder is reading what is left.
+2. **Neighbours cross `product_family` constantly.** The same credit-repair
+   template appears under `credit_reporting` and `debt_collection`; a title-loan
+   complaint returns neighbours split across `personal_loan` and `vehicle_loan`.
+   This is direct evidence for the open question about whether clustering within
+   family fragments cross-product harms — it does, and `related_clusters`
+   (METHODOLOGY §4.2) is load-bearing rather than a nicety.
+3. **Cosines of 0.99 are template pairs that survived dedup.** Star clustering
+   splits a template into several groups by design (Phase 2, 21 pairs of recall
+   traded for 7 fewer false merges), and those splits are exactly what shows up
+   at the top of a neighbour list. Phase 4 will see them as very dense regions.
+
+_Idempotence:_ verified. A second run encodes 0 and reports `resumed at n_total`.
+Resume was also exercised for real: the run was interrupted at 1,700,096 and
+restarted from the checkpoint with no loss.
+
+_Caveat — this is the dev model._ METHODOLOGY §3 names `bge-base-en-v1.5` as the
+default and MiniLM for iteration. Phase 4 is a gate needing heavy iteration
+(ARI across sample sizes, disjoint halves, label-ablation AUC), so it is
+developed against MiniLM. **The Phase 4 gate may not be declared on these
+embeddings** — bge-base is a ~16 h encode and must run before any gate number is
+recorded as final.
+
+_Two bugs the smoke test caught, both silent:_
+
+1. `--limit 3000` encoded 3,000 rows and then mapped all 3,830,002 complaints to
+   row indices computed over all 2,477,937 texts. Almost every index pointed
+   past the end of a 3,000-row memmap; no error anywhere, and a downstream read
+   would have returned whatever numpy found at that offset. Bounding `row_idx`
+   fixes the dangling indices and converts it to a silent *drop*, so `build_map`
+   returns the unmapped count and a full encode fails when it is nonzero.
+2. `encode_batch` passed `batch_size=len(flat)` to `model.encode`, making a
+   512-text batch one forward pass over 1,024 sequences of 512 tokens. That OOMs
+   Metal on an M3 Pro, and the configured batch size is 256 — **the full run
+   would have died**. GPU memory and checkpoint spacing are now separate knobs.
+
+_A third, found by the commit security review:_ the `--limit` marker added to
+`pipeline runs` read `$.limit`, but `db.run` nests its payload as
+`{"config", "params"}`, so the correct path is `$.params.limit`. The marker
+never fired. It passed its test because the test fabricated a flat params shape
+the pipeline has never written — the test and the code were wrong about the data
+in the same way, which is the failure mode a test is supposed to prevent. Now
+read with `json_extract` in SQL, so there is one parser and the path is visible
+in the query.
 
 ### Phase 4 — Clustering & novelty [GATE]
 _Params per family:_
