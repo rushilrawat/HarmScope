@@ -1147,10 +1147,9 @@ def cmd_clusters(args: argparse.Namespace) -> int:
         print("-" * 72)
         for (text,) in con.execute(
             """
-            SELECT any_value(n.text_redacted) FROM cluster_members m
+            SELECT n.text_redacted FROM cluster_members m
             JOIN narratives n USING (complaint_id)
             WHERE m.cluster_id = ?
-            GROUP BY m.complaint_id
             ORDER BY m.is_exemplar DESC, m.membership_prob DESC LIMIT ?
             """,
             [cid, args.k],
