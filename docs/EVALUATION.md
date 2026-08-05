@@ -134,8 +134,18 @@ flatter HarmScope specifically, since the natural threshold to reach for is
 #### Rule 2 — company resolution is mechanical and conservative
 
 Enforcement filings name companies as `"TransUnion Interactive, Inc., TransUnion, LLC, and
-TransUnion"`; the complaint corpus names them `"TRANSUNION INTERMEDIATE HOLDINGS, INC."`. Exact
-normalized matching, the Phase 1 standard, resolves **0 of 212**. The replacement is still
+TransUnion"`; the complaint corpus names them `"TRANSUNION INTERMEDIATE HOLDINGS, INC."`, so the
+two vocabularies differ by legal suffixes and by how many entities a filing names at once.
+
+> **Correction, 2026-08-05.** This section originally said exact normalized matching "resolves
+> 0 of 212". That was wrong, and wrong in the direction that made the new rule look more
+> necessary than it is: the candidate CSV's `company_canonical_id` column is empty because the
+> Phase 6 scraper never populated it, not because matching fails. Once trailing legal suffixes
+> are stripped, **exact matching alone resolves 96**; the unique-prefix rule adds 13. The rule
+> below is unchanged — it was fixed before the code ran — but the premise stated for it was a
+> mis-reading of an empty column.
+
+The rule is still
 conservative — ambiguity resolves to *no match*, never to a guess — because trap T6 has not
 gone away and a wrong company attaches an action to the wrong complaint stream, making every
 lead time computed from it meaningless.
