@@ -203,6 +203,11 @@ def contingency(con: duckdb.DuckDBPyConnection) -> list[tuple]:
         JOIN by_company co USING (product_family, company_id)
         JOIN by_cluster cl USING (product_family, cluster_id)
         JOIN by_family  f  USING (product_family)
+        -- Ordered because the empirical-Bayes prior is fit by method of moments
+        -- over these rows: np.mean/np.var sum in array order, so an unordered
+        -- parallel scan changed alpha and beta in their last bits and moved EB05
+        -- for a handful of pairs between otherwise identical runs.
+        ORDER BY p.product_family, p.company_id, p.cluster_id
     """).fetchall()
 
 
