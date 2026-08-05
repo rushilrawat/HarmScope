@@ -281,6 +281,47 @@ campaign flag is the second layer — exclusion from signal detection — not th
 first. That is why this is recorded as a defect to fix rather than as the reason
 the gate failed.
 
+_Both defects fixed, and the fix did not solve the problem next to it_
+(run `1785896176289-fda4ce84`, git 36abc79): `submitted_via_concentration`
+dropped in migration 003; the concentration bar now compares against
+`expected_hhi(H, n) = H + (1-H)/n` instead of raw `H`.
+
+    flagged campaigns   3,787 -> 3,376        credit_reporting share  30.70% -> 29.91%
+    state_concentration fire rate among unflagged  84.7% -> 68.6%
+
+**The large templated groups are still unflagged, all at exactly 2 signals.**
+The 24,507-member group fires burstiness (37.9) and length_cv (0.011), and
+cannot reach 3: it cites no statute (`boilerplate = 0.00`), its state HHI 0.071
+is at chance for its size, and its company HHI 0.334 is what mailing all three
+bureaus looks like. 2,429 of the 3,252 unflagged candidates sit at exactly 2.
+This was predicted before the run and is recorded because it was: the two fixes
+were made because each is wrong on its own terms, not because either was
+expected to flag these.
+
+_The design question that is actually left,_ and it is not a threshold to
+tune: **group size is the strongest evidence of a mass filing and is not a
+signal at all.** It appears only as `campaign_min_size = 20`, a floor. A group of
+24,507 near-identical narratives is a mass filing by definition — `dup_groups`
+membership already established the near-identity — and "does it also cite a
+statute?" should not be able to veto that. Options, none picked:
+
+- make size a signal, so a large group needs 2 of the other 4;
+- make size sufficient above some bound, no signal count;
+- lower `campaign_min_signals` to 2 (would flag 2,429 more candidates, most of
+  them small, on weak evidence);
+- leave it, and handle template inflation in Phase 5 by counting
+  `n_supporting_groups` rather than complaints — the column already exists.
+
+The last is worth weighing seriously: dedup already collapses each of these to
+one representative, so nothing reaches clustering inflated. The exposure is
+confined to signal detection counting complaints instead of groups.
+
+_Determinism check (README standing rule 3):_ two independent full runs on the
+same snapshot produced identical output — 1,352,065 exact pairs, 2,477,937
+representatives, 41,161,012 LSH candidates, 12,935,450 verified, 1,883,062
+groups, and the same 145/8/36/111 confusion matrix. The campaign fix changed
+only the campaign layer, as intended.
+
 _What the gate still needs, in order:_
 
 1. **Hand-adjudicate the 8 false positives.** Read as template variants that the
