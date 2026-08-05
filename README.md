@@ -14,8 +14,16 @@ lead time.
 
 ## Status
 
-**Phase 4 complete (gate passed).** Nothing downstream has run, so there are no
-results yet — see the empty table at the bottom, which stays empty until Phase 9.
+**Phase 5 complete.** Nothing downstream has run, so there are no results yet —
+see the empty table at the bottom, which stays empty until Phase 9.
+
+Phase 5's mandatory negative control — shuffle cluster labels, re-run detection,
+and see how much fires — **failed first at a 10.7% false-alert rate and found
+three bugs**, one of them in the control itself. After the fixes it runs at
+0.45% against an α of 0.05. The sequence is in `ENGINEERING_NOTES.md`; the
+short version is that all three bugs computed a "distinct groups" quantity as a
+sum over a partition, and all three produced plausible numbers that only a null
+could expose.
 
 `METHODOLOGY §4.3` requires the stability ARI to appear here whatever it says.
 **Disjoint-halves ARI is 0.505** (credit_reporting) and **0.541** (mortgage).
@@ -44,7 +52,7 @@ decisions rather than presented as satisfying the original bar.
 | 2 — Dedup & campaign detection **[GATE]** | ✅ gate passed — precision 1.000 on blind-adjudicated labels, recall 0.765 |
 | 3 — Embedding & index | ✅ 2.48M vectors, 10/10 neighbour checks — on the dev model, see note |
 | 4 — Clustering & novelty **[GATE]** | ✅ gate passed — ablation AUC 0.791; **disjoint-halves ARI 0.505** |
-| 5 — Signal detection | ⬜ |
+| 5 — Signal detection | ✅ negative control passes at 0.0045 vs α 0.05 |
 | 6 — Ground truth & backtest **[GATE]** | ⬜ |
 | 7 — Baselines | ⬜ |
 | 8 — LLM layer | ⬜ |

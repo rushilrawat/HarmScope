@@ -601,9 +601,109 @@ they admit is not, so the distribution is recorded and the change left as a
 stated decision.
 
 ### Phase 5 — Signal detection
-_Negative-control (shuffled labels) false-alert rate:_
-_Expected under FDR α:_
-_Top 20 signals, first impressions:_
+_Run:_ `1785964943190-ac0ae219` (2026-08-05, git 780e062). Dev-model clusters —
+the Phase 3 caveat still applies.
+
+    expanded    2,965,850 non-campaign complaints
+    panel         257,082 cluster-level rows, 932,134 company-level
+    2x2 tests      35,500 pairs with a >= 5, of 207,566 company x cluster pairs
+    changepoint    12,483 series fired of 207,883
+    signals        50,104 rows      alerts 20,696 at q <= 0.05
+    by method      ebgm 35,500   ewma 12,067   pelt 2,537
+
+_Negative-control (shuffled labels) false-alert rate:_ **0.0045** — 236 alerts
+of 52,033 permuted tests. **PASS.**
+
+_Expected under FDR α:_ α is 0.05, and the realized rate is an order of
+magnitude below it. That is the right direction and not a coincidence: under a
+*complete* null BH does not reject α of tests, it rejects almost none — the
+guarantee is on the expected proportion of false discoveries among rejections,
+and with no true effects anywhere the procedure should be nearly silent. A rate
+close to 0.05 would have been a weaker result than it looks.
+
+_The control failed first, at 0.1071, and found three bugs._ Committing that
+sequence because the numbers are worthless without it — every one of the three
+produced plausible, well-formed, entirely wrong output, and none is visible in a
+normal run.
+
+1. **The control itself was wrong.** In production a group's cluster comes from
+   its representative, so every complaint in a group shares one cluster. The
+   shuffle permuted labels *per complaint*, scattering each group across many
+   clusters — a null for a dataset that cannot exist. Permuted at group level
+   now.
+2. **The contingency margins did not partition.** A 2×2 tests association only
+   if every unit is in exactly one cell. One credit-repair template mailed to
+   Equifax, Experian and TransUnion is three complaints against three companies
+   sharing one `group_id`: the company margin counted it three times, the
+   cluster margin counted distinct groups and counted it once, so
+   `c = n_cluster - a` came out too small and **every PRR was inflated**. The
+   unit is now the `(group, company)` pair, which partitions and is right on its
+   own terms — 24,507 identical complaints against one bureau are one
+   allegation, the same template to three bureaus is three.
+3. **`n_supporting_groups` summed months instead of counting groups.** The gate
+   whose entire job is stopping one filing from looking like many was counting
+   one filing many times: a template active for two years reported 24 supporting
+   groups and cleared `min_supporting_groups = 15` unaided.
+
+    before   5,680 / 53,015 = 0.1071   FAIL
+    after      236 / 52,033 = 0.0045   PASS   (24x reduction)
+
+All three share a signature worth remembering: **a quantity defined as "distinct
+groups" but computed as a sum over a partition** — of companies in one case, of
+months in another. Sums over partitions are the thing to grep for in Phase 6.
+
+_p-value calibration under the null,_ because "few alerts" and "correct test"
+are different claims:
+
+    p <= 0.5     0.5291   1.1x uniform
+    p <= 0.1     0.1433   1.4x
+    p <= 0.05    0.0863   1.7x
+    p <= 0.01    0.0315   3.1x
+    p <= 0.001   0.0082   8.2x
+
+Near-uniform in the bulk, mildly anti-conservative in the extreme tail. That is
+the known cost of the normal approximation on log ROR rather than Fisher's exact
+— chosen because Fisher on 52,000 tables is the dominant cost of the phase. BH
+absorbs it (0.45% realized), and ranking is on EB05 rather than on p, so the
+tail excess does not drive the ordering. Upgrade path if it ever matters:
+exact tests for the pairs that clear the BH threshold, which is a few hundred
+tables rather than 52,000.
+
+_Top 20 signals, first impressions:_ the novel track's leaders are dominated by
+companies with **real public enforcement histories**, which is the first
+encouraging sign that Phase 6 has something to find:
+
+    EB05 1208  credit_reporting  JOHN C HEATH ATTORNEY AT LAW (Lexington Law)
+    EB05 1185  credit_reporting  CHIME FINANCIAL
+    EB05  955  credit_reporting  PNC BANK
+    EB05  948  credit_reporting  RADIUS GLOBAL SOLUTIONS
+    EB05  740  credit_reporting  FREEDOM FINANCIAL NETWORK
+    EB05  674  bank_account      COINBASE            (novel)
+    EB05  669  credit_reporting  CREDIT KARMA
+    EB05  710  debt_collection   PNC BANK            (novel)
+
+Two cautions on that list, both for Phase 6 rather than now. **Lexington Law is
+a credit-repair firm**, so complaints naming it sit uncomfortably close to trap
+T2 — its clients are the people who file templated complaints, and the campaign
+flag is known to miss unflagged templates. That cluster needs reading before any
+backtest counts it as a hit. And these are **company × cluster** signals, so a
+company appearing twice under different families (PNC) is two findings, not one,
+and the adjudication has to treat them separately.
+
+_A structural artifact checked for and not found:_ three of the first twelve
+alerts share a changepoint of 2017-07-01, which is near the CFPB taxonomy
+restructuring (`DATA.md §3.4`) and would be a systematic artifact if the
+detectors were keying on it. They are not — 2017-07 accounts for 216 of 14,604
+changepoints (1.5%), and the most common months are 2022-02, 2022-07 and
+2021-09, which track the real credit-reporting surge. The coincidence in the top
+twelve was small-sample noise.
+
+_A feasibility change, argued on correctness first:_ changepoint now skips
+series below `min_supporting_groups` instead of fitting them. §6.3 cannot turn a
+changepoint on such a series into an alert, so the work was already discarded —
+and PELT over ~200,000 mostly-tiny series is the dominant cost of the phase,
+which Phase 6 pays eight times over for its eight cutoffs. EWMA signals fell
+from 30,371 to 12,067 with no alert lost.
 
 ### Phase 6 — Ground truth & backtest [GATE]
 _Actions curated / usable / excluded:_
