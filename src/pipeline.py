@@ -13,7 +13,6 @@ a dispatch table is exactly how that trap gets sprung.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -798,9 +797,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_runs(args: argparse.Namespace) -> int:
     con = db.connect(read_only=True)
+    # json_extract, not Python's json: params_json is a DuckDB JSON column, and
+    # parsing it a second time in Python was how the path bug below survived a
+    # passing test. One parser, and the path is visible in the query.
     rows = con.execute(
         "SELECT run_id, phase, status, output_rows, started_at, "
-        "substr(git_sha, 1, 12), substr(config_hash, 1, 8), error, params_json "
+        "substr(git_sha, 1, 12), substr(config_hash, 1, 8), error, "
+        "json_extract(params_json, '$.params.limit') "
         "FROM runs ORDER BY started_at DESC LIMIT ?",
         [args.n],
     ).fetchall()
@@ -810,11 +813,13 @@ def cmd_runs(args: argparse.Namespace) -> int:
     print(f"{'phase':<13} {'status':<8} {'rows':>10}  {'started':<20} "
           f"{'git':<13} {'cfg':<9} error")
     partial = False
-    for _run_id, phase, status, out_rows, started, sha, cfg, err, params in rows:
+    for _run_id, phase, status, out_rows, started, sha, cfg, err, limit in rows:
         # A run over a deliberately truncated input is not a run of the phase.
         # Without this marker a --limit smoke test and the real thing differ
         # only by output_rows, which nothing reads as a warning.
-        capped = bool(json.loads(params or "{}").get("limit"))
+        # json_extract returns JSON text, so an absent key and a stored null
+        # arrive as None and the four characters "null" respectively.
+        capped = limit not in (None, "null")
         partial |= capped
         label = f"{phase}{'*' if capped else ''}"
         print(f"{label:<13} {status:<8} {out_rows if out_rows is not None else '-':>10}"

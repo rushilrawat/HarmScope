@@ -93,24 +93,21 @@ def test_run_ids_sort_by_creation_time():
 def test_runs_listing_marks_truncated_runs(con, capsys):
     """A --limit smoke run must not read as a full run of the phase.
 
-    The embed smoke test wrote a runs row identical in shape to the real thing —
-    same phase, same config_hash, differing only in output_rows, which nothing
-    interprets as "this was a test".
+    Rows are written through `db.run`, not hand-built. The first version of this
+    test fabricated params_json as a flat {"model", "limit"} object and passed,
+    while `db.run` actually nests it under {"config", "params"} — so the shipped
+    code read $.limit, found nothing, and could never have marked a real run.
+    A test that invents its own input shape cannot catch that.
     """
     import argparse
 
     from src import pipeline
+    from src.config import CONFIG
 
-    for run_id, params, rows in (
-        ("0000000000001-aaaaaaaa", '{"model": "m", "limit": 5000}', 7822),
-        ("0000000000002-bbbbbbbb", '{"model": "m", "limit": null}', 2477937),
-    ):
-        con.execute(
-            "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
-            "started_at, finished_at, status, output_rows) "
-            "VALUES (?, 'embed', 'sha', 'cfg', ?, now(), now(), 'ok', ?)",
-            [run_id, params, rows],
-        )
+    with db.run(con, "embed", CONFIG, params={"model": "m", "limit": 5000}) as r:
+        r.finish(output_rows=7822)
+    with db.run(con, "embed", CONFIG, params={"model": "m", "limit": None}) as r:
+        r.finish(output_rows=2477937)
 
     original = pipeline.db.connect
     pipeline.db.connect = lambda **kw: con
@@ -120,10 +117,10 @@ def test_runs_listing_marks_truncated_runs(con, capsys):
         pipeline.db.connect = original
 
     out = capsys.readouterr().out
-    assert "embed*" in out, "the truncated run is not marked"
+    marked = [ln for ln in out.splitlines() if ln.startswith("embed")]
+    assert len(marked) == 2, out
+    truncated = [ln for ln in marked if "7822" in ln]
+    full = [ln for ln in marked if "2477937" in ln]
+    assert truncated and truncated[0].startswith("embed*"), "truncated run unmarked"
+    assert full and not full[0].startswith("embed*"), "full run wrongly marked"
     assert "--limit" in out, "no legend explaining the marker"
-    # The full run must NOT be marked.
-    assert [ln for ln in out.splitlines() if "2477937" in ln or "2,477,937" in ln]
-    assert not any(
-        "embed*" in ln and "2477937" in ln for ln in out.splitlines()
-    ), "the full run was marked as truncated"
