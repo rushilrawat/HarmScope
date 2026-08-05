@@ -170,11 +170,113 @@ throwaway in-memory apply of `schema.sql` and fails at bootstrap with
 instructions. First migration lives at `db/migrations/001_*.sql`.
 
 ### Phase 2 — Dedup & campaign detection [GATE]
-_MinHash threshold chosen and why:_
-_Precision / recall:_
+_Run:_ `1785889953195-a400c7b1`, 2026-08-04, git 7d3c7f5.
+
+_MinHash threshold chosen and why:_ 0.88. Swept once on the labelled pairs from
+the original 0.85 (`d9ead66`) and frozen since. 128 permutations give SE ≈ 0.088,
+so pairs with true Jaccard just under the bar clear it roughly half the time;
+0.88 buys back most of the resulting over-merge. **The labels were not
+re-derived when the threshold moved** — they stay at the 0.85 exact-Jaccard
+reference, so precision keeps measuring over-merge against a fixed bar instead
+of against whatever the detector currently does.
+
+_Precision / recall:_ **precision 0.9477, gate requires 0.95 — FAIL.**
+tp/fp/fn/tn = 145 / 8 / 36 / 111 over 300 pairs. Recall 0.8011 overall, 0.8675
+over the 151 pairs at or above the detector's own 0.88 threshold. 22 pairs were
+merged despite true Jaccard below 0.88 — MinHash overestimating near the bar,
+the effect `d9ead66` identified.
+
+_What star clustering actually cost:_ nothing measurable in recall, and it fixed
+the blowup. Union-find at the same threshold: precision 0.9112, largest group
+84,657, mean group size 3,709, 1.8M narratives in groups over 1,000. Star
+clustering: precision 0.9477, largest group 49,457, 702,032 narratives in groups
+over 1,000. Group-level recall at threshold (0.8675) lands on the *pairwise*
+recall measured during the sweep (0.8674), i.e. bounding group diameter to one
+hop from the seed costs essentially none of the recall the pairwise decisions
+had to give — the chaining it removed was all false merges.
+
+_Gate passed:_ **N.**
+
 _Campaign-flagged fraction by family:_
-_What the flagged campaigns actually looked like on reading:_
-_Gate passed:_ Y / N
+
+    credit_reporting  30.70%   debt_relief    1.47%
+    money_service     28.66%   student_loan   0.78%
+    debt_collection   14.71%   vehicle_loan   0.76%
+    credit_card        4.78%   personal_loan  0.16%
+    bank_account       3.00%   mortgage       0.07%
+                               prepaid_card   0.01%
+
+Credit reporting is highest and mortgage is 438× lower, which is the direction
+`METHODOLOGY §2.4` requires. Corpus boilerplate baseline 0.3625.
+
+_What the flagged campaigns actually looked like on reading:_ 20 read, largest
+first. **All 20 are unambiguously templated** — the criterion that would have
+forced a stop-and-fix is satisfied. The largest group, 49,457 members, is one
+template and not an artifact of `MAX_BUCKET_PAIRS` anchoring: every member opens
+"In accordance with the Fair Credit Reporting act. The List of accounts below
+has violated my federally protected consumer rights…", the canonical
+credit-repair letter. Others: "estoppel by silence, Engelhardt V. Gravens",
+"HI I AM SUBMITTING THIS WITHOUT ANY INFLUENCE AND THIS IS NOT A THIRD PARTY".
+
+Two encouraging things in that set. The Cash App (22,002) and Zelle (9,971)
+campaigns score `boilerplate = 0.00` — no statutory citation anywhere — and are
+flagged on burstiness and length variance alone, so the feature set is not just
+a credit-repair statute detector. And their burstiness is enormous (4,083 and
+1,173 against a threshold of 3.0): both reference "the recent CFPB lawsuit",
+i.e. filings that spike on a news event. That is what pushes `money_service` to
+28.66%, second only to credit reporting.
+
+_The finding that is not in the acceptance criteria:_ **the 20 largest unflagged
+groups are also obviously templated.** A 24,507-member group whose members all
+open "My credit reports are inaccurate. These inaccuracies are causing creditors
+to deny me credit…" is not 24,507 consumers writing independently. Four of the
+20 are the same credit-repair service's family ("I have a goal of getting a
+house as soon as possible but the stuff on my credit report will really put me
+in trouble"), and a 7,309-member `vehicle_loan` group is the *same* template as
+the largest flagged campaign, sitting in a different family.
+
+Every one of the twelve largest unflagged candidates scores exactly **2**
+signals against a bar of 3, and the two dead signals are structural, not
+threshold choices:
+
+1. **`submitted_via_concentration` cannot fire in credit reporting.** The family
+   baseline HHI is **1.0** — essentially every credit-reporting complaint
+   arrives through one channel — and the rule asks a group to exceed
+   `1.5 × baseline`. An HHI cannot exceed 1.0. It fired 0 times in 2,841
+   unflagged candidates. The flag is really "3 of 5" in the family that matters
+   most.
+2. **`company_concentration` is backwards for tri-bureau blasts.** The family
+   baseline is 0.2674 and the bar is 0.401. A template mailed to all three
+   bureaus scores ≈ 0.33 — *below* the bar. The single most characteristic
+   credit-repair behaviour reads as unconcentrated. The baseline is computed
+   over every complaint in the family including the campaigns themselves, so
+   campaign traffic sets the norm that campaigns are then measured against.
+
+Bounded blast radius, and worth stating: `dup_groups` collapses these regardless
+of the flag, and clustering consumes representatives only (`METHODOLOGY §2.3`),
+so a 24,507-member unflagged template still enters Phase 4 as one document. The
+campaign flag is the second layer — exclusion from signal detection — not the
+first. That is why this is recorded as a defect to fix rather than as the reason
+the gate failed.
+
+_What the gate still needs, in order:_
+
+1. **Hand-adjudicate the 8 false positives.** Read as template variants that the
+   exact-Jaccard proxy misses because CFPB's own `XXXX` redaction runs differ in
+   length, which moves character-5-shingle overlap a long way while changing
+   nothing a reader would call a difference. **Not applied.** Relabelling only
+   the pairs the detector merged would raise precision to 1.000 by construction,
+   which is the shape of the thing trap T5 exists to prevent. The check that
+   made this decidable: among the 111 pairs labelled `not_dup` and left
+   unmerged, exactly **1** has 50%+ of the shorter narrative verbatim-identical
+   to the other, against 3 of the 8 disputed merges and 91 of the 145 agreed
+   merges. So the proxy is sound on the negatives and the asymmetry is real —
+   but the adjudication is a human's to make and is recorded here unapplied.
+2. Fix the two dead campaign signals, then re-read.
+3. `data/interim/dedup_near_misses.csv` — 300 rejected LSH candidates sampled
+   during the run, of which **14 (4.7%) were true duplicates** by exact Jaccard.
+   That is the verifier's loss in the band below threshold, and it is the only
+   recall figure in this section that the eval file could not have produced.
 
 ### Phase 3 — Embedding & index
 _Model, throughput, wall time:_
