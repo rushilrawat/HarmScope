@@ -51,3 +51,13 @@ def parse_cluster_id(cid: str) -> tuple[str, str, str]:
     if len(parts) != 3:
         raise ValueError(f"malformed cluster_id: {cid!r}")
     return parts[0], parts[1], parts[2]
+
+
+def signal_id(run_id: str, local_id: int | str) -> str:
+    """`{run_id}:signal:{local_id}` — unique across refits.
+
+    Same reason as `campaign_id`: signals are recomputed at every backtest
+    cutoff from that cutoff's clusters, so eight refits would put eight
+    different rows in the same slot if the id were a bare local counter.
+    """
+    return _scoped(run_id, "signal", local_id)

@@ -61,10 +61,9 @@ harmscope/
 │   │   ├── novelty.py           # novelty vs existing taxonomy + label ablation
 │   │   └── stability.py         # ARI across sample sizes and disjoint halves
 │   ├── signals/
-│   │   ├── timeseries.py        # cluster x period x company panels
-│   │   ├── disproportionality.py# PRR / ROR / shrinkage
-│   │   ├── changepoint.py       # EWMA + PELT
-│   │   └── correct.py           # Benjamini-Hochberg FDR
+│   │   ├── timeseries.py        # cluster x period x company panels, in dup-groups
+│   │   ├── disproportionality.py# PRR / ROR / EB shrinkage / Benjamini-Hochberg
+│   │   └── changepoint.py       # EWMA control chart + PELT
 │   ├── llm/
 │   │   ├── label.py             # cluster -> harm mechanism label
 │   │   ├── retrieve.py          # hybrid BM25 + dense evidence retrieval

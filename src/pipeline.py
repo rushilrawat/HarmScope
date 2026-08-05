@@ -987,6 +987,166 @@ def cmd_adjudicate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _months(con) -> list:
+    return [r[0] for r in con.execute(
+        "SELECT DISTINCT period_month FROM complaints ORDER BY 1"
+    ).fetchall()]
+
+
+def phase_signals(args: argparse.Namespace) -> int:
+    """Phase 5 — disproportionality, changepoint, FDR, alert construction."""
+    from src.ids import signal_id as make_signal_id
+    from src.signals import changepoint, disproportionality, timeseries
+
+    con = db.bootstrap()
+    cluster_run = args.run_id or latest_run(con, "cluster")
+    dedup_run = args.dedup_run or latest_run(con, "dedup")
+    as_of = con.execute("SELECT max(date_received) FROM complaints").fetchone()[0]
+    months = _months(con)
+
+    params = {"cluster_run": cluster_run, "dedup_run": dedup_run,
+              "shuffle": args.shuffle, "limit": None}
+    with db.run(con, "signals", CONFIG, params=params) as r:
+        n_expanded = timeseries.build_expanded(con, cluster_run, dedup_run)
+        if args.shuffle:
+            n_shuffled = _shuffle_clusters(con, CONFIG.seed + args.shuffle)
+            print(f"NEGATIVE CONTROL: cluster labels permuted within family "
+                  f"({n_shuffled:,} rows, seed offset {args.shuffle})")
+        print(f"expanded   : {n_expanded:,} non-campaign complaints")
+
+        n_total, n_company = timeseries.build_panel(con, cluster_run, as_of)
+        print(f"panel      : {n_total:,} cluster-level rows, "
+              f"{n_company:,} company-level")
+
+        cells = timeseries.contingency(con)
+        scored = disproportionality.analyse(cells, CONFIG.signals.min_a)
+        print(f"2x2 tests  : {len(scored):,} pairs with a >= {CONFIG.signals.min_a} "
+              f"(of {len(cells):,} company x cluster pairs)")
+
+        series = timeseries.series(con, cluster_run)
+        changes = changepoint.detect(series, months, CONFIG.signals)
+        print(f"changepoint: {len(changes):,} series fired of {len(series):,}")
+
+        rows = _build_signals(con, r.run_id, cluster_run, scored, changes,
+                              as_of, make_signal_id)
+        con.execute("DELETE FROM signals WHERE run_id = ?", [r.run_id])
+        if rows:
+            con.executemany(
+                "INSERT INTO signals (signal_id, run_id, cluster_id, company_id, "
+                "period_month, method, statistic, ci_low, ci_high, p_value, "
+                "q_value, n_supporting, n_supporting_groups, as_of) "
+                "VALUES (" + ",".join("?" * 14) + ")", rows,
+            )
+        checks.expect_no_nulls(con, "signals", ["as_of", "company_id"])
+        r.finish(output_rows=len(rows), input_rows=n_expanded)
+
+    alerts = con.execute(
+        "SELECT count(*) FROM signals WHERE run_id = ? AND q_value <= ?",
+        [r.run_id, CONFIG.signals.fdr_alpha],
+    ).fetchone()[0]
+    print(f"\nsignals    : {len(rows):,} rows")
+    print(f"alerts     : {alerts:,} at q <= {CONFIG.signals.fdr_alpha}")
+    by_method = con.execute(
+        "SELECT method, count(*) FROM signals WHERE run_id = ? GROUP BY 1 ORDER BY 2 DESC",
+        [r.run_id],
+    ).fetchall()
+    print("by method  : " + ", ".join(f"{m}={n:,}" for m, n in by_method))
+    if args.shuffle:
+        n_tests = sum(n for m, n in by_method if m == "ebgm")
+        rate = alerts / max(n_tests, 1)
+        print(f"\n{'=' * 72}\nNEGATIVE CONTROL (ROADMAP Phase 5, mandatory)")
+        print(f"  permuted-label alerts : {alerts:,} of {n_tests:,} tests")
+        print(f"  false-alert rate      : {rate:.4f}")
+        print(f"  FDR alpha             : {CONFIG.signals.fdr_alpha}")
+        # The rate, not the count. Shuffling spreads every cluster across every
+        # company, so a permuted panel has far more series than the real one and
+        # the raw counts are not comparable — which is exactly the mistake that
+        # would make a broken detector look fine.
+        verdict = "PASS" if rate <= CONFIG.signals.fdr_alpha * 2 else "FAIL"
+        print(f"  verdict               : {verdict}")
+        if verdict == "FAIL":
+            print("\n  A random assignment is producing real alerts. Per ROADMAP "
+                  "Phase 5 the statistics are wrong — fix before Phase 6.")
+    return 0
+
+
+def _shuffle_clusters(con, seed: int) -> int:
+    """Permute cluster labels among complaints, within product family.
+
+    The negative control ROADMAP Phase 5 makes mandatory. Permuting *within*
+    family preserves every marginal that is not the thing under test — family
+    volume, monthly totals, company mix, group structure — so anything that
+    still fires is the machinery inventing signal rather than finding it.
+    Shuffling globally would instead destroy the family structure and make the
+    test easier to pass for the wrong reason.
+    """
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE _shuffled AS
+        WITH labelled AS (
+          SELECT complaint_id, product_family, cluster_id,
+                 row_number() OVER (PARTITION BY product_family
+                                    ORDER BY hash(complaint_id * 2654435761 + {seed})) AS src
+          FROM _expanded WHERE cluster_id IS NOT NULL
+        ),
+        slots AS (
+          SELECT product_family, cluster_id,
+                 row_number() OVER (PARTITION BY product_family
+                                    ORDER BY complaint_id) AS dst
+          FROM _expanded WHERE cluster_id IS NOT NULL
+        )
+        SELECT l.complaint_id, s.cluster_id
+        FROM labelled l JOIN slots s
+          ON s.product_family = l.product_family AND s.dst = l.src
+    """)
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE _expanded AS
+        SELECT e.complaint_id, e.company_id, e.period_month, e.product_family,
+               e.group_id, s.cluster_id
+        FROM _expanded e LEFT JOIN _shuffled s USING (complaint_id)
+    """)
+    return con.execute("SELECT count(*) FROM _shuffled").fetchone()[0]
+
+
+def _build_signals(con, run_id, cluster_run, scored, changes, as_of, make_id):
+    """Assemble signal rows, carrying both support counts on every one."""
+    support = dict(con.execute("""
+        SELECT (cluster_id, company_id),
+               (sum(n), count(DISTINCT period_month))
+        FROM cluster_timeseries t JOIN clusters c USING (cluster_id)
+        WHERE c.run_id = ? GROUP BY 1
+    """, [cluster_run]).fetchall())
+    raw = dict(con.execute("""
+        SELECT (cluster_id, coalesce(company_id, '__ALL__')), n FROM (
+          SELECT cluster_id, company_id, count(*) AS n FROM _expanded
+          WHERE cluster_id IS NOT NULL GROUP BY GROUPING SETS ((cluster_id, company_id), (cluster_id))
+        )
+    """).fetchall())
+
+    rows, i = [], 0
+    latest = max(m for (m,) in con.execute(
+        "SELECT DISTINCT period_month FROM complaints").fetchall())
+    for s in scored:
+        key = (s.cluster_id, s.company_id)
+        groups = support.get(key, (0, 0))[0] or 0
+        rows.append((
+            make_id(run_id, i), run_id, s.cluster_id, s.company_id, latest,
+            "ebgm", s.eb05, s.prr_low, s.prr_high, s.p_value, s.q_value,
+            int(raw.get(key, 0)), int(groups), as_of,
+        ))
+        i += 1
+    for (cluster_id, company_id), fired in changes.items():
+        for change in fired:
+            key = (cluster_id, company_id)
+            groups = support.get(key, (0, 0))[0] or 0
+            rows.append((
+                make_id(run_id, i), run_id, cluster_id, company_id, change.period,
+                change.method, change.statistic, None, None, None, None,
+                int(raw.get(key, 0)), int(groups), as_of,
+            ))
+            i += 1
+    return rows
+
+
 def _family_rows(con, dedup_run: str, model: str, family: str):
     import numpy as np
 
@@ -1186,10 +1346,10 @@ PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
     "dedup": phase_dedup,
     "embed": phase_embed,
     "cluster": phase_cluster,
+    "signals": phase_signals,
 }
 
 PLANNED: dict[str, str] = {
-    "signals": "ROADMAP Phase 5 — disproportionality, changepoint, FDR",
     "backtest": "ROADMAP Phase 6 [GATE] — point-in-time harness",
     "baselines": "ROADMAP Phase 7 — B0 volume, B1 taxonomy, B2 LDA, B3 BERTopic",
     "label": "ROADMAP Phase 8 — LLM cluster labels + evidence retrieval",
@@ -1266,6 +1426,10 @@ def main(argv: list[str] | None = None) -> int:
                        help="encode only the first N texts; cluster: fit sample size")
     p_run.add_argument("--dedup-run", help="dedup run whose representatives to cluster")
     p_run.add_argument("--family", help="cluster only this product family")
+    p_run.add_argument("--run-id", help="cluster run to build signals from")
+    p_run.add_argument("--shuffle", type=int, default=0, metavar="K",
+                       help="negative control: permute cluster labels within "
+                            "family using seed offset K (ROADMAP Phase 5)")
     p_run.set_defaults(func=cmd_run)
 
     p_gate = sub.add_parser("gate", help="Phase 2 gate report: precision, recall, "
