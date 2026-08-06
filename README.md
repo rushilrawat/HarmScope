@@ -186,21 +186,25 @@ blind human adjudication (`EVALUATION.md` §1.3) and a `bge-base` encode.
 
 \* Lead times are company-level and inflated; see `ENGINEERING_NOTES.md` Phase 6.
 
-**Adjudication reverses the ordering on a small sample.** On 8 actions both
-systems detected, judged blind against the orders' own descriptions:
+**Adjudication closes the gap to nothing.** On 14 actions both systems detected,
+judged blind against the orders' own descriptions:
 
 | System | Strong match | Corrected rate |
 |---|---|---|
-| HarmScope | 5 / 8 | **31.8%** |
-| B1 — CFPB taxonomy | 3 / 8 | 21.1% |
+| HarmScope | 8 / 14 | 29.1% |
+| B1 — CFPB taxonomy | 7 / 14 | 28.1% |
 
-B1's strong set is a strict subset of HarmScope's, so the direction is
-consistent — but two discordant pairs is an exact McNemar *p* = 0.50 and
-establishes nothing. **The unadjudicated table above is what the project can
-currently defend; this one is a signal to chase, not a result.**
+Discordant pairs 2–1, exact McNemar *p* = 1.00. **The two systems are
+indistinguishable on this evidence.**
 
-The mechanism is the mirror of why B1 leads unadjudicated: coarse taxonomy units
-fire more often for a company, and match a specific harm less often when asked.
+Worth recording how that number moved. At n = 8 the split was 5–3 with 2–0
+discordant, which looked like a reversal in HarmScope's favour and would have
+been a tempting place to stop. Six more actions took it to 8–7 with 2–1. The
+apparent effect did not survive its own sample growing.
+
+**Adjudication also cuts both systems roughly in half**, because a company-level
+fire is not a harm-level match. That correction is much larger and much better
+supported than any difference between the systems.
 
 **Unadjudicated, the taxonomy baseline wins.** The ordering is
 `B1 > HarmScope > B0`: the pipeline is worth something over counting complaints

@@ -757,7 +757,30 @@ _Paired result against B1 (same 8 actions, same blinding, same standard):_
     corrected       HarmScope   31.8%        B1     21.1%
     discordant      HarmScope-only 2, B1-only 0, exact McNemar p = 0.50
 
-**The ordering reverses, and the sample cannot support it.** B1's strong set is a
+_Extended to n = 14 (2026-08-06)._ Six more paired actions, same protocol:
+
+    strong rate    HarmScope 8/14 = 57.1%    B1 7/14 = 50.0%
+    corrected      HarmScope 29.1%           B1 28.1%
+    discordant     HarmScope-only 2, B1-only 1, exact McNemar p = 1.00
+
+**The reversal did not survive its own sample growing.** At n = 8 it was 5-3
+with 2-0 discordant and B1's strong set a strict subset of HarmScope's; six more
+actions made it 8-7 with 2-1, and the corrected rates are within one point. The
+n = 8 result was a place it would have been very easy to stop, and stopping
+there would have produced a headline the data does not support.
+
+Sterling Jewelers is the discordant case that went the other way and is worth
+naming: the order is about store cards opened without customer consent, and B1
+had a unit for unsolicited prepaid cards arriving in the mail while HarmScope's
+nearest cluster was identity theft — a fraudster opening an account, not a
+merchant. Coarse units are not uniformly worse; they are differently wrong.
+
+_What the adjudication does establish,_ much more strongly than any
+system difference: **it halves both systems.** 57.1% and 50.0% of company-level
+detections survive the question of whether the cluster describes the harm. That
+correction is an order of magnitude better supported than the gap between them.
+
+**The ordering reverses at n = 8, and the sample cannot support it.** B1's strong set is a
 strict subset of HarmScope's, so the direction is at least internally consistent,
 but two discordant pairs is not evidence. What the sample does show is a
 mechanism: B1 leads unadjudicated because a coarse taxonomy tuple fires for a
