@@ -1173,6 +1173,46 @@ def cmd_refit(args: argparse.Namespace) -> int:
     return 0
 
 
+def phase_backtest(args: argparse.Namespace) -> int:
+    """Phase 6 — evaluate every usable action against its own cutoff's refit."""
+    from src.evaluation import backtest
+
+    con = db.bootstrap()
+    params = {"system": args.system, "strong_only": args.strong_only, "limit": None}
+    with db.run(con, "backtest", CONFIG, params=params) as r:
+        outcomes = backtest.evaluate(
+            con, CONFIG.signals.min_supporting_groups, CONFIG.signals.fdr_alpha,
+            strong_only=args.strong_only,
+        )
+        n = backtest.write(con, r.run_id, args.system, outcomes)
+        r.finish(output_rows=n)
+
+    stats = backtest.summarise(outcomes)
+    print(f"system      : {args.system}")
+    print(f"adjudicated : {'strong links only' if args.strong_only else 'unadjudicated (company-level)'}")
+    print(f"actions     : {stats['n_actions']}")
+    print(f"detected    : {stats['n_detected']}  ({stats['detect_rate']:.1%})")
+    if stats["median_lead_days"] is not None:
+        print(f"lead time   : median {stats['median_lead_days']:.0f} d  "
+              f"(p25 {stats['lead_p25']} / p75 {stats['lead_p75']})")
+    print("\nby cutoff:")
+    by: dict = {}
+    for o in outcomes:
+        k = o.cutoff.year
+        by.setdefault(k, [0, 0])
+        by[k][0] += 1
+        by[k][1] += int(o.detected)
+    for year in sorted(by):
+        total, hit = by[year]
+        print(f"  {year}  {hit:>3} / {total:<3}  {hit / total:5.0%}")
+    if not args.strong_only:
+        print("\nUNADJUDICATED — a company-level fire is not a match. "
+              "EVALUATION §1.3\nrequires a human to judge the cluster against "
+              "the action's harm, and only\n'strong' counts in the headline. "
+              "This number is an upper bound.")
+    return 0
+
+
 def _as_of(con, cutoff=None):
     """The newest complaint date actually in scope.
 
@@ -1577,10 +1617,10 @@ PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
     "embed": phase_embed,
     "cluster": phase_cluster,
     "signals": phase_signals,
+    "backtest": phase_backtest,
 }
 
 PLANNED: dict[str, str] = {
-    "backtest": "ROADMAP Phase 6 [GATE] — point-in-time harness",
     "baselines": "ROADMAP Phase 7 — B0 volume, B1 taxonomy, B2 LDA, B3 BERTopic",
     "label": "ROADMAP Phase 8 — LLM cluster labels + evidence retrieval",
     "evaluate": "ROADMAP Phase 9 — metrics, calibration, failure analysis",
@@ -1656,6 +1696,9 @@ def main(argv: list[str] | None = None) -> int:
                        help="encode only the first N texts; cluster: fit sample size")
     p_run.add_argument("--dedup-run", help="dedup run whose representatives to cluster")
     p_run.add_argument("--family", help="cluster only this product family")
+    p_run.add_argument("--system", default="harmscope", help="backtest: system label")
+    p_run.add_argument("--strong-only", action="store_true",
+                       help="backtest: require an adjudicated strong link")
     p_run.add_argument("--run-id", help="cluster run to build signals from")
     p_run.add_argument("--shuffle", type=int, default=0, metavar="K",
                        help="negative control: permute cluster labels within "

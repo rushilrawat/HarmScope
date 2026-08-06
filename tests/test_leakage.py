@@ -27,11 +27,23 @@ GROUND_TRUTH = ROOT / "data" / "ground_truth" / "enforcement_actions.csv"
 
 
 def _live():
+    """The live database, or a skip.
+
+    DuckDB is single-writer at the process level, so a long refit holds the file
+    and even a read-only connect fails. Skipping then is right: a leakage check
+    that fails because a pipeline stage is running is reporting on the lock, not
+    on leakage, and a red suite that means nothing trains people to ignore it.
+    """
+    import duckdb
+
     from src.config import PATHS
 
     if not PATHS.db.exists():
         pytest.skip("no database — leakage checks need a real run")
-    return db.connect(read_only=True)
+    try:
+        return db.connect(read_only=True)
+    except duckdb.IOException:
+        pytest.skip("database is locked by a running pipeline stage")
 
 
 def _refit(con):
