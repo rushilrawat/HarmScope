@@ -1173,6 +1173,51 @@ def cmd_refit(args: argparse.Namespace) -> int:
     return 0
 
 
+def phase_baselines(args: argparse.Namespace) -> int:
+    """Phase 7 — build a baseline's units, then run the identical pipeline.
+
+    Only the definition of a "cluster" changes. Everything after it is the same
+    code, which is what EVALUATION §2 means by "the same statistical machinery".
+    """
+    from src.evaluation import baselines
+
+    system = args.system
+    if system not in baselines.BUILDERS:
+        raise SystemExit(f"no builder for {system}; have {list(baselines.BUILDERS)}")
+
+    con = db.bootstrap()
+    cutoff = getattr(args, "cutoff", None)
+    dedup_run = args.dedup_run or (
+        backtest_run_for(con, cutoff) if cutoff else latest_run(con, "dedup")
+    )
+    as_of = _as_of(con, cutoff)
+
+    params = {"system": system, "dedup_run": dedup_run, "limit": None,
+              "cutoff": str(cutoff or "")}
+    with db.run(con, "cluster", CONFIG, params=params) as r:
+        n_clusters, n_members = baselines.BUILDERS[system](
+            con, r.run_id, dedup_run, as_of, cutoff
+        )
+        checks.expect_rows(con, "clusters", min=1)
+        r.finish(output_rows=n_clusters, input_rows=n_members)
+
+    print(f"{system}: {n_clusters:,} units over {n_members:,} representatives")
+    print(f"  cluster run: {r.run_id}")
+    print("  next: `run --phase signals --run-id <that>` puts it through the "
+          "identical detection path")
+    return 0
+
+
+def backtest_run_for(con, cutoff):
+    """The dedup run belonging to a cutoff's refit."""
+    from src.evaluation import backtest as bt
+
+    run = bt.run_for_cutoff(con, "dedup", cutoff)
+    if run is None:
+        raise SystemExit(f"no dedup refit at {cutoff} — run `refit --cutoff` first")
+    return run
+
+
 def phase_backtest(args: argparse.Namespace) -> int:
     """Phase 6 — evaluate every usable action against its own cutoff's refit."""
     from src.evaluation import backtest
@@ -1629,10 +1674,10 @@ PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
     "cluster": phase_cluster,
     "signals": phase_signals,
     "backtest": phase_backtest,
+    "baselines": phase_baselines,
 }
 
 PLANNED: dict[str, str] = {
-    "baselines": "ROADMAP Phase 7 — B0 volume, B1 taxonomy, B2 LDA, B3 BERTopic",
     "label": "ROADMAP Phase 8 — LLM cluster labels + evidence retrieval",
     "evaluate": "ROADMAP Phase 9 — metrics, calibration, failure analysis",
 }
@@ -1706,6 +1751,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--limit", type=int,
                        help="encode only the first N texts; cluster: fit sample size")
     p_run.add_argument("--dedup-run", help="dedup run whose representatives to cluster")
+    p_run.add_argument("--cutoff", help="ISO date; restricts to complaints before it")
     p_run.add_argument("--family", help="cluster only this product family")
     p_run.add_argument("--system", default="harmscope", help="backtest: system label")
     p_run.add_argument("--strong-only", action="store_true",
