@@ -77,7 +77,7 @@ def evaluate(
     min_supporting_groups: int,
     fdr_alpha: float,
     strong_only: bool = False,
-) -> list[Outcome]:
+) -> tuple[list[Outcome], dict]:
     """One `Outcome` per usable action.
 
     A detection requires a signal for the action's company, from the cutoff's
@@ -93,17 +93,20 @@ def evaluate(
     ).fetchall()
 
     out: list[Outcome] = []
+    missing: dict[date, list[str]] = {}
     for action_id, company_id, filed in actions:
         cutoff = cutoff_for(filed)
         if cutoff is None:
             continue
         signals_run = run_for_cutoff(con, "signals", cutoff)
         if signals_run is None:
-            raise LookupError(
-                f"no signals run for cutoff {cutoff} — action {action_id} cannot "
-                f"be evaluated without one, and using another run would evaluate "
-                f"it against a model that saw the action"
-            )
+            # Skipped loudly, never silently, and never by substituting another
+            # run: any other run saw complaints filed after this action, so it
+            # would "detect" the action using the response to it. The caller
+            # reports the missing cutoffs as coverage rather than hiding the gap
+            # in a denominator.
+            missing.setdefault(cutoff, []).append(action_id)
+            continue
 
         rows = con.execute(
             """
@@ -133,7 +136,7 @@ def evaluate(
             lead_time_days=(filed - first).days if first else None,
             n_clusters_fired=len(rows),
         ))
-    return out
+    return out, missing
 
 
 def summarise(outcomes: list[Outcome]) -> dict:

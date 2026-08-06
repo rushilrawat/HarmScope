@@ -1180,7 +1180,7 @@ def phase_backtest(args: argparse.Namespace) -> int:
     con = db.bootstrap()
     params = {"system": args.system, "strong_only": args.strong_only, "limit": None}
     with db.run(con, "backtest", CONFIG, params=params) as r:
-        outcomes = backtest.evaluate(
+        outcomes, missing = backtest.evaluate(
             con, CONFIG.signals.min_supporting_groups, CONFIG.signals.fdr_alpha,
             strong_only=args.strong_only,
         )
@@ -1195,6 +1195,11 @@ def phase_backtest(args: argparse.Namespace) -> int:
     if stats["median_lead_days"] is not None:
         print(f"lead time   : median {stats['median_lead_days']:.0f} d  "
               f"(p25 {stats['lead_p25']} / p75 {stats['lead_p75']})")
+    if missing:
+        n_skipped = sum(len(v) for v in missing.values())
+        print(f"\nCOVERAGE GAP: {n_skipped} actions not evaluated — no refit at "
+              f"{', '.join(str(c) for c in sorted(missing))}")
+        print("  These are excluded from the denominator, not counted as misses.")
     print("\nby cutoff:")
     by: dict = {}
     for o in outcomes:
@@ -1206,10 +1211,16 @@ def phase_backtest(args: argparse.Namespace) -> int:
         total, hit = by[year]
         print(f"  {year}  {hit:>3} / {total:<3}  {hit / total:5.0%}")
     if not args.strong_only:
-        print("\nUNADJUDICATED — a company-level fire is not a match. "
-              "EVALUATION §1.3\nrequires a human to judge the cluster against "
-              "the action's harm, and only\n'strong' counts in the headline. "
-              "This number is an upper bound.")
+        print(
+            "\nUNADJUDICATED — both numbers above are upper bounds, and the lead\n"
+            "time is the more inflated of the two. `first_signal` is the earliest\n"
+            "month ANY cluster fired for this company, not the cluster that\n"
+            "corresponds to this action's harm, so it measures 'when did this\n"
+            "company first look unusual at all' — which for a large bank is\n"
+            "close to always. EVALUATION §1.3 requires a human to match the\n"
+            "cluster to the harm; only then is a lead time a lead time.\n"
+            "Re-run with --strong-only once backtest_links is populated."
+        )
     return 0
 
 
