@@ -207,3 +207,19 @@ def load(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
     return con.execute(
         "SELECT count(*) FROM enforcement_actions WHERE usable"
     ).fetchone()[0]
+
+
+def update_summaries(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
+    """Update `harm_summary` in place, leaving every other column alone.
+
+    Not a delete-and-reload. `baseline_results` and `backtest_links` both key on
+    `action_id`, so replacing the table would either fail on the foreign key or
+    require discarding backtest output to change a description field that no
+    detection stage reads. An UPDATE also makes the invariant obvious: nothing
+    that decides which actions are evaluated can move.
+    """
+    con.executemany(
+        "UPDATE enforcement_actions SET harm_summary = ? WHERE action_id = ?",
+        [(r["harm_summary"] or None, r["action_id"]) for r in rows],
+    )
+    return len(rows)
