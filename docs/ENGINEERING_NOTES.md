@@ -906,6 +906,71 @@ the age of a company's complaint stream, not of a harm.
 
 Nothing here is final while Phases 3-5 run on the dev model.
 
+_B2 and B3 — decisions recorded before either produced a detection rate
+(2026-08-06):_
+
+Everything below was fixed while B2's first cutoff was still running and B3 had
+not been built. The threshold sweep two entries up is the reason for the
+formality: the free parameters in a baseline are the free parameters in the
+comparison, and choosing them after seeing which way they push is trap T4 no
+matter how good the mechanism sounds.
+
+**B2's topic count is HarmScope's cluster count, per family, per cutoff.**
+`n_topics` sets B2's granularity directly, and the sweep already measured what
+granularity does here: an absolute `min_supporting_groups` floor filters on unit
+size, so a system with three times as many units clears it less often regardless
+of quality. Matching HarmScope's discovered count removes the degree of freedom —
+whatever the floor does to HarmScope it does to B2. This neutralizes the artifact
+**between B2 and HarmScope only**. B0 has 11 units and B3 has whatever
+`min_cluster_size=10` finds; granularity is not controlled across all four and
+the quantile floor recorded above is still the fix.
+
+**`min_supporting_groups` does not measure the same quantity for B3.** B3 runs
+without dedup, so its groups are singletons and `n_supporting_groups ==
+n_supporting`: the floor of 15 means fifteen *complaints* for B3 and fifteen
+distinct *dup-groups* for every other system. Campaign exclusion is also empty
+for B3, by the same construction. Two effects pull opposite ways — BERTopic's
+`min_cluster_size=10` makes units finer, complaint-denominated counting with no
+campaign exclusion makes support larger — and which dominates was not predicted
+in advance. This is the same defect class as the threshold artifact: an absolute
+count compared across systems whose units are not commensurable. Recorded before
+B3's rate exists so that it reads as a caveat rather than as a discovery.
+`CONFIG.signals.min_a` in the 2x2 test inherits the same problem.
+
+**B3's "no dedup" is expressed as data, not as a flag.** A `dup_groups`
+population of singletons under its own run makes the unchanged panel mean
+exactly "no dedup": each complaint carries its own cluster, distinct groups equal
+distinct complaints, and no `campaigns` rows exist to exclude. It is registered
+under phase `dedup_identity` rather than `dedup` — `latest_run` and
+`backtest.run_for_cutoff` resolve by recency within a phase, so an identity run
+filed as `dedup` would be newer than the real refit at the same cutoff and would
+silently shadow it for HarmScope, B0, B1 and B2.
+
+**B3's deviations from `pip install bertopic`.** The hyperparameters are
+BERTopic 0.17's constructor defaults read from its source — UMAP(15, 5,
+min_dist=0.0, cosine), HDBSCAN(min_cluster_size=10, euclidean, eom) — and its
+default encoder is `all-MiniLM-L6-v2`, which is the model every system in this
+comparison runs on. What is not off-the-shelf: the fit is per product family
+rather than global, because the panel restricts a cluster's numerator to its own
+family and a global model would need a modal family per topic that silently drops
+cross-family members; assignment is HarmScope's nearest-centroid rule rather than
+`approximate_predict`, so the gap measures default hyperparameters instead of a
+different assignment rule; and the fit sample stays at 500k, as HarmScope's does.
+
+**B2's `norm=None` was a bug fix, found before it became a result.**
+`TfidfVectorizer` l2-normalizes by default, which leaves each document carrying
+about one unit of pseudo-count mass, and LDA fit on that has essentially no data.
+Measured at the 2017 cutoff, credit_reporting, k=195: **5 of 195 topics ever won
+an argmax and one held 99.0% of the documents.** Unchanged at max_iter 5, 20 and
+50, and unchanged with `use_idf=False` — normalization was the cause, not
+weighting or convergence. With `norm=None` all 195 topics populate and the
+largest holds 5.4%; raw counts sit in between at 92 of 195, largest 23.7%. The
+first B2 run, before the fix, produced 114 units at a cutoff where HarmScope has
+1,101 — a system crippled by an implementation detail would have looked like
+evidence that bag-of-words topic models cannot find harm mechanisms. `max_iter`
+stays at 5: 5, 20 and 50 were indistinguishable on this diagnostic, and the
+diagnostic is a topic-count property that never sees a detection rate.
+
 ### Phase 8 — LLM layer
 _Determinism test result:_
 _Label agreement rate on 50 verified:_

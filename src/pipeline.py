@@ -466,8 +466,13 @@ def phase_cluster(args: argparse.Namespace) -> int:
     families = [f for f in sorted(by_family, key=lambda f: -len(by_family[f]))
                 if not args.family or f == args.family]
 
+    # B3 reuses this whole stage with BERTopic's default hyperparameters and an
+    # identity dedup run; `system` is what keeps its clusters, signals and
+    # backtest rows separable from HarmScope's.
+    cfg = getattr(args, "cluster_cfg", None) or CONFIG.cluster
+    system = getattr(args, "system", None)
     params = {"model": model, "dedup_run": dedup_run, "limit": args.limit,
-              "family": args.family,
+              "family": args.family, "system": system,
               "cutoff": str(getattr(args, "cutoff", None) or "")}
     totals = {"clusters": 0, "assigned": 0, "reps": 0}
     with db.run(con, "cluster", CONFIG, params=params) as r:
@@ -486,7 +491,7 @@ def phase_cluster(args: argparse.Namespace) -> int:
             rows, complaint_ids = by_family[family], ids_by_family[family]
             totals["reps"] += len(rows)
             result = fit_mod.fit_family(
-                vectors, rows, family, CONFIG.cluster, CONFIG.seed,
+                vectors, rows, family, cfg, CONFIG.seed,
                 sample_size=args.limit or None,
             )
             if result is None or result.n_clusters == 0:
@@ -495,7 +500,7 @@ def phase_cluster(args: argparse.Namespace) -> int:
             # Every representative goes through the same rule, sampled or not —
             # see the note in cluster/fit.py on why that symmetry matters.
             labels, sims = assign_mod.assign(
-                vectors, rows, result.centroids, CONFIG.cluster.assign_max_distance
+                vectors, rows, result.centroids, cfg.assign_max_distance
             )
             coherence = assign_mod.coherence(labels, sims, result.n_clusters)
             medoid = assign_mod.medoids(vectors, rows, labels, sims, result.n_clusters)
@@ -539,8 +544,17 @@ def phase_cluster(args: argparse.Namespace) -> int:
                   f"assigned {assigned.mean():5.1%}  "
                   f"mean coherence {coherence[coherence > 0].mean():.3f}")
 
-        n_novel = _write_novelty(con, r.run_id)
-        n_related = _write_related(con, centroids_by_family, cluster_ids)
+        # `cluster_novelty` and `related_clusters` are the descriptive layer:
+        # the panel, the signals and the backtest never join either, only
+        # `pipeline alerts` and METHODOLOGY §4.2 read them. EVALUATION §2 runs
+        # B3 with "no novelty scoring", and skipping both changes no B3 number.
+        # `related` is also O(k_a x k_b) per family pair, which at BERTopic's
+        # min_cluster_size of 10 is tens of thousands of centroids a side.
+        if getattr(args, "no_descriptive", False):
+            n_novel = n_related = 0
+        else:
+            n_novel = _write_novelty(con, r.run_id)
+            n_related = _write_related(con, centroids_by_family, cluster_ids)
         checks.expect_rows(con, "clusters", min=1)
         r.finish(output_rows=totals["clusters"], input_rows=totals["reps"])
 
@@ -1263,15 +1277,20 @@ def phase_baselines(args: argparse.Namespace) -> int:
     from src.evaluation import baselines
 
     system = args.system
-    if system not in baselines.BUILDERS:
-        raise SystemExit(f"no builder for {system}; have {list(baselines.BUILDERS)}")
+    if system != "B3" and system not in baselines.BUILDERS:
+        raise SystemExit(
+            f"no builder for {system}; have {[*baselines.BUILDERS, 'B3']}"
+        )
 
     con = db.bootstrap()
     cutoff = getattr(args, "cutoff", None)
+    as_of = _as_of(con, cutoff)
+    if system == "B3":
+        return _baseline_b3(con, args, cutoff, as_of)
+
     dedup_run = args.dedup_run or (
         backtest_run_for(con, cutoff) if cutoff else latest_run(con, "dedup")
     )
-    as_of = _as_of(con, cutoff)
 
     params = {"system": system, "dedup_run": dedup_run, "limit": None,
               "cutoff": str(cutoff or "")}
@@ -1284,9 +1303,39 @@ def phase_baselines(args: argparse.Namespace) -> int:
 
     print(f"{system}: {n_clusters:,} units over {n_members:,} representatives")
     print(f"  cluster run: {r.run_id}")
-    print("  next: `run --phase signals --run-id <that>` puts it through the "
-          "identical detection path")
+    print(f"  next: `run --phase signals --run-id {r.run_id} "
+          f"--dedup-run {dedup_run}` puts it through the identical detection path")
     return 0
+
+
+def _baseline_b3(con, args, cutoff, as_of) -> int:
+    """B3 — off-the-shelf BERTopic defaults, no dedup, no novelty scoring.
+
+    Two things make B3 different from B0/B1/B2, and both are expressed as
+    inputs to the existing stage rather than as a parallel implementation:
+    BERTopic's hyperparameters replace HarmScope's, and the dedup run is an
+    identity one. `src/evaluation/baselines.py` documents why each falls out of
+    the unchanged code path.
+    """
+    from src.evaluation import baselines
+
+    with db.run(con, "dedup_identity", CONFIG,
+                params={"system": "B3", "limit": None,
+                        "cutoff": str(cutoff or "")}) as r:
+        n_rows = baselines.identity_groups(con, r.run_id, as_of, cutoff)
+        r.finish(output_rows=n_rows, input_rows=n_rows)
+    identity_run = r.run_id
+    print(f"identity dedup: {n_rows:,} singleton groups  ({identity_run})\n")
+
+    rc = phase_cluster(argparse.Namespace(
+        model=args.model, dedup_run=identity_run, family=None, limit=None,
+        cutoff=cutoff, system="B3", cluster_cfg=baselines.bertopic_cluster_config(),
+        no_descriptive=True,
+    ))
+    cluster_run = latest_run(con, "cluster")
+    print(f"  next: `run --phase signals --run-id {cluster_run} "
+          f"--dedup-run {identity_run}` puts it through the identical detection path")
+    return rc
 
 
 def backtest_run_for(con, cutoff):
@@ -1783,6 +1832,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.phase not in PHASES:
         known = ", ".join(sorted([*PHASES, *PLANNED, "all"]))
         raise SystemExit(f"unknown phase '{args.phase}'. Known phases: {known}")
+    # A cutoff is a date everywhere it is used internally — `cmd_refit` already
+    # parses it, and `backtest.run_for_cutoff` calls `.isoformat()` on it. Doing
+    # it once here rather than in each phase keeps the CLI path and the refit
+    # path handing the phases the same type.
+    if getattr(args, "cutoff", None):
+        from datetime import date as _date
+
+        args.cutoff = _date.fromisoformat(args.cutoff)
     return PHASES[args.phase](args)
 
 
