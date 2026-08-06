@@ -182,15 +182,22 @@ blind human adjudication (`EVALUATION.md` §1.3) and a `bge-base` encode.
 |---|---|---|---|
 | B1 — CFPB taxonomy | 63 / 112 | **56.2%** | 1518 d |
 | HarmScope | 57 / 112 | 50.9% | 1747 d |
+| B0 — volume only | 46 / 112 | 41.1% | 1954 d |
 
 \* Lead times are company-level and inflated; see `ENGINEERING_NOTES.md` Phase 6.
 
-**As it stands, the taxonomy baseline wins.** HarmScope produces 2,010 units to
-B1's 634, so each carries less evidence per company — 51.6% of its company-level
-signals clear the support floor against B1's 57.3% — and the finer partition
-loses more to that floor than it gains in specificity. If this survives
-adjudication, the honest conclusion is that the existing taxonomy is sufficient,
-and this table stays exactly as it is.
+**As it stands, the taxonomy baseline wins.** The ordering is
+`B1 > HarmScope > B0`: the pipeline is worth something over counting complaints
+per company (+9.8 points on B0), and is not worth anything over the taxonomy CFPB
+already publishes (−5.3 points on B1).
+
+HarmScope produces 2,010 units to B1's 634, so each carries less evidence per
+company — 51.6% of its company-level signals clear the support floor against
+B1's 57.3% — and the finer partition loses more to that floor than it gains in
+specificity. That is the bill for `cluster_selection_method='leaf'` arriving.
+
+If this survives adjudication, the honest conclusion is that the existing
+taxonomy is sufficient for this task, and this table stays exactly as it is.
 
 | Metric | Value |
 |---|---|
