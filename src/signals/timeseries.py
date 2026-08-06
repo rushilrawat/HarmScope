@@ -72,15 +72,21 @@ LEFT JOIN dup_groups dr
        ON dr.run_id = d.run_id AND dr.group_id = d.group_id AND dr.is_representative
 LEFT JOIN rep_cluster r ON r.rep_id = dr.complaint_id
 WHERE d.run_id = ?
+  AND (? IS NULL OR c.date_received < ?)
   AND c.complaint_id NOT IN (SELECT complaint_id FROM flagged)
 """
 
 
 def build_expanded(
-    con: duckdb.DuckDBPyConnection, cluster_run: str, dedup_run: str
+    con: duckdb.DuckDBPyConnection, cluster_run: str, dedup_run: str, cutoff=None
 ) -> int:
-    """Materialize the complaint -> (group, cluster) mapping for one run pair."""
-    con.execute(EXPANDED_SQL, [cluster_run, dedup_run, dedup_run])
+    """Materialize the complaint -> (group, cluster) mapping for one run pair.
+
+    `cutoff` excludes complaints received on or after it. Filtering here rather
+    than on the output is the point of EVALUATION §1.1.1: a post-cutoff
+    complaint must not reach the panel, the 2x2 margins, or the campaign flag.
+    """
+    con.execute(EXPANDED_SQL, [cluster_run, dedup_run, dedup_run, cutoff, cutoff])
     return con.execute("SELECT count(*) FROM _expanded").fetchone()[0]
 
 

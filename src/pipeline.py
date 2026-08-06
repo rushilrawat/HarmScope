@@ -411,7 +411,7 @@ def cmd_neighbours(args: argparse.Namespace) -> int:
     return 0
 
 
-def _representatives(con, dedup_run: str, model: str) -> tuple[dict, dict]:
+def _representatives(con, dedup_run: str, model: str, cutoff=None) -> tuple[dict, dict]:
     """`{product_family: memmap row indices}` for this dedup run's representatives.
 
     Clustering consumes representatives only (METHODOLOGY §2.3) — one document
@@ -427,9 +427,10 @@ def _representatives(con, dedup_run: str, model: str) -> tuple[dict, dict]:
         JOIN complaints c USING (complaint_id)
         JOIN embedding_map e USING (complaint_id)
         WHERE d.run_id = ? AND d.is_representative AND e.model = ?
+          AND (? IS NULL OR c.date_received < ?)
         ORDER BY c.product_family, d.complaint_id
         """,
-        [dedup_run, model],
+        [dedup_run, model, cutoff, cutoff],
     ).fetchall()
     out: dict[str, list] = {}
     ids: dict[str, list] = {}
@@ -458,13 +459,16 @@ def phase_cluster(args: argparse.Namespace) -> int:
     vectors = np.load(memmap, mmap_mode="r")
 
     dedup_run = args.dedup_run or latest_run(con, "dedup")
-    as_of = con.execute("SELECT max(date_received) FROM complaints").fetchone()[0]
-    by_family, ids_by_family = _representatives(con, dedup_run, model)
+    as_of = _as_of(con, getattr(args, "cutoff", None))
+    by_family, ids_by_family = _representatives(
+        con, dedup_run, model, getattr(args, "cutoff", None)
+    )
     families = [f for f in sorted(by_family, key=lambda f: -len(by_family[f]))
                 if not args.family or f == args.family]
 
     params = {"model": model, "dedup_run": dedup_run, "limit": args.limit,
-              "family": args.family}
+              "family": args.family,
+              "cutoff": str(getattr(args, "cutoff", None) or "")}
     totals = {"clusters": 0, "assigned": 0, "reps": 0}
     with db.run(con, "cluster", CONFIG, params=params) as r:
         con.execute(f"DELETE FROM cluster_novelty WHERE cluster_id LIKE '{r.run_id}:%'")
@@ -1091,9 +1095,104 @@ def cmd_alerts(args: argparse.Namespace) -> int:
     return 0
 
 
-def _months(con) -> list:
+def cmd_refit(args: argparse.Namespace) -> int:
+    """EVALUATION §1.1 — rebuild every date-dependent stage at one cutoff.
+
+    ROADMAP Phase 6 gates on this running end to end with a documented wall
+    time. What is refit and what is not comes from §1.1.1 and is not a
+    judgement call: it follows from whether a stage's output can depend on when
+    a complaint arrived.
+
+        embeddings, dup_pairs   reused   a vector and a pairwise Jaccard do not
+                                         change because another complaint exists
+        grouping, campaigns     refit    seed selection and time-windowed
+                                         features are both date-dependent
+        clustering, novelty     refit    trap T3: cluster definitions are THE
+                                         leakage vector
+        panel, signals          refit    obviously
+
+    Nothing here filters an existing artifact by date. Each stage is recomputed
+    from inputs restricted to `date_received < cutoff`, which is the difference
+    §1.2 exists to insist on.
+    """
+    import time
+    from datetime import date as _date
+
+    cutoff = _date.fromisoformat(args.cutoff)
+    con = db.bootstrap()
+    n_before = con.execute(
+        "SELECT count(*) FROM complaints WHERE date_received < ? AND has_narrative",
+        [cutoff],
+    ).fetchone()[0]
+    as_of = con.execute(
+        "SELECT max(date_received) FROM complaints WHERE date_received < ?", [cutoff]
+    ).fetchone()[0]
+    print(f"cutoff      : {cutoff}   as_of {as_of}")
+    print(f"in scope    : {n_before:,} narrative-bearing complaints\n")
+
+    timings: list[tuple[str, float]] = []
+    t_all = time.time()
+
+    # --- grouping + campaigns, from the reused dup_pairs ---------------------
+    from src.dedup import detect
+
+    t0 = time.time()
+    with db.run(con, "dedup", CONFIG, params={"cutoff": str(cutoff), "limit": None}) as r:
+        dedup_run = r.run_id
+        n_groups, n_rows = detect.assign_groups(con, dedup_run, as_of, cutoff=cutoff)
+        n_cand, n_flag = detect.build_campaigns(con, dedup_run, CONFIG, as_of)
+        r.finish(output_rows=n_rows, input_rows=n_before)
+    timings.append(("grouping + campaigns", time.time() - t0))
+    print(f"  groups    : {n_groups:,} over {n_rows:,}; campaigns {n_cand:,} "
+          f"({n_flag:,} flagged)   [{timings[-1][1] / 60:.1f} min]")
+
+    # --- clustering + novelty ------------------------------------------------
+    t0 = time.time()
+    cluster_args = argparse.Namespace(
+        model=args.model, dedup_run=dedup_run, family=None, limit=None,
+        cutoff=cutoff,
+    )
+    phase_cluster(cluster_args)
+    timings.append(("clustering + novelty", time.time() - t0))
+
+    # --- panel + signals -----------------------------------------------------
+    t0 = time.time()
+    cluster_run = latest_run(con, "cluster")
+    signal_args = argparse.Namespace(
+        run_id=cluster_run, dedup_run=dedup_run, shuffle=0, cutoff=cutoff,
+    )
+    phase_signals(signal_args)
+    timings.append(("panel + signals", time.time() - t0))
+
+    total = time.time() - t_all
+    print(f"\n{'=' * 60}\nFULL REFIT AT {cutoff} — wall time")
+    for name, seconds in timings:
+        print(f"  {name:<24} {seconds / 60:6.1f} min")
+    print(f"  {'TOTAL':<24} {total / 60:6.1f} min")
+    print(f"\n  8 annual cutoffs at this rate: {8 * total / 3600:.1f} h")
+    return 0
+
+
+def _as_of(con, cutoff=None):
+    """The newest complaint date actually in scope.
+
+    Taken from the corpus *restricted to the cutoff*, never from the whole
+    corpus. Getting this from `max(date_received)` over everything stamped a
+    2017 refit's clusters with as_of 2026-08-03, which defeats the point of
+    carrying as_of at all: EVALUATION §5 item 2 asserts cluster definitions
+    used at cutoff C were fit only on < C data, and it asserts it on this field.
+    """
+    return con.execute(
+        "SELECT max(date_received) FROM complaints WHERE (? IS NULL OR date_received < ?)",
+        [cutoff, cutoff],
+    ).fetchone()[0]
+
+
+def _months(con, cutoff=None) -> list:
     return [r[0] for r in con.execute(
-        "SELECT DISTINCT period_month FROM complaints ORDER BY 1"
+        "SELECT DISTINCT period_month FROM complaints "
+        "WHERE (? IS NULL OR period_month < ?) ORDER BY 1",
+        [cutoff, cutoff],
     ).fetchall()]
 
 
@@ -1105,13 +1204,17 @@ def phase_signals(args: argparse.Namespace) -> int:
     con = db.bootstrap()
     cluster_run = args.run_id or latest_run(con, "cluster")
     dedup_run = args.dedup_run or latest_run(con, "dedup")
-    as_of = con.execute("SELECT max(date_received) FROM complaints").fetchone()[0]
-    months = _months(con)
+    cutoff = getattr(args, "cutoff", None)
+    as_of = _as_of(con, cutoff)
+    months = _months(con, cutoff)
 
     params = {"cluster_run": cluster_run, "dedup_run": dedup_run,
-              "shuffle": args.shuffle, "limit": None}
+              "shuffle": args.shuffle, "limit": None,
+              "cutoff": str(getattr(args, "cutoff", None) or "")}
     with db.run(con, "signals", CONFIG, params=params) as r:
-        n_expanded = timeseries.build_expanded(con, cluster_run, dedup_run)
+        n_expanded = timeseries.build_expanded(
+            con, cluster_run, dedup_run, getattr(args, 'cutoff', None)
+        )
         if args.shuffle:
             n_shuffled = _shuffle_clusters(con, CONFIG.seed + args.shuffle)
             print(f"NEGATIVE CONTROL: cluster labels permuted within family "
@@ -1134,7 +1237,7 @@ def phase_signals(args: argparse.Namespace) -> int:
         print(f"changepoint: {len(changes):,} series fired of {len(series):,}")
 
         rows = _build_signals(con, r.run_id, cluster_run, scored, changes,
-                              as_of, make_signal_id)
+                              as_of, make_signal_id, months)
         con.execute("DELETE FROM signals WHERE run_id = ?", [r.run_id])
         if rows:
             con.executemany(
@@ -1223,7 +1326,7 @@ def _shuffle_clusters(con, seed: int) -> int:
     return con.execute("SELECT count(*) FROM _shuffled").fetchone()[0]
 
 
-def _build_signals(con, run_id, cluster_run, scored, changes, as_of, make_id):
+def _build_signals(con, run_id, cluster_run, scored, changes, as_of, make_id, months):
     """Assemble signal rows, carrying both support counts on every one.
 
     `n_supporting_groups` is **distinct** groups over the whole window, not the
@@ -1247,8 +1350,11 @@ def _build_signals(con, run_id, cluster_run, scored, changes, as_of, make_id):
     """).fetchall())
 
     rows, i = [], 0
-    latest = max(m for (m,) in con.execute(
-        "SELECT DISTINCT period_month FROM complaints").fetchall())
+    # The period a disproportionality signal is dated at is the newest month IN
+    # SCOPE, not the newest month in the corpus. Reading it from the whole
+    # corpus dated every 2017-cutoff signal at 2026-08 — after its own cutoff,
+    # which would make any lead time computed from it meaningless.
+    latest = months[-1]
     for s in scored:
         key = (s.cluster_id, s.company_id)
         groups = support.get(key, 0)
@@ -1601,6 +1707,11 @@ def main(argv: list[str] | None = None) -> int:
     p_cl.add_argument("--run-id")
     p_cl.add_argument("--novel-only", action="store_true")
     p_cl.set_defaults(func=cmd_clusters)
+
+    p_re = sub.add_parser("refit", help="Phase 6: full refit at one cutoff")
+    p_re.add_argument("--cutoff", required=True, help="ISO date; uses complaints < this")
+    p_re.add_argument("--model")
+    p_re.set_defaults(func=cmd_refit)
 
     p_al = sub.add_parser("alerts", help="Phase 5: the joint alert criteria (§6.3)")
     p_al.add_argument("-n", type=int, default=20)

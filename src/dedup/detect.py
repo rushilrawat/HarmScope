@@ -145,22 +145,37 @@ def verify(
 
 
 def assign_groups(
-    con: duckdb.DuckDBPyConnection, run_id: str, as_of: date
+    con: duckdb.DuckDBPyConnection, run_id: str, as_of: date,
+    cutoff: date | None = None,
 ) -> tuple[int, int]:
-    """Union-find over `dup_pairs`, then write `dup_groups`.
+    """Star clustering over `dup_pairs`, then write `dup_groups`.
 
     The representative is the earliest `date_received`, ties on the lower
     `complaint_id` (docs/METHODOLOGY.md §2.3): deterministic, and backward
     looking, so a group that gains members after a backtest cutoff does not
     retroactively change what a pre-cutoff run saw.
+
+    `cutoff` restricts the whole computation to complaints received strictly
+    before it. This is refit per cutoff and cannot be replaced by filtering the
+    output (EVALUATION §1.1.1): grouping is date-dependent, because a document
+    only becomes a seed if enough of its neighbours have already arrived, and
+    representative selection must choose from members that existed at the time.
+    `dup_pairs` itself is not refit — pairwise Jaccard does not depend on what
+    else exists — so this reuses the one expensive artifact and recomputes only
+    the date-dependent part.
     """
+    where = "" if cutoff is None else f"WHERE c.date_received < DATE '{cutoff}'"
     # Exact duplicates are atomic: identical text, similarity 1.0 by
     # definition, so they are collapsed first and only their representatives
     # are star-clustered. Otherwise a seed could admit some members of an exact
     # group and not others, splitting byte-identical documents.
     exact = con.execute(
-        "SELECT complaint_id, min(complaint_id) OVER (PARTITION BY text_hash) "
-        "FROM narratives ORDER BY complaint_id"
+        f"""
+        SELECT complaint_id, min(complaint_id) OVER (PARTITION BY text_hash)
+        FROM narratives n JOIN complaints c USING (complaint_id)
+        {where}
+        ORDER BY complaint_id
+        """
     ).fetchall()
     rep_of = dict(exact)
     reps = sorted({rep for _, rep in exact})
