@@ -713,7 +713,49 @@ _Anti-leakage tests passing:_
 _Gate passed:_ Y / N
 
 ### Phase 7 — Baselines
-_B1 implementation notes (must use identical statistical machinery):_
+_B1 implementation notes (must use identical statistical machinery):_ B1 is not
+a second implementation. Each `(product_family, issue_std, sub_issue_std)` tuple
+is written into `clusters` under its own `run_id`, and every downstream stage —
+panel, 2x2 margins, EB shrinkage, BH within family, EWMA, PELT, §6.3 criteria,
+backtest — runs over it untouched. There is no parallel code path that could
+diverge, which is a stronger reading of §2's "same statistical machinery" than
+any refactor.
+
+Both systems read the same `dup_groups` representatives, so the population is
+identical and only the partition differs. `coherence` and `persistence` are set
+to 1.0 for taxonomy units: they are HDBSCAN notions and a label is a definition
+rather than a discovered density. Leaving them NULL would have let §6.3 filter
+B1 out and handed HarmScope the comparison.
+
+_First result (2026-08-06, dev model, UNADJUDICATED):_
+
+    system      detected   rate    median lead   units at 2024 cutoff
+    HarmScope     57/112   50.9%      1747 d          2,010
+    B1 taxonomy   63/112   56.2%      1518 d            634
+
+**B1 wins on detection rate.** The existing CFPB taxonomy identifies six more of
+the 112 enforcement actions than the discovered clusters do. `PROJECT_SPEC` and
+the README both commit to reporting this outcome if it happens, and it has
+happened.
+
+The structural reason is visible in the support distribution. HarmScope produces
+2,010 units at the 2024 cutoff against B1's 634, so its units are finer and each
+carries less evidence per company: median 15 supporting groups against B1's 18,
+and 51.6% of HarmScope's company-level signals clear the `min_supporting_groups`
+gate against B1's 57.3%. Splitting the same complaints into three times as many
+units divides the support three ways, and the §6.3 floor then removes what is
+left. Finer clusters are the whole point of `cluster_selection_method='leaf'`,
+and this is the bill for it.
+
+_What this result is not, yet:_ both numbers are company-level and
+unadjudicated, so they measure "did anything fire for this company" rather than
+"did the thing that fired correspond to this harm". That comparison is roughly
+fair between the two systems — both are inflated the same way — but the gap is
+small enough that adjudication could move it either direction. The median lead
+times are not comparable at all for the reason recorded under Phase 6: they are
+the age of a company's complaint stream, not of a harm.
+
+Nothing here is final while Phases 3-5 run on the dev model.
 
 ### Phase 8 — LLM layer
 _Determinism test result:_

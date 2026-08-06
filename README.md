@@ -175,10 +175,26 @@ phase 'cluster' is not built.
 
 _Populate after Phase 9. Do not write numbers here until the backtest has run._
 
+**Provisional, unadjudicated, dev model.** Not the headline — the headline needs
+blind human adjudication (`EVALUATION.md` §1.3) and a `bge-base` encode.
+
+| System | Detected | Rate | Median lead* |
+|---|---|---|---|
+| B1 — CFPB taxonomy | 63 / 112 | **56.2%** | 1518 d |
+| HarmScope | 57 / 112 | 50.9% | 1747 d |
+
+\* Lead times are company-level and inflated; see `ENGINEERING_NOTES.md` Phase 6.
+
+**As it stands, the taxonomy baseline wins.** HarmScope produces 2,010 units to
+B1's 634, so each carries less evidence per company — 51.6% of its company-level
+signals clear the support floor against B1's 57.3% — and the finer partition
+loses more to that floor than it gains in specificity. If this survives
+adjudication, the honest conclusion is that the existing taxonomy is sufficient,
+and this table stays exactly as it is.
+
 | Metric | Value |
 |---|---|
-| Enforcement actions backtested | — |
-| Actions with a matching signal before action date | — |
-| Median lead time | — |
-| Lead time vs. taxonomy baseline | — |
+| Enforcement actions backtested | 112 (of 212 scraped) |
+| Cutoffs | annual, 2017–2024, full refit each |
+| Adjudication | **not yet performed** |
 | False alerts per 1,000 company-months | — |
