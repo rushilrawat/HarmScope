@@ -52,7 +52,10 @@ def cutoff_for(filed: date) -> date | None:
     return prior[-1] if prior else None
 
 
-def run_for_cutoff(con: duckdb.DuckDBPyConnection, phase: str, cutoff: date) -> str | None:
+def run_for_cutoff(
+    con: duckdb.DuckDBPyConnection, phase: str, cutoff: date,
+    system: str | None = None,
+) -> str | None:
     """The run of `phase` produced by the refit at `cutoff`.
 
     Resolved from the cutoff recorded in the run's own params, never from
@@ -65,9 +68,11 @@ def run_for_cutoff(con: duckdb.DuckDBPyConnection, phase: str, cutoff: date) -> 
         SELECT run_id FROM runs
         WHERE phase = ? AND status = 'ok'
           AND json_extract_string(params_json, '$.params.cutoff') = ?
+          AND (? IS NULL OR coalesce(
+                json_extract_string(params_json, '$.params.system'), 'harmscope') = ?)
         ORDER BY started_at DESC LIMIT 1
         """,
-        [phase, cutoff.isoformat()],
+        [phase, cutoff.isoformat(), system, system],
     ).fetchone()
     return row[0] if row else None
 
@@ -77,6 +82,7 @@ def evaluate(
     min_supporting_groups: int,
     fdr_alpha: float,
     strong_only: bool = False,
+    system: str = "harmscope",
 ) -> tuple[list[Outcome], dict]:
     """One `Outcome` per usable action.
 
@@ -98,7 +104,7 @@ def evaluate(
         cutoff = cutoff_for(filed)
         if cutoff is None:
             continue
-        signals_run = run_for_cutoff(con, "signals", cutoff)
+        signals_run = run_for_cutoff(con, "signals", cutoff, system)
         if signals_run is None:
             # Skipped loudly, never silently, and never by substituting another
             # run: any other run saw complaints filed after this action, so it

@@ -1227,7 +1227,7 @@ def phase_backtest(args: argparse.Namespace) -> int:
     with db.run(con, "backtest", CONFIG, params=params) as r:
         outcomes, missing = backtest.evaluate(
             con, CONFIG.signals.min_supporting_groups, CONFIG.signals.fdr_alpha,
-            strong_only=args.strong_only,
+            strong_only=args.strong_only, system=args.system,
         )
         n = backtest.write(con, r.run_id, args.system, outcomes)
         r.finish(output_rows=n)
@@ -1304,8 +1304,15 @@ def phase_signals(args: argparse.Namespace) -> int:
     as_of = _as_of(con, cutoff)
     months = _months(con, cutoff)
 
+    # The system that produced the clusters is carried onto the signals run, or
+    # the backtest cannot tell B1's signals from HarmScope's and every baseline
+    # silently reports HarmScope's numbers.
+    system = con.execute(
+        "SELECT coalesce(json_extract_string(params_json, '$.params.system'), "
+        "'harmscope') FROM runs WHERE run_id = ?", [cluster_run],
+    ).fetchone()[0]
     params = {"cluster_run": cluster_run, "dedup_run": dedup_run,
-              "shuffle": args.shuffle, "limit": None,
+              "shuffle": args.shuffle, "limit": None, "system": system,
               "cutoff": str(getattr(args, "cutoff", None) or "")}
     with db.run(con, "signals", CONFIG, params=params) as r:
         n_expanded = timeseries.build_expanded(
