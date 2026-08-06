@@ -739,6 +739,37 @@ difference is paired rather than confounded.
     detect rate        50.9% unadjudicated
     corrected          31.8%           CI [15.6%, 43.9%]
 
+_Paired result against B1 (same 8 actions, same blinding, same standard):_
+
+    action                     HarmScope   B1
+    Zelle / Early Warning        strong    —      no P2P-specific unit; nearest
+                                                  is unauthorised EFT generally
+    Equifax 2019                 strong    —      no data-breach unit
+    Fay Servicing 2024           strong  strong
+    Nationstar 2020              strong  strong
+    Portfolio Recovery 2023      strong  strong
+    Bank of America 2022           —      —
+    Citibank 2023                  —      —
+    Santander 2018                 —      —
+
+    strong rate     HarmScope 5/8 = 62.5%    B1 3/8 = 37.5%
+    unadjudicated   HarmScope   50.9%        B1     56.2%
+    corrected       HarmScope   31.8%        B1     21.1%
+    discordant      HarmScope-only 2, B1-only 0, exact McNemar p = 0.50
+
+**The ordering reverses, and the sample cannot support it.** B1's strong set is a
+strict subset of HarmScope's, so the direction is at least internally consistent,
+but two discordant pairs is not evidence. What the sample does show is a
+mechanism: B1 leads unadjudicated because a coarse taxonomy tuple fires for a
+company more readily, and loses that lead when asked whether the tuple describes
+the specific harm. The two it lost are exactly the specific ones — Zelle P2P
+fraud, where B1's nearest unit is unauthorised electronic transfers in general,
+and the Equifax breach, which no taxonomy tuple names.
+
+That is the contribution the project was built to test, appearing for the first
+time and at a sample size that cannot confirm it. The honest next step is more
+adjudication, not a louder claim.
+
 **Roughly a third of "detections" survive the question of whether the cluster
 actually corresponds to the harm.** n = 8 and the interval says so; what this
 establishes is the direction and rough size of the company-level inflation, not

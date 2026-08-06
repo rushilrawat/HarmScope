@@ -186,7 +186,23 @@ blind human adjudication (`EVALUATION.md` §1.3) and a `bge-base` encode.
 
 \* Lead times are company-level and inflated; see `ENGINEERING_NOTES.md` Phase 6.
 
-**As it stands, the taxonomy baseline wins.** The ordering is
+**Adjudication reverses the ordering on a small sample.** On 8 actions both
+systems detected, judged blind against the orders' own descriptions:
+
+| System | Strong match | Corrected rate |
+|---|---|---|
+| HarmScope | 5 / 8 | **31.8%** |
+| B1 — CFPB taxonomy | 3 / 8 | 21.1% |
+
+B1's strong set is a strict subset of HarmScope's, so the direction is
+consistent — but two discordant pairs is an exact McNemar *p* = 0.50 and
+establishes nothing. **The unadjudicated table above is what the project can
+currently defend; this one is a signal to chase, not a result.**
+
+The mechanism is the mirror of why B1 leads unadjudicated: coarse taxonomy units
+fire more often for a company, and match a specific harm less often when asked.
+
+**Unadjudicated, the taxonomy baseline wins.** The ordering is
 `B1 > HarmScope > B0`: the pipeline is worth something over counting complaints
 per company (+9.8 points on B0), and is not worth anything over the taxonomy CFPB
 already publishes (−5.3 points on B1).
