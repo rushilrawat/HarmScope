@@ -1173,6 +1173,87 @@ def cmd_refit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_worklist(args: argparse.Namespace) -> int:
+    """Emit blinded adjudication worklists (EVALUATION §1.3 steps 1-2).
+
+    One CSV per action, containing cluster text and nothing that indicates
+    whether — or how strongly — anything fired. Decoys from unrelated companies
+    are shuffled in, because twenty candidates all drawn from one company would
+    itself tell the adjudicator the system fired on that company.
+    """
+    from src.evaluation import backtest as bt
+    from src.evaluation import worklist as wl
+
+    con = db.connect(read_only=True)
+    out_dir = PATHS.interim / "adjudication"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    actions = con.execute(
+        """
+        SELECT action_id, company_id, filed_date, harm_summary
+        FROM enforcement_actions WHERE usable AND company_id IS NOT NULL
+        ORDER BY filed_date
+        """
+    ).fetchall()
+
+    written = skipped = 0
+    for action_id, company_id, filed, _summary in actions:
+        cutoff = bt.cutoff_for(filed)
+        signals_run = bt.run_for_cutoff(con, "signals", cutoff, args.system)
+        cluster_run = bt.run_for_cutoff(con, "cluster", cutoff, args.system)
+        if not signals_run or not cluster_run:
+            skipped += 1
+            continue
+        candidates, _truth = wl.select(
+            con, signals_run, cluster_run, company_id,
+            CONFIG.eval.adjudication_top_k, CONFIG.eval.adjudication_decoys,
+            CONFIG.seed,
+        )
+        if not candidates:
+            skipped += 1
+            continue
+        wl.write(action_id, candidates, out_dir / f"{args.system}__{action_id}.csv")
+        written += 1
+
+    print(f"system   : {args.system}")
+    print(f"worklists: {written} written to {out_dir}")
+    print(f"skipped  : {skipped} (no refit, or no candidates)")
+    print("\nEach row has match_quality blank. Fill with strong / partial / none")
+    print("against the action's own description, then `pipeline adjudicate`.")
+    return 0
+
+
+def cmd_verdicts(args: argparse.Namespace) -> int:
+    """Read filled-in worklists into `backtest_links` (§1.3 steps 3-4).
+
+    Named `verdicts`, not `adjudicate`: that name already belongs to the Phase 2
+    dedup-pair reader, and two commands with one name is how someone runs the
+    wrong one.
+    """
+    from src.evaluation import adjudicate as adj
+
+    con = db.bootstrap()
+    directory = PATHS.interim / "adjudication"
+    files = sorted(directory.glob(f"{args.system}__*.csv"))
+    if not files:
+        raise SystemExit(f"no worklists in {directory} — run `worklist` first")
+
+    total = 0
+    for path in files:
+        rows = adj.read_worklist(path)
+        verdicts = adj.parse(rows)
+        if verdicts:
+            total += adj.record(con, verdicts, args.adjudicator)
+    counts = dict(con.execute(
+        "SELECT match_quality, count(*) FROM backtest_links GROUP BY 1"
+    ).fetchall())
+    print(f"recorded : {total} verdicts by {args.adjudicator!r}")
+    print(f"in table : {counts}")
+    print("\nOnly 'strong' counts as a detection (§1.3 step 5). Re-run the "
+          "backtest with --strong-only.")
+    return 0
+
+
 def phase_baselines(args: argparse.Namespace) -> int:
     """Phase 7 — build a baseline's units, then run the identical pipeline.
 
@@ -1819,6 +1900,15 @@ def main(argv: list[str] | None = None) -> int:
     p_re.add_argument("--cutoff", required=True, help="ISO date; uses complaints < this")
     p_re.add_argument("--model")
     p_re.set_defaults(func=cmd_refit)
+
+    p_wl = sub.add_parser("worklist", help="Phase 6: emit blinded adjudication worklists")
+    p_wl.add_argument("--system", default="harmscope")
+    p_wl.set_defaults(func=cmd_worklist)
+
+    p_vd = sub.add_parser("verdicts", help="Phase 6: read filled worklists")
+    p_vd.add_argument("--system", default="harmscope")
+    p_vd.add_argument("--adjudicator", default="claude-opus-5")
+    p_vd.set_defaults(func=cmd_verdicts)
 
     p_al = sub.add_parser("alerts", help="Phase 5: the joint alert criteria (§6.3)")
     p_al.add_argument("-n", type=int, default=20)
