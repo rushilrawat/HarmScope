@@ -190,6 +190,12 @@ def write(rows: list[dict], path: Path) -> Path:
 
 def load(con: duckdb.DuckDBPyConnection, rows: list[dict]) -> int:
     """Replace `enforcement_actions` with the curated set."""
+    # Everything keyed on action_id goes first, or the foreign keys reject the
+    # delete. Discarding them is correct rather than unfortunate: re-curating
+    # can change which actions exist, and a backtest result for an action that
+    # is no longer in the set is worse than no result. `update_summaries` is the
+    # path for changing a description without touching any of this.
+    con.execute("DELETE FROM baseline_results")
     con.execute("DELETE FROM backtest_links")
     con.execute("DELETE FROM enforcement_actions")
     con.executemany(

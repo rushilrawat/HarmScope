@@ -705,6 +705,55 @@ and PELT over ~200,000 mostly-tiny series is the dominant cost of the phase,
 which Phase 6 pays eight times over for its eight cutoffs. EWMA signals fell
 from 30,371 to 12,067 with no alert lost.
 
+### Phase 6b — Adjudication (2026-08-06)
+
+_The blocker found by starting, not by reading._ `harm_summary` held listing-page
+previews: median 182 characters, 18% ending in a literal ellipsis mid-sentence.
+The Citibank entry said only that Citibank "is a national bank headquartered in
+New York City, New York" — no conduct at all. Adjudicating a cluster against that
+is not strict or lenient, it is undefined. Enriched from the detail pages;
+median 182 → 1,505 characters. Only `harm_summary` changed, asserted across all
+212 rows against the seven selection-bearing fields.
+
+_Sample:_ 8 actions drawn by seed from the 55 that **both** HarmScope and B1
+detected, so the same actions can later be adjudicated for both and the
+difference is paired rather than confounded.
+
+    action                     verdict   matched cluster
+    Zelle / Early Warning      strong    P2P transfer fraud, explicit Zelle scams
+    Equifax 2019               strong    the 2017 breach and mishandled PII
+    Fay Servicing 2024         strong    forbearance and loss-mitigation requests
+    Nationstar 2020            strong    loan modification for distressed borrowers
+    Portfolio Recovery 2023    strong    collecting unvalidated / not-owed debt
+    Bank of America 2022       none      garnishment-notice processing — nearest
+                                         cluster is consumer-side garnishment
+                                         via a collector, a different mechanism
+    Citibank 2023              none      ECOA national-origin discrimination —
+                                         nothing among 30 candidates concerns
+                                         discrimination or adverse-action notices
+    Santander 2018             none      misdescribed GAP auto add-on — the
+                                         vehicle_loan clusters are servicing and
+                                         financing, not add-on products
+
+    strong             5 / 8 = 62.5%   Wilson 95% CI [30.6%, 86.3%]
+    detect rate        50.9% unadjudicated
+    corrected          31.8%           CI [15.6%, 43.9%]
+
+**Roughly a third of "detections" survive the question of whether the cluster
+actually corresponds to the harm.** n = 8 and the interval says so; what this
+establishes is the direction and rough size of the company-level inflation, not
+a headline. The three misses are informative in the same way: all three are
+harms with no natural complaint-narrative expression — a bank's internal
+garnishment processing, discrimination detectable only in denial rates, and an
+add-on product's disclosure. Complaint text cannot contain what consumers do not
+know happened to them.
+
+_Blinding, and its limit._ Rank, statistic and decoy status are all withheld and
+the presentation order is seeded. The limit is that the adjudicator is the same
+process that built the system and has seen the alert list, which no amount of
+worklist blinding fixes. Recorded as `claude-opus-5` in `backtest_links`, not
+passed off as human labelling.
+
 ### Phase 6 — Ground truth & backtest [GATE]
 _Actions curated / usable / excluded:_
 _enforcement_actions.csv frozen at SHA:_

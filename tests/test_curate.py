@@ -134,3 +134,32 @@ def test_committed_ground_truth_is_within_the_evaluable_window():
         filed = date.fromisoformat(row["filed_date"])
         assert curate.WINDOW_START <= filed <= curate.WINDOW_END
         assert row["company_canonical_id"], "a usable action must resolve to a company"
+
+
+def test_reload_clears_everything_keyed_on_an_action(con):
+    """Re-curation must not be blocked by a foreign key, or left half-applied.
+
+    baseline_results gained an action_id foreign key in migration 006, and
+    load() did not clear it — so the first attempt to re-curate after a backtest
+    failed mid-delete with enforcement_actions already emptied.
+    """
+
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES ('r1','backtest','s','c','{}', now(), 'ok')"
+    )
+    con.execute(
+        "INSERT INTO enforcement_actions (action_id, filed_date, usable) "
+        "VALUES ('a1', DATE '2020-01-01', true)"
+    )
+    con.execute(
+        "INSERT INTO baseline_results (run_id, system, action_id, cutoff, detected) "
+        "VALUES ('r1','harmscope','a1', DATE '2020-01-01', true)"
+    )
+    curate.load(con, [{
+        "action_id": "a2", "filed_date": "2021-06-01", "company_raw": "X",
+        "company_canonical_id": "", "product_family": "", "harm_summary": "",
+        "source_url": "u", "usable": "false", "exclusion_reason": "test",
+    }])
+    assert con.execute("SELECT count(*) FROM baseline_results").fetchone()[0] == 0
+    assert con.execute("SELECT action_id FROM enforcement_actions").fetchall() == [("a2",)]
