@@ -815,6 +815,52 @@ _Wall time for one full-refit cutoff:_
 _Anti-leakage tests passing:_
 _Gate passed:_ Y / N
 
+### Phase 9 (partial) — Threshold sensitivity, run early because it changes Phase 7's reading
+
+ROADMAP Phase 9 requires "sensitivity analysis on every threshold in
+`config.py`". Running the one that gates an alert early, because the Phase 7
+headline turns on it. `signals` already stores `n_supporting_groups`, so the
+sweep is a re-query rather than eight refits.
+
+    floor   HarmScope        B1           gap
+        1   67.9%  76/112    66.1%  74    HarmScope +1.8
+        5   67.9%  76/112    66.1%  74    HarmScope +1.8
+       10   55.4%  62/112    58.0%  65    B1        +2.6
+       15   50.9%  57/112    56.2%  63    B1        +5.3   <- frozen value
+       25   46.4%  52/112    50.0%  56    B1        +3.6
+       50   44.6%  50/112    44.6%  50    tie
+      100   40.2%  45/112    38.4%  43    HarmScope +1.8
+
+**The ordering changes sign three times, and the frozen value sits in the band
+that favours B1.** That is not an argument for moving it — it was frozen before
+the backtest and stays frozen, per trap T4 — but it is decisive for how the
+Phase 7 result should be read.
+
+_The mechanism is granularity, and it is measurable rather than speculative:_
+
+    system      units   p25  p50  p75  p90    clears 5 / 15 / 50
+    harmscope   2,010     7   15   44  163    100% / 52% / 23%
+    B1            634     8   18   49  163    100% / 57% / 25%
+
+HarmScope divides the same complaints into three times as many units, so its
+support-per-unit distribution sits lower by arithmetic — median 15 against 18 —
+not because its units describe harm worse. At floor 5 nothing is excluded and
+the systems separate on merit; at floor 100 only large units survive in both and
+they separate on merit again; in between, the floor is measuring unit size.
+
+**An absolute support floor is not comparable across systems with different
+granularity.** That is a defect in the comparison design, present since the
+criteria were written in Phase 0, and it would be fixed by a floor expressed
+relative to a system's own support distribution — a quantile rather than a
+count. Recorded as the fix, not applied retroactively: changing the criterion
+after seeing which system it favours is precisely trap T4, whatever the
+justification.
+
+Taken with the adjudication (29.1% vs 28.1%, p = 1.00), the picture is
+consistent: **there is no stable difference between the systems.** The
+unadjudicated +5.3 for B1 was a threshold artifact, and the n=8 reversal for
+HarmScope was a sampling artifact. Both dissolved when examined.
+
 ### Phase 7 — Baselines
 _B1 implementation notes (must use identical statistical machinery):_ B1 is not
 a second implementation. Each `(product_family, issue_std, sub_issue_std)` tuple

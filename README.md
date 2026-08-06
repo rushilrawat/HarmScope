@@ -206,7 +206,32 @@ apparent effect did not survive its own sample growing.
 fire is not a harm-level match. That correction is much larger and much better
 supported than any difference between the systems.
 
-**Unadjudicated, the taxonomy baseline wins.** The ordering is
+**The unadjudicated gap is a threshold artifact.** ROADMAP Phase 9 requires a
+sensitivity analysis on every threshold in `config.py`. Sweeping the one that
+gates an alert — `min_supporting_groups`, frozen at 15 — the ordering **changes
+sign three times**:
+
+| floor | HarmScope | B1 | gap |
+|---:|---:|---:|---:|
+| 1–5 | 67.9% | 66.1% | HarmScope +1.8 |
+| 10 | 55.4% | 58.0% | B1 +2.6 |
+| **15 (frozen)** | 50.9% | 56.2% | **B1 +5.3** |
+| 25 | 46.4% | 50.0% | B1 +3.6 |
+| 50 | 44.6% | 44.6% | 0.0 |
+| 100 | 40.2% | 38.4% | HarmScope +1.8 |
+
+The frozen value sits in the band that favours B1, and the mechanism is
+granularity rather than quality: HarmScope splits the same complaints into 2,010
+units against B1's 634, so its support-per-unit distribution sits lower (median
+15 vs 18) purely by arithmetic. **An absolute support floor is not comparable
+across systems whose unit counts differ threefold** — in the mid-band it
+measures granularity, not whether a unit describes a harm.
+
+The threshold was frozen before the backtest and **is not being changed after
+seeing this**. The finding is that no stable ordering exists, which agrees with
+the adjudicated result rather than contradicting it.
+
+**Unadjudicated at the frozen threshold, the taxonomy baseline leads.** The ordering is
 `B1 > HarmScope > B0`: the pipeline is worth something over counting complaints
 per company (+9.8 points on B0), and is not worth anything over the taxonomy CFPB
 already publishes (−5.3 points on B1).
