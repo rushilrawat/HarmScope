@@ -168,6 +168,7 @@ and the README must say so.
 | `docs/EVALUATION.md` | Backtest protocol, baselines, metrics, failure analysis |
 | `docs/LLM_LAYER.md` | Labeling + RAG contract, prompts, caching, guardrails |
 | `docs/ROADMAP.md` | Phased build with per-phase acceptance criteria |
+| `docs/phases/` | One dossier per phase — question, context, tech, acceptance, findings |
 | `docs/ENGINEERING_NOTES.md` | Running log of decisions, failures, gotchas |
 | `data/ground_truth/README.md` | Curation and freeze protocol for the hand-built files |
 
@@ -242,11 +243,18 @@ detection rate, precisely so the artifact that produced B1's lead could not
 operate here. It lands on 2,010 units at 2024 against HarmScope's 2,010, median
 support 16 against 15, clearing the floor 54.4% against 51.6%. Matched on every
 dimension that mattered, **a TF-IDF topic model detects 58 enforcement actions to
-the embedding pipeline's 57.** `EVALUATION §2` says B2 "tests whether the
-embeddings buy anything". On this evidence they do not.
+the embedding pipeline's 57** — 54 of them the same actions, discordant 4–3,
+exact McNemar *p* = 1.00.
+
+`EVALUATION §2` says B2 "tests whether the embeddings buy anything". On this
+evidence **no difference is detectable** — which is not the same as proving there
+is none. A 1-point gap sits well inside the range the threshold sweep below shows
+an arbitrary threshold can manufacture, and the honest form of this result is the
+same one used for B1: the two are indistinguishable.
 
 B3 ties B2 at 58 while running with no dedup, no campaign detection, no novelty
-scoring, and default hyperparameters — the `pip install bertopic` comparison.
+scoring, and default hyperparameters — the `pip install bertopic` comparison. The
+tie is on *different actions*: 53 shared, 5 B2-only, 5 B3-only.
 Its numbers are not strictly commensurable: without dedup its groups are
 singletons, so `min_supporting_groups` gates it on fifteen *complaints* where
 every other system is gated on fifteen *dup-groups*. That was written down before

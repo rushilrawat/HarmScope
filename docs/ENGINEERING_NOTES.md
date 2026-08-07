@@ -1005,7 +1005,36 @@ matched by construction on every dimension the threshold artifact operates
 through, because `harmscope_k` was fixed before B2 had a rate. On that footing a
 bag-of-words topic model detects 58 actions to the embedding pipeline's 57.
 EVALUATION §2 asks B2 to "test whether the embeddings buy anything"; the answer
-on this evidence is that they do not. This is a much cleaner comparison than
+on this evidence is that **no difference is detectable**, which is weaker than
+"they do not". Pairwise on the same 112 actions: 54 detected by both, 4 B2-only,
+3 HarmScope-only, exact McNemar p = 1.00. A 1-point gap is well inside what the
+threshold sweep shows an arbitrary threshold can manufacture, so the honest form
+is the one already used for B1 — indistinguishable, not beaten.
+
+_Pairwise agreement, latest backtest run per system, all on 112 actions:_
+
+    pair                    both   A-only   B-only   exact McNemar p
+    B1  vs HarmScope          55       8        2         0.109
+    B2  vs HarmScope          54       4        3         1.00
+    B3  vs HarmScope          53       5        4         1.00
+    B2  vs B3                 53       5        5         1.00
+    B0  vs HarmScope          40       6       17         0.035
+
+The only pair that separates at all is B0, which is the one comparison the
+project needs to win and does. **B2 and B3 tie at 58 on different actions** —
+53 shared of 58 each — so the equal totals are coincidence rather than the same
+detections.
+
+_The 2x2 floor has the same problem as the support floor._ `contingency` builds
+its `a` cell from distinct `(group, company)` pairs, so for B3 — whose groups are
+singletons — `min_a = 5` gates on five *complaints* where every other system is
+gated on five *dup-groups*. B3's 55,687 company-level signals against
+HarmScope's 29,004, and its 62.4% floor-clearing rate, are therefore partly a
+floor effect rather than detection quality. This does not touch B3's 58/112,
+which comes from `baseline_results`, but it is why B3's row in the granularity
+table above must not be read across.
+
+This is a much cleaner comparison than
 HarmScope-vs-B1, where the systems differ threefold in granularity and the
 ordering was shown to flip with the threshold.
 
