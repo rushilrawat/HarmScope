@@ -1,0 +1,477 @@
+<title>HarmScope — Build Report, Phases 0–7</title>
+<style>
+  :root {
+    --bg: #EEF1F3;
+    --surface: #FFFFFF;
+    --sunk: #E3E8EB;
+    --ink: #121A20;
+    --muted: #5B6B77;
+    --hair: #C9D3D9;
+    --accent: #0E6E6C;
+    --accent-soft: #D6E8E7;
+    --pass: #2C6E49;
+    --warn: #8A6212;
+    --fail: #A8382B;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0D1317; --surface: #141D23; --sunk: #101922;
+      --ink: #E4EDF2; --muted: #93A6B2; --hair: #2A3A45;
+      --accent: #4BB5B1; --accent-soft: #163234;
+      --pass: #6BC28C; --warn: #D9A441; --fail: #E17566;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0D1317; --surface: #141D23; --sunk: #101922;
+    --ink: #E4EDF2; --muted: #93A6B2; --hair: #2A3A45;
+    --accent: #4BB5B1; --accent-soft: #163234;
+    --pass: #6BC28C; --warn: #D9A441; --fail: #E17566;
+  }
+  :root[data-theme="light"] {
+    --bg: #EEF1F3; --surface: #FFFFFF; --sunk: #E3E8EB;
+    --ink: #121A20; --muted: #5B6B77; --hair: #C9D3D9;
+    --accent: #0E6E6C; --accent-soft: #D6E8E7;
+    --pass: #2C6E49; --warn: #8A6212; --fail: #A8382B;
+  }
+
+  body {
+    background: var(--bg); color: var(--ink);
+    font-family: var(--serif); font-size: 17px; line-height: 1.62;
+    margin: 0; padding: 0 1.25rem 6rem;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 62rem; margin: 0 auto; }
+  .col { max-width: 40rem; }
+
+  h1, h2, h3 { text-wrap: balance; line-height: 1.2; margin: 0; font-weight: 600; }
+  h1 { font-size: 2.5rem; letter-spacing: -0.015em; }
+  h2 { font-size: 1.5rem; letter-spacing: -0.01em; }
+  h3 { font-size: 1.06rem; }
+  p { margin: 0; }
+  a { color: var(--accent); }
+
+  .eyebrow {
+    font-family: var(--mono); font-size: 0.7rem; text-transform: uppercase;
+    letter-spacing: 0.13em; color: var(--muted); margin: 0;
+  }
+  .lede { font-size: 1.16rem; color: var(--muted); }
+
+  header.head {
+    padding: 3.5rem 0 2rem; border-bottom: 2px solid var(--ink);
+    display: flex; flex-direction: column; gap: 1rem;
+  }
+  section { padding: 2.75rem 0; border-bottom: 1px solid var(--hair); }
+  .stack { display: flex; flex-direction: column; gap: 1.15rem; }
+  .stack-tight { display: flex; flex-direction: column; gap: 0.6rem; }
+
+  /* numbers everywhere are mono + tabular: the point of the project */
+  .num, td.n, th.n { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  .grid {
+    display: grid; gap: 1px; background: var(--hair);
+    border: 1px solid var(--hair); margin: 0;
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  }
+  .cell { background: var(--surface); padding: 0.95rem 1rem; display: flex; flex-direction: column; gap: 0.2rem; }
+  .cell .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 1.32rem; letter-spacing: -0.02em; }
+  .cell .k { font-family: var(--mono); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); }
+
+  .scroll { overflow-x: auto; border: 1px solid var(--hair); background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.6rem 0.85rem; border-bottom: 1px solid var(--hair); vertical-align: top; }
+  th {
+    font-family: var(--mono); font-size: 0.66rem; text-transform: uppercase;
+    letter-spacing: 0.09em; color: var(--muted); font-weight: 500;
+    background: var(--sunk); white-space: nowrap; position: sticky; top: 0;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.n, th.n { text-align: right; white-space: nowrap; }
+  tr.hi td { background: var(--accent-soft); }
+
+  .chip {
+    font-family: var(--mono); font-size: 0.63rem; text-transform: uppercase;
+    letter-spacing: 0.08em; padding: 0.15rem 0.45rem; border: 1px solid currentColor;
+    white-space: nowrap; display: inline-block;
+  }
+  .pass { color: var(--pass); } .fail { color: var(--fail); } .warn { color: var(--warn); }
+  .todo { color: var(--muted); }
+
+  /* phase ledger: the numbering is real — phases are a sequence with gates */
+  .phase { display: grid; grid-template-columns: 3.1rem 1fr; gap: 1.15rem; padding: 1.4rem 0; border-bottom: 1px solid var(--hair); }
+  .phase:last-child { border-bottom: 0; }
+  .phase .no {
+    font-family: var(--mono); font-size: 1.5rem; color: var(--accent);
+    font-variant-numeric: tabular-nums; line-height: 1.1;
+  }
+  .phase .gatemark { font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.08em; color: var(--muted); display: block; margin-top: 0.15rem; }
+  .phase h3 { display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }
+
+  .note { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 0.85rem 1.1rem; }
+  .note.bad { border-left-color: var(--fail); background: color-mix(in srgb, var(--fail) 9%, var(--surface)); }
+  .note p + p { margin-top: 0.5rem; }
+
+  dl.kv { display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 1.1rem; margin: 0; font-size: 0.92rem; }
+  dl.kv dt { font-family: var(--mono); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); padding-top: 0.28rem; }
+  dl.kv dd { margin: 0; }
+
+  ul { margin: 0; padding-left: 1.15rem; }
+  li + li { margin-top: 0.4rem; }
+  code { font-family: var(--mono); font-size: 0.86em; background: var(--sunk); padding: 0.08em 0.32em; }
+  strong { font-weight: 600; }
+  .fine { font-size: 0.86rem; color: var(--muted); }
+  .rule { height: 1px; background: var(--hair); border: 0; margin: 0; }
+</style>
+
+<div class="wrap">
+
+<header class="head">
+  <p class="eyebrow">Build report · 2026-08-02 → 2026-08-07 · 56 commits</p>
+  <h1>HarmScope</h1>
+  <p class="lede col">Emergent consumer-harm discovery over the CFPB Consumer Complaint Database — 16.9M complaints, 3.8M narratives. <strong>Phases 0–7 complete</strong>: three gates passed, five systems backtested through one harness, one blind adjudication. This report is written to be evaluated: every number below was recomputed from the database, not copied from a commit message.</p>
+</header>
+
+<section>
+  <div class="stack">
+    <p class="eyebrow">The claim being tested — and the answer</p>
+    <p class="col">Can unsupervised harm-mechanism discovery over complaint narratives surface company–harm signals <em>earlier</em> than monitoring the CFPB's existing <code>Product / Issue / Sub-issue</code> taxonomy, without a higher false-alert rate?</p>
+    <p class="col">The contribution is defined entirely as <strong>the gap to B1</strong>, the taxonomy baseline. If B1 wins, the honest headline is "the existing taxonomy is sufficient" — a real finding, and the README is written to say so. <strong>All four baselines have now run, and the gap is not there.</strong></p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>System</th><th>Unit definition</th><th class="n">Detected</th><th class="n">Rate</th><th class="n">Units @2024</th></tr></thead>
+        <tbody>
+          <tr><td>B1 — CFPB taxonomy</td><td>published <code>(family, issue, sub-issue)</code></td><td class="n">63 / 112</td><td class="n"><strong>56.2%</strong></td><td class="n">634</td></tr>
+          <tr><td>B2 — TF-IDF + LDA</td><td>topic, at HarmScope's <em>k</em></td><td class="n">58 / 112</td><td class="n">51.8%</td><td class="n">2,010</td></tr>
+          <tr><td>B3 — BERTopic default</td><td>off-the-shelf, <strong>no dedup</strong></td><td class="n">58 / 112</td><td class="n">51.8%</td><td class="n">11,336</td></tr>
+          <tr class="hi"><td>HarmScope</td><td>UMAP → HDBSCAN cluster</td><td class="n">57 / 112</td><td class="n">50.9%</td><td class="n">2,010</td></tr>
+          <tr><td>B0 — volume only</td><td>one per product family</td><td class="n">46 / 112</td><td class="n">41.1%</td><td class="n">12</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <p><strong>HarmScope finishes last of the four non-trivial systems.</strong> Every alternative way of defining a unit — the published taxonomy, a bag-of-words topic model, and off-the-shelf BERTopic with no dedup at all — matches or beats the pipeline. Pairwise on the same 112 actions, the only comparison that separates is the one against naive volume.</p>
+      <p class="fine">B1 vs HarmScope <span class="num">p = 0.109</span> · B2 vs HarmScope <span class="num">p = 1.00</span> · B3 vs HarmScope <span class="num">p = 1.00</span> · B2 vs B3 <span class="num">p = 1.00</span> · <strong>B0 vs HarmScope <span class="num">p = 0.035</span></strong>. Exact McNemar, computed not asserted. After blind adjudication HarmScope and B1 sit at 29.1% against 28.1%, <span class="num">p = 1.00</span>.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow" style="margin-bottom:1rem">Corpus and artifacts — verified from the database</p>
+  <div class="grid">
+    <div class="cell"><span class="v">16,900,994</span><span class="k">complaints loaded</span></div>
+    <div class="cell"><span class="v">3,830,002</span><span class="k">narratives</span></div>
+    <div class="cell"><span class="v">2,477,937</span><span class="k">distinct texts</span></div>
+    <div class="cell"><span class="v">14,287,515</span><span class="k">dup pairs</span></div>
+    <div class="cell"><span class="v">1,883,062</span><span class="k">dup groups</span></div>
+    <div class="cell"><span class="v">3,376</span><span class="k">campaigns flagged</span></div>
+    <div class="cell"><span class="v">2,821</span><span class="k">clusters</span></div>
+    <div class="cell"><span class="v">49,935</span><span class="k">signals</span></div>
+    <div class="cell"><span class="v">112</span><span class="k">usable actions</span></div>
+    <div class="cell"><span class="v">5</span><span class="k">systems compared</span></div>
+    <div class="cell"><span class="v">226</span><span class="k">tests passing</span></div>
+    <div class="cell"><span class="v">7,593</span><span class="k">lines src</span></div>
+  </div>
+  <p class="fine" style="margin-top:0.7rem">Narrative coverage is 22.66% of the corpus and that ratio governs everything downstream: only narratives can be clustered, so every rate is reported over the narrative-bearing subsample, never over all complaints.</p>
+</section>
+
+<section>
+  <div class="stack">
+    <p class="eyebrow">Stack</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Layer</th><th>Choice</th><th>Version</th><th>Why this one</th></tr></thead>
+        <tbody>
+          <tr><td>Store</td><td>DuckDB</td><td class="n">1.5.5</td><td>Single file, analytical, handles 16.9M rows on a laptop. Cost: single-writer locking — a long refit blocks even a read-only connect.</td></tr>
+          <tr><td>Dedup</td><td>datasketch MinHash + LSH</td><td class="n">2.0.0</td><td>Template detection is the core preprocessing problem, not a nicety.</td></tr>
+          <tr><td>Embeddings</td><td>sentence-transformers</td><td class="n">5.1.2</td><td><code>all-MiniLM-L6-v2</code> (384-d) in use; <code>bge-base-en-v1.5</code> (768-d) is the declared default and has now been measured against it.</td></tr>
+          <tr><td>Compute</td><td>PyTorch / Metal (MPS)</td><td class="n">2.13.0</td><td>M3 Pro, 18 GB, 11 cores. GPU path measured, not assumed.</td></tr>
+          <tr><td>ANN index</td><td>FAISS <code>IndexFlatIP</code></td><td class="n">1.13.0</td><td>Vectors are unit-length, so inner product <em>is</em> cosine and the index is exact.</td></tr>
+          <tr><td>Reduction</td><td>UMAP</td><td class="n">0.5.12</td><td>10 components, <code>min_dist=0</code> — preprocessing for density clustering, not visualisation.</td></tr>
+          <tr><td>Clustering</td><td>HDBSCAN, leaf selection</td><td class="n">0.8.44</td><td>No fixed <em>k</em>, native noise class. <code>leaf</code> buys fine clusters; Phase 7 is where the bill arrives.</td></tr>
+          <tr><td>Baselines</td><td>scikit-learn LDA · BERTopic defaults</td><td class="n">1.9.0 · 0.17</td><td>B2 and B3 are unit definitions fed to the same harness, not parallel pipelines.</td></tr>
+          <tr><td>Statistics</td><td>scipy · ruptures · statsmodels</td><td class="n">1.18.0 · 1.1.10 · 0.14.6</td><td>Gamma-Poisson shrinkage, PELT changepoint, exact McNemar, ARI and AUC.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="fine">Python 3.12.12. Six schema migrations. Requirements split base / dev / ml so CI never builds torch.</p>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow" style="margin-bottom:0.4rem">Phase ledger</p>
+  <p class="fine col" style="margin-bottom:1rem">Phases 2, 4 and 6 are gates: failing one means stopping, not proceeding on a known-broken foundation. Two of the three failed on first run. Full dossiers live in <code>docs/phases/</code>.</p>
+
+  <div class="phase">
+    <div class="no">0<span class="gatemark"></span></div>
+    <div class="stack-tight">
+      <h3>Scaffold <span class="chip pass">complete</span></h3>
+      <p>22-table schema, run registry, seeds, CI. The registry raises if a stage exits without declaring output rows — a stage that produced nothing cannot be recorded as a success. Found before any data: DuckDB enforces NOT NULL on primary-key columns, so the specified NULL "all companies" marker row could never have inserted. That would have surfaced at Phase 5, after hours of embedding.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="no">1<span class="gatemark"></span></div>
+    <div class="stack-tight">
+      <h3>Ingestion &amp; normalization <span class="chip pass">complete</span></h3>
+      <p>16,900,994 rows loaded from a 1.41 GB snapshot; 5,911 unkeyed rows dropped (0.035%) with reconciliation that fails above 0.1%. <strong>Two taxonomy restructurings, not one</strong> — the 2023 boundary is larger than the documented 2017 one, and two changes are splits rather than renames, so the crosswalk keys on <code>(product, sub_product)</code>. 34 rules, 0 uncovered labels, all 12 families with zero empty months inside their active range.</p>
+      <p class="fine">Company canonicalization merges only on exact normalized match. Fuzzy scoring proposes and never merges: <code>token_set_ratio</code> scores 100 on <code>CREDIT ACCEPTANCE</code> vs <code>AMERICAN CREDIT ACCEPTANCE</code>.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="no">2<span class="gatemark">gate</span></div>
+    <div class="stack-tight">
+      <h3>Dedup &amp; campaign detection <span class="chip fail">failed twice</span> <span class="chip pass">then passed</span></h3>
+      <p>Union-find chained templates into a single 84,657-member "duplicate group". Replaced with star clustering, which bounds group diameter from a seed so chaining cannot happen by construction.</p>
+      <div class="scroll" style="margin:0.35rem 0">
+        <table>
+          <thead><tr><th>Grouping</th><th class="n">Precision</th><th class="n">Recall</th><th class="n">Largest group</th><th class="n">In groups &gt;1000</th></tr></thead>
+          <tbody>
+            <tr><td>Union-find</td><td class="n">0.9112</td><td class="n">0.9171</td><td class="n">84,657</td><td class="n">1,803,654</td></tr>
+            <tr><td>Star clustering</td><td class="n">0.9477</td><td class="n">0.8011</td><td class="n">49,457</td><td class="n">702,032</td></tr>
+            <tr><td>After adjudication</td><td class="n">1.0000</td><td class="n">0.7650</td><td class="n">49,457</td><td class="n">702,032</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note">
+        <p><strong>The precision number was measured on 8% of the merges.</strong> The eval set samples pairs that have a verified edge, but star clustering merges through a <em>seed</em> — in a 49,457-member star, 49,456 of ~1.2 billion member-pairs are edges. Sampling same-group pairs the way the corpus holds them: 3 of 40 have a verified edge, 37 are seed-mediated. Reading 12 of the unsampled kind by hand: all 12 are the same template.</p>
+      </div>
+      <p class="fine">Campaign-flagged share: credit reporting 29.9%, mortgage 0.07% — the required direction. All 20 flagged campaigns read as templated; so did the 20 largest <em>unflagged</em> groups, a known miss handled in Phase 5 by counting groups rather than complaints.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="no">3<span class="gatemark"></span></div>
+    <div class="stack-tight">
+      <h3>Embedding &amp; index <span class="chip pass">complete</span></h3>
+      <p>2,477,937 vectors keyed on <code>text_hash</code>, not on dup-group representatives — representative selection is refit per cutoff while embeddings are computed once, and both cannot be true of a representative-keyed memmap. 10/10 nearest-neighbour checks topically correct.</p>
+      <dl class="kv">
+        <dt>Throughput</dt><dd class="num">386 texts/s (MiniLM) vs 41 texts/s (bge-base) — 2.1 h vs 16.8 h for the corpus</dd>
+        <dt>Rejected</dt><dd>Length-sorting to cut padding waste: measured 7% gain, so not built</dd>
+        <dt>Caught</dt><dd>A <code>--limit</code> run mapped 3.8M complaints to indices over 2.5M texts — every index past the end of the memmap, no error</dd>
+      </dl>
+      <p class="fine">The encoder recovers company identity through redaction: a USAA deposit-hold complaint returns five USAA deposit-hold complaints. Neighbours cross <code>product_family</code> constantly, which is why <code>related_clusters</code> is load-bearing.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="no">4<span class="gatemark">gate</span></div>
+    <div class="stack-tight">
+      <h3>Clustering &amp; novelty <span class="chip fail">failed once</span> <span class="chip pass">then passed</span></h3>
+      <p>2,821 clusters over 1,883,062 representatives, 94.1% assigned, coherence 0.75–0.84 per family.</p>
+      <div class="scroll" style="margin:0.35rem 0">
+        <table>
+          <thead><tr><th>Gate criterion</th><th class="n">Result</th><th>Verdict</th></tr></thead>
+          <tbody>
+            <tr><td>Label-ablation AUC ≥ 0.7</td><td class="n">0.7909</td><td><span class="chip pass">pass</span> 10 of 11 families</td></tr>
+            <tr><td>Disjoint-halves ARI (reported, not gated)</td><td class="n">0.5051</td><td><span class="chip warn">limitation</span></td></tr>
+            <tr><td>Name 15 random clusters</td><td class="n">15 / 15</td><td><span class="chip pass">pass</span></td></tr>
+            <tr><td>Noise fraction per family</td><td class="n">49–72%</td><td><span class="chip pass">reported</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note bad">
+        <p><strong>The ablation failed first at 0.6658.</strong> <code>dominant_label_share</code> divided by <em>surviving</em> labels rather than cluster size, so a 101-member cluster that was 99% the hidden issue scored novelty <strong>0.000</strong> — the least-explained cluster in its family, rated perfectly explained.</p>
+        <p>The spec says "fraction of <em>members</em>", so this was conformance, not tuning. Checked rather than claimed: recomputing all 2,821 production scores under the fix gives a largest difference of <strong>0.00e+00</strong>. Zero scores moved — it cannot have been tuned toward an outcome it does not touch.</p>
+      </div>
+      <p class="fine"><strong>ARI 0.505 is the number to carry forward.</strong> Cluster counts across two independent halves agree to within 1% (688 vs 693) and assignment fractions match to the decimal, but <em>which</em> cluster a complaint lands in agrees about half the time. A cluster is a region of a dense neighbourhood, not a canonical object.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="no">5<span class="gatemark"></span></div>
+    <div class="stack-tight">
+      <h3>Signal detection <span class="chip pass">complete</span></h3>
+      <p>Disproportionality (PRR / ROR with empirical-Bayes shrinkage, ranked on EB05), EWMA control chart and PELT changepoint on the share series, Benjamini–Hochberg within product family. 49,935 signals, 20,664 at <em>q</em> ≤ 0.05.</p>
+      <div class="note bad">
+        <p><strong>The mandatory negative control failed at a 10.7% false-alert rate and found three bugs</strong> — one of them in the control itself. After the fixes it runs at <strong>0.45%</strong> against an α of 0.05.</p>
+        <p class="fine">All three shared one signature: a quantity <em>defined</em> as "distinct groups" but <em>computed</em> as a sum over a partition — of companies in one case, of months in another. None is visible in a normal run; all three produce plausible, well-formed, entirely wrong numbers.</p>
+      </div>
+      <p class="fine">Top alerts are dominated by companies with real public enforcement histories — Lexington Law, Chime, Freedom Financial, Credit Karma, Coinbase. Checked for a structural artifact at the 2017 taxonomy boundary and found none: 1.5% of changepoints.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="no">6<span class="gatemark">gate</span></div>
+    <div class="stack-tight">
+      <h3>Ground truth &amp; backtest <span class="chip pass">gate passed</span></h3>
+      <p>212 enforcement actions scraped and frozen <em>before</em> any signal existed; <strong>112 usable</strong> after mechanical curation, spread across all eight years. All 8 annual cutoffs refit end-to-end.</p>
+      <div class="note">
+        <p><strong>The unavoidable methodological exposure, stated plainly.</strong> The candidate pool was frozen pre-detection and that is verifiable from git. But curation happened <em>after</em> Phases 4–5 ran, so the curator knew which companies alert. That cannot be undone — only bounded.</p>
+        <p class="fine">Both curation rules were pre-registered and committed <em>before</em> the code that applies them existed. The <code>usable</code> rule has <strong>no free parameter</strong>: no minimum-volume threshold, so a three-complaint company stays in and produces an honest miss. The bias audit compares resolved companies' alert share against a volume-matched expectation — <span class="num">0.695 observed vs 0.675 expected, a 1.03× excess</span>.</p>
+      </div>
+      <div class="note bad">
+        <p><strong>The refit found two real leaks before a single test was written.</strong> <code>as_of</code> and the signal date were read from the whole corpus rather than the data in scope, so a 2017 refit stamped its 367 clusters <code>as_of 2026-08-03</code> and dated all 2,953 disproportionality signals <em>after their own cutoff</em>. EVALUATION §5 item 2 asserts the leakage guarantee <em>on</em> <code>as_of</code> — so that field being wrong silently voids the check meant to catch it.</p>
+      </div>
+      <p class="fine"><strong>Adjudication roughly halves both systems.</strong> Only 57% and 50% of company-level detections survive being asked whether the cluster describes the harm the order describes. That correction is far larger and far better supported than any difference between systems. At n = 8 the split looked like a reversal in HarmScope's favour, 5–3 with 2–0 discordant; six more actions took it to 8–7 with 2–1. <strong>The effect did not survive its own sample growing.</strong></p>
+      <p class="fine"><strong>Three actions neither system can reach, for structural reasons.</strong> Bank of America's order concerns its own processing of garnishment notices; Citibank's is ECOA discrimination, which applicants are never told is the reason for denial; Santander's is a GAP add-on disclosure. Complaint narratives cannot contain what consumers do not know happened to them — a ceiling on the corpus, not on either method.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="no">7<span class="gatemark">result</span></div>
+    <div class="stack-tight">
+      <h3>Baselines <span class="chip pass">all four complete</span></h3>
+      <p><strong>A baseline is a unit definition, not a parallel pipeline.</strong> Each system materialises its units into <code>clusters</code> under its own <code>run_id</code>, and every downstream stage runs over it untouched — panel, 2×2 margins, shrinkage, BH, EWMA, PELT, alert criteria, backtest. There is no second implementation that could diverge, which is a stronger reading of "same statistical machinery" than any refactor.</p>
+
+      <div class="note">
+        <p><strong>B2 is the row that carries the most weight, because it is the only comparison where granularity is not a confound.</strong> B2's topic count was fixed to HarmScope's own cluster count, per family per cutoff, <em>before B2 had a detection rate</em> — precisely so the artifact that produced B1's lead could not operate.</p>
+        <p>At the 2024 cutoff: <span class="num">2,010</span> units against <span class="num">2,010</span>, median support <span class="num">16</span> against <span class="num">15</span>, clearing the floor <span class="num">54.4%</span> against <span class="num">51.6%</span>. Matched on every dimension the threshold artifact works through, <strong>a bag-of-words topic model detects 58 actions to the embedding pipeline's 57</strong> — 54 of them the same actions, discordant 4–3, <span class="num">p = 1.00</span>. On this evidence no difference is detectable, which is weaker than proving there is none.</p>
+      </div>
+
+      <div class="scroll" style="margin:0.35rem 0">
+        <table>
+          <thead><tr><th>System</th><th class="n">Units</th><th class="n">p25</th><th class="n">med</th><th class="n">p75</th><th class="n">Clears floor</th><th class="n">Signals</th></tr></thead>
+          <tbody>
+            <tr class="hi"><td>HarmScope</td><td class="n">2,010</td><td class="n">7</td><td class="n">15</td><td class="n">44</td><td class="n">51.6%</td><td class="n">29,004</td></tr>
+            <tr><td>B0</td><td class="n">12</td><td class="n">44</td><td class="n">113</td><td class="n">354</td><td class="n">96.8%</td><td class="n">1,451</td></tr>
+            <tr><td>B1</td><td class="n">634</td><td class="n">8</td><td class="n">18</td><td class="n">49</td><td class="n">57.3%</td><td class="n">24,273</td></tr>
+            <tr><td>B2</td><td class="n">2,010</td><td class="n">7</td><td class="n">16</td><td class="n">41</td><td class="n">54.4%</td><td class="n">32,419</td></tr>
+            <tr><td>B3 <span class="chip warn">not comparable</span></td><td class="n">11,336</td><td class="n">9</td><td class="n">19</td><td class="n">36</td><td class="n">62.4%</td><td class="n">55,687</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="fine"><strong>B3's support column counts complaints; every other row counts dup-groups.</strong> Recorded before B3 ran, not discovered after. Without dedup its groups are singletons, so the floor of 15 gates it on fifteen complaints where every other system is gated on fifteen dup-groups — and <code>min_a</code> in the 2×2 test inherits the same problem. The table shows the predicted effect: 5.6× the unit count yet a <em>higher</em> median support.</p>
+
+      <div class="note bad">
+        <p><strong>A bug caught before it became a result.</strong> <code>TfidfVectorizer</code> l2-normalizes by default, leaving each document with about one unit of pseudo-count mass — and LDA fit on that has essentially no data. Measured at credit_reporting, k=195: <strong>5 of 195 topics ever won an argmax, one holding 99.0% of documents.</strong> Unchanged at max_iter 5/20/50 and unchanged with <code>use_idf=False</code>, so normalization was the cause, not weighting or convergence.</p>
+        <p class="fine">With <code>norm=None</code> all 195 populate and the largest holds 5.4%. The first B2 run produced 114 units where HarmScope has 1,101 — a baseline crippled by an implementation detail would have read as evidence against bag-of-words topic models.</p>
+      </div>
+      <p class="fine">Cost note: B3's 2024 cutoff took <span class="num">516 minutes</span> on credit_reporting alone. BERTopic's <code>min_cluster_size=10</code> against HarmScope's 50 produces 8,363 clusters on a 500k fit sample, and HDBSCAN's cost follows.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="no">8–10<span class="gatemark"></span></div>
+    <div class="stack-tight">
+      <h3>LLM layer · Evaluation · Interface <span class="chip todo">not started</span> <span class="chip warn">2 items pulled forward</span></h3>
+      <p>The LLM layer is labelling only and never touches detection; the determinism test requires that deleting <code>src/llm/</code> leaves <code>signals</code> byte-identical. Phase 10 is deliberately last and the most cuttable. Two Phase 9 items were run early because they changed how earlier phases read — the threshold sweep, and the encoder experiment below.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="stack">
+    <p class="eyebrow">Pulled forward — does the encoder choice matter?</p>
+    <p class="col">The README carried a "provisional, dev model" flag since Phase 3, with a full <code>bge-base</code> re-encode as the implied fix: 16.8 h plus a re-run of Phases 4–7. Rather than pay that to find out whether it changes anything, the question was scoped to what one family can answer. <strong>150,000 credit_reporting representatives at the 2024 cutoff, encoded on both models, clustered with identical config.</strong> Paired by construction.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Metric</th><th class="n">MiniLM (384-d)</th><th class="n">bge-base (768-d)</th></tr></thead>
+        <tbody>
+          <tr><td>Clusters</td><td class="n">336</td><td class="n">350</td></tr>
+          <tr><td>Fit noise</td><td class="n">65.4%</td><td class="n">63.7%</td></tr>
+          <tr><td>Assigned at the fixed 0.65 floor</td><td class="n">94.5%</td><td class="n">100.0%</td></tr>
+          <tr><td>Nearest-centroid cosine, p10 / p50</td><td class="n">0.684 / 0.794</td><td class="n">0.831 / 0.890</td></tr>
+          <tr><td>ARI vs itself, disjoint halves</td><td class="n">0.469</td><td class="n">0.454</td></tr>
+          <tr class="hi"><td><strong>ARI across the two encoders</strong></td><td class="n" colspan="2"><strong>0.232</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <p><strong>Two guards made this readable, and both mattered.</strong></p>
+      <p><em>The cross-encoder ARI is meaningless without its within-encoder baseline.</em> 0.232 alone looks like proof of anything you like. Against a within-encoder disjoint-halves ARI of 0.469 on the same sample — reproducing the 0.505 already recorded — the honest statement is that the encoder disagrees about twice as much as resampling does.</p>
+      <p><em><code>assign_max_distance = 0.35</code> is calibrated to MiniLM's geometry.</em> bge sits on a visibly higher cosine scale, so its 100% assignment at a fixed 0.65 floor is the threshold moving, not coverage improving. Reporting that as coverage would have reproduced the support-floor artifact one entry after diagnosing it.</p>
+    </div>
+    <p class="col"><strong>Verdict.</strong> Cluster <em>identity</em> is encoder-sensitive, so the provisional flag was justified and nothing may treat a cluster as the same object across encoders. Cluster <em>granularity</em> is not, at 4% apart — and granularity is what drives the Phase 7 table. The swap is unlikely to move the ordering. The full encode stays outstanding as a whole-table item, since a cross-system comparison needs every system on one encoder.</p>
+    <p class="fine">Validated on a positive control first: with the bge matrix replaced by a copy of MiniLM's, cross-encoder ARI is <span class="num">1.000</span> and within-encoder halves <span class="num">0.499</span> against the recorded 0.505. ARI throughout is computed by <code>src.cluster.stability</code> — the same held-out protocol and noise-excluding <code>ari()</code> that produced 0.505, because two ARIs computed differently are not comparable and that comparison is the entire point.</p>
+  </div>
+</section>
+
+<section>
+  <div class="stack">
+    <p class="eyebrow">The threshold sweep — why no ordering here is stable</p>
+    <p class="col">ROADMAP Phase 9 requires a sensitivity analysis on every threshold in <code>config.py</code>. The one that gates an alert — <code>min_supporting_groups</code>, frozen at 15 — was swept because the Phase 7 headline turns on it.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th class="n">Floor</th><th class="n">HarmScope</th><th class="n">B1</th><th>Gap</th></tr></thead>
+        <tbody>
+          <tr><td class="n">1–5</td><td class="n">67.9%</td><td class="n">66.1%</td><td>HarmScope +1.8</td></tr>
+          <tr><td class="n">10</td><td class="n">55.4%</td><td class="n">58.0%</td><td>B1 +2.6</td></tr>
+          <tr class="hi"><td class="n"><strong>15 (frozen)</strong></td><td class="n">50.9%</td><td class="n">56.2%</td><td><strong>B1 +5.3</strong></td></tr>
+          <tr><td class="n">25</td><td class="n">46.4%</td><td class="n">50.0%</td><td>B1 +3.6</td></tr>
+          <tr><td class="n">50</td><td class="n">44.6%</td><td class="n">44.6%</td><td>tie</td></tr>
+          <tr><td class="n">100</td><td class="n">40.2%</td><td class="n">38.4%</td><td>HarmScope +1.8</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <p><strong>The ordering changes sign three times, and the frozen value sits in the band that favours B1.</strong> The mechanism is granularity, measured rather than asserted: HarmScope splits the same complaints into 2,010 units against B1's 634, so its support-per-unit distribution sits lower by arithmetic — median 15 against 18, clearing the floor 51.6% against 57.3%.</p>
+      <p><strong>The threshold was not moved.</strong> It was frozen before the backtest, and changing it after seeing which system it favours is exactly the trap. The real defect is that an <em>absolute</em> support floor is not comparable across systems of different granularity; the fix is a floor expressed as a quantile of each system's own distribution — recorded as future work, not applied retroactively.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="stack">
+    <p class="eyebrow">Defects found by reviewing state rather than code</p>
+    <p class="col">Every headline number reproduced exactly from the database. <strong>The values were right; the defects were structural</strong>, which is why an audit of stored state found more than the preceding phases of feature work.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Defect</th><th>Consequence</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td><code>cluster_timeseries</code> had no <code>run_id</code></td><td>The negative control had silently <strong>overwritten the real panel</strong>; the table held shuffled data</td><td><span class="chip pass">fixed</span></td></tr>
+          <tr><td><code>latest_run()</code> returned the control</td><td><code>pipeline alerts</code> defaulted to reporting <strong>permuted results</strong> with nothing saying so</td><td><span class="chip pass">fixed</span></td></tr>
+          <tr><td>Arbitrary exposure denominator</td><td>23.8% of clusters span &gt;1 family; <code>share</code> got a <strong>randomly chosen denominator</strong></td><td><span class="chip pass">fixed</span></td></tr>
+          <tr><td>Unordered contingency scan</td><td>EB05 drifted in last bits, moving pairs across the BH threshold</td><td><span class="chip pass">fixed</span></td></tr>
+          <tr><td><code>--system</code> was cosmetic</td><td>Every baseline reported <strong>HarmScope's numbers</strong> under a different label</td><td><span class="chip pass">fixed</span></td></tr>
+          <tr><td>Anti-leakage check aimed at an empty table</td><td>The guard against <strong>tuning a threshold on the backtest</strong> counted rows in a table nothing writes — so it passed vacuously through all of Phases 6 and 7</td><td><span class="chip pass">fixed</span></td></tr>
+          <tr><td>Phase 8's criterion named the same empty table</td><td>The determinism test would have proved a property of a table that is never populated</td><td><span class="chip pass">fixed</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note bad">
+      <p><strong>The leakage guard is the one worth dwelling on.</strong> EVALUATION §5.6 calls it "the one most likely to be violated by accident" — it is the check that would catch changing a detection threshold after seeing which system it favours. It counted rows in <code>backtest_results</code>; the harness writes <code>baseline_results</code>. The count was always zero, so the "no backtest yet" branch always ran.</p>
+      <p class="fine">It now compares <code>CONFIG.signals</code> field by field against the config each backtest run recorded in its own params. Field by field rather than on the whole-config fingerprint, because a Phase 8 LLM setting would trip a fingerprint comparison while changing no threshold — and a check that cries wolf is how this one died in the first place.</p>
+    </div>
+    <p class="fine"><strong>Determinism is exact.</strong> Two consecutive runs on identical input: <span class="num">0</span> panel rows and <span class="num">0</span> signal rows differ — from 1,114 and 81 before.</p>
+  </div>
+</section>
+
+<section>
+  <div class="stack">
+    <p class="eyebrow">What is verified, and what is provisional</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Claim</th><th>Standing</th></tr></thead>
+        <tbody>
+          <tr><td>Corpus counts, cluster counts, assignment fraction, signal and alert counts</td><td><span class="chip pass">recomputed from the DB</span></td></tr>
+          <tr><td><code>as_of</code> non-null everywhere; nothing beyond corpus max; zero orphans</td><td><span class="chip pass">verified</span></td></tr>
+          <tr><td>Signals phase byte-reproducible across runs</td><td><span class="chip pass">verified twice</span></td></tr>
+          <tr><td>All five systems: 112 actions × 8 cutoffs in <code>baseline_results</code></td><td><span class="chip pass">queried directly</span></td></tr>
+          <tr><td>Detection rate, unadjudicated, 5 systems</td><td><span class="chip pass">112 actions, 8 cutoffs</span></td></tr>
+          <tr><td>Pairwise McNemar across all system pairs</td><td><span class="chip pass">exact, from scipy</span></td></tr>
+          <tr><td>Adjudicated correction (halves both systems)</td><td><span class="chip pass">n=14, paired, blind</span></td></tr>
+          <tr><td>Cutoff refits produce no post-cutoff row</td><td><span class="chip pass">5 probes clean</span></td></tr>
+          <tr><td>Phase 2 precision 1.000</td><td><span class="chip warn">model-adjudicated, blind, not human</span></td></tr>
+          <tr><td>Phase 3–5 gate numbers</td><td><span class="chip warn">dev model; encoder effect now bounded, full encode outstanding</span></td></tr>
+          <tr><td>B3's support and floor-clearing columns</td><td><span class="chip warn">complaint-denominated — not comparable across rows</span></td></tr>
+          <tr><td>Cluster identity across refits <em>and</em> across encoders</td><td><span class="chip fail">ARI 0.505 within, 0.232 across — do not assume stable</span></td></tr>
+          <tr><td>HarmScope vs B1, B2, B3</td><td><span class="chip fail">p = 0.109 / 1.00 / 1.00 — indistinguishable</span></td></tr>
+          <tr><td>Median lead time</td><td><span class="chip fail">not usable — company-level artifact</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section style="border-bottom:0">
+  <div class="stack">
+    <p class="eyebrow">Honest limitations</p>
+    <ul class="col">
+      <li><strong>The headline is a null result.</strong> HarmScope is indistinguishable from B1, B2 and B3, and beats only B0. That is a real finding and the README leads with it rather than with the sample size at which it looked otherwise.</li>
+      <li><strong>The one thing the pipeline demonstrably buys is the gap to naive volume</strong> — <span class="num">+9.8</span> points, <span class="num">p = 0.035</span>. Everything above that line is within noise.</li>
+      <li><strong>The adjudicator is the process that built the system.</strong> Worklists blind rank, statistic and decoy status, and order is seeded — but the adjudicator has seen the alert list, which no worklist design fixes. Recorded as <code>claude-opus-5</code>, never as human labelling, and the intra-rater check is not yet done.</li>
+      <li><strong>n = 14 of 112</strong> for adjudication. The corrections are estimates from a small paired sample; the intervals are wide and stated as such.</li>
+      <li><strong>Phases 3–7 all ran on the dev model.</strong> The encoder experiment bounds what that costs but does not eliminate it: a full <code>bge-base</code> encode is ~16.8 h and must move the whole table at once, since a cross-system comparison needs every system on one encoder.</li>
+      <li><strong>Curation post-dates detection.</strong> Bounded by pre-registration and a bias audit, but a permanent asterisk — and the anti-leakage test for it is written to fail rather than be pointed at the wrong file.</li>
+      <li><strong>Two absolute thresholds are known not to be comparable across systems:</strong> <code>min_supporting_groups</code> across granularities, and both it and <code>min_a</code> across B3's complaint-denominated units. The quantile fix is recorded, not applied.</li>
+      <li><strong>Complaint volume is not harm volume.</strong> No denominator of customers exists; reporting propensity varies by product, company size and third-party filing activity.</li>
+      <li><strong>A process failure worth naming:</strong> shell <code>&amp;&amp;</code> chains twice reported <code>tail</code>'s exit code instead of the real one, hiding a failed install and a failing test.</li>
+    </ul>
+  </div>
+</section>
+
+<p class="fine" style="padding:2rem 0 0">HarmScope · phases 0–7 complete · 56 commits · 226 tests passing, 1 xfail · report generated 2026-08-07 and verified against the database at that commit. Per-phase dossiers in <code>docs/phases/</code>.</p>
+
+</div>
