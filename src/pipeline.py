@@ -1268,6 +1268,35 @@ def cmd_verdicts(args: argparse.Namespace) -> int:
     return 0
 
 
+def phase_label(args: argparse.Namespace) -> int:
+    """Phase 8 — label clusters with the LLM. Descriptive only.
+
+    Imported inside the function on purpose: `src/pipeline.py` is imported by
+    every detection phase, so a module-level import would make the whole
+    pipeline fail once `src/llm/` is deleted — turning LLM_LAYER §1's
+    determinism test from a property into a crash. `tests/test_llm.py` pins it.
+    """
+    from src.llm import run as llm_run
+
+    con = db.bootstrap()
+    cluster_run = args.run_id or latest_run(con, "cluster")
+    signals_run = args.signals_run or latest_run(con, "signals")
+    model = args.model or CONFIG.embed.dev_model
+
+    params = {"cluster_run": cluster_run, "signals_run": signals_run,
+              "limit": args.limit, "control_n": args.control_n}
+    with db.run(con, "label", CONFIG, params=params) as r:
+        stats = llm_run.run(con, cluster_run, signals_run, args.control_n,
+                            args.limit, model)
+        r.finish(output_rows=stats["labelled"])
+
+    print(f"\nlabelled   : {stats['labelled']:,}  "
+          f"(cache hits {stats['cached']:,}, refused {stats['refused']:,}, "
+          f"no narratives {stats['skipped']:,})")
+    print("  next: `pipeline verify --n 50` for the LLM_LAYER §2.5 read")
+    return 0
+
+
 def phase_baselines(args: argparse.Namespace) -> int:
     """Phase 7 — build a baseline's units, then run the identical pipeline.
 
@@ -1812,10 +1841,10 @@ PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
     "signals": phase_signals,
     "backtest": phase_backtest,
     "baselines": phase_baselines,
+    "label": phase_label,
 }
 
 PLANNED: dict[str, str] = {
-    "label": "ROADMAP Phase 8 — LLM cluster labels + evidence retrieval",
     "evaluate": "ROADMAP Phase 9 — metrics, calibration, failure analysis",
 }
 
@@ -1902,6 +1931,10 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--strong-only", action="store_true",
                        help="backtest: require an adjudicated strong link")
     p_run.add_argument("--run-id", help="cluster run to build signals from")
+    p_run.add_argument("--signals-run", help="label: signals run defining which clusters fired")
+    p_run.add_argument("--control-n", type=int, default=50,
+                       help="label: random non-firing clusters to also label, so the "
+                            "LLM_LAYER §2.5 verification sample is not drawn only from alerts")
     p_run.add_argument("--shuffle", type=int, default=0, metavar="K",
                        help="negative control: permute cluster labels within "
                             "family using seed offset K (ROADMAP Phase 5)")

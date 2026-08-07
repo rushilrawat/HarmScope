@@ -178,12 +178,25 @@ human_verify_n             = 50
 `prompt_version` is bumped on any prompt edit. Cached labels from an old version are never
 silently reused — the cache key includes it.
 
-**On the model.** This spec originally named `claude-sonnet-4-6`, which is a
-real model but a previous-generation one; `claude-sonnet-5` is the current
-Sonnet. The tier choice is deliberate and unchanged: labelling is a bulk,
-well-scoped, cost-sensitive job and §2.4 is explicit about cost control. Nothing
-has been labelled yet, so changing it now is free — the model string is part of
-the cache key, so switching after a labelling run invalidates the cache. If the
-§2.5 human verification comes back with a poor agreement rate, the first lever
-is a stronger model (`claude-opus-5`), the second is the prompt. Record which
-was changed and re-verify; do not change both at once.
+**On the model.** This spec originally named `claude-sonnet-4-6`, then
+`claude-sonnet-5` — the tier chosen deliberately because labelling is a bulk,
+well-scoped, cost-sensitive job and §2.4 is explicit about cost control. It now
+reads `claude-opus-5`.
+
+That is the escalation this section already pre-registered ("if §2.5 human
+verification comes back with a poor agreement rate, the first lever is a stronger
+model"), pulled forward on 2026-08-07 at the operator's explicit instruction that
+cost is not a constraint. It is recorded as an instructed change rather than an
+evidence-driven one, because no verification has run yet — there is no agreement
+rate to justify it, and pretending otherwise would misrepresent why the tier
+moved.
+
+Changing it now is free: **nothing has been labelled**, and the model string is
+part of the cache key, so the same switch after a labelling run would have
+invalidated every cached label. That property is why the model belongs in the
+key, and the reason to make this change before the first run rather than after
+it.
+
+The remaining lever is the prompt. If §2.5 verification is still weak on
+`claude-opus-5`, change the prompt and bump `prompt_version` — one at a time, and
+record which, so an agreement-rate movement can be attributed.

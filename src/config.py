@@ -227,7 +227,12 @@ class LLMConfig:
     byte-identical (docs/LLM_LAYER.md §1).
     """
 
-    model: str = "claude-sonnet-5"
+    # docs/LLM_LAYER.md §4 specified claude-sonnet-5 and pre-registered
+    # claude-opus-5 as the first lever if §2.5 verification came back weak.
+    # Pulled forward on 2026-08-07 at the operator's instruction, before any
+    # labelling run — free to change now because the model string is part of the
+    # cache key, so switching after a run would have invalidated every label.
+    model: str = "claude-opus-5"
     prompt_version: str = "v1"           # bumped on any prompt edit; part of the cache key
     label_sample_k: int = 20
     label_medoid_k: int = 12             # nearest-medoid share of label_sample_k
