@@ -97,7 +97,7 @@ decisions rather than presented as satisfying the original bar.
 | 5 — Signal detection | ✅ negative control passes at 0.0045 vs α 0.05 |
 | 6 — Ground truth & backtest **[GATE]** | ✅ gate passed — refit at one cutoff in 3.2 min, 7 anti-leakage checks, blind adjudication on 14 actions |
 | 7 — Baselines | ✅ all four in `baseline_results` — B1 56.2% > B2 = B3 51.8% > HarmScope 50.9% > B0 41.1% |
-| 8 — LLM layer | ⬜ |
+| 8 — LLM layer | 🔄 deterministic core built, determinism test passes; labelling needs an API key |
 | 9 — Evaluation & write-up | ⬜ |
 | 10 — Interface | ⬜ |
 

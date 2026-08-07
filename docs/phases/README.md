@@ -32,7 +32,7 @@ the defect.
 | 5 | [Signal detection](phase-05-signals.md) | ✅ complete; negative control 0.45% vs α 0.05 |
 | 6 | [Ground truth & backtest](phase-06-backtest.md) | ✅ **gate** passed |
 | 7 | [Baselines](phase-07-baselines.md) | ✅ complete — all four systems |
-| 8 | [LLM layer](phase-08-llm.md) | ⬜ not started |
+| 8 | [LLM layer](phase-08-llm.md) | 🔄 determinism criterion met; labelling blocked on credentials |
 | 9 | [Evaluation & write-up](phase-09-evaluation.md) | 🔄 two items pulled forward |
 | 10 | [Interface](phase-10-interface.md) | ⬜ not started |
 
