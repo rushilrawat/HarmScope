@@ -971,6 +971,104 @@ evidence that bag-of-words topic models cannot find harm mechanisms. `max_iter`
 stays at 5: 5, 20 and 50 were indistinguishable on this diagnostic, and the
 diagnostic is a topic-count property that never sees a detection rate.
 
+_All four baselines (2026-08-07, dev model, UNADJUDICATED):_
+
+    system                      detected   rate    median lead   units at 2024
+    B1  taxonomy                  63/112   56.2%      1518 d           634
+    B2  TF-IDF + LDA              58/112   51.8%      1810 d         2,010
+    B3  BERTopic default          58/112   51.8%      1679 d        11,336
+    HarmScope                     57/112   50.9%      1747 d         2,010
+    B0  volume only               46/112   41.1%      1954 d            12
+
+B2 and B3 tie at 58 on different actions — the per-cutoff splits differ (B2
+8/3/5/11/1/7/15/8, B3 8/2/6/10/2/6/16/8), so the equal totals are coincidence
+rather than the same detections.
+
+_Granularity across all five, 2024 cutoff, floor 15:_
+
+    system        units   p25   med   p75      max   clears floor   signals
+    HarmScope     2,010     7    15    44    3,429       51.6%       29,004
+    B0               12    44   113   354  168,678       96.8%        1,451
+    B1              634     8    18    49   37,246       57.3%       24,273
+    B2            2,010     7    16    41   12,274       54.4%       32,419
+    B3           11,336     9    19    36    7,403       62.4%       55,687
+
+**B3's support column is not comparable with the others.** It counts complaints;
+every other row counts dup-groups. That is the pre-registered caveat above, and
+the table shows the effect it predicted: B3 has 5.6x HarmScope's unit count yet a
+*higher* median support (19 against 15), because complaint-denominated counting
+with no campaign exclusion more than offsets the finer units.
+
+**The B2 row is the result worth reading.** Unit count 2,010 against HarmScope's
+2,010, median support 16 against 15, clearing the floor 54.4% against 51.6% —
+matched by construction on every dimension the threshold artifact operates
+through, because `harmscope_k` was fixed before B2 had a rate. On that footing a
+bag-of-words topic model detects 58 actions to the embedding pipeline's 57.
+EVALUATION §2 asks B2 to "test whether the embeddings buy anything"; the answer
+on this evidence is that they do not. This is a much cleaner comparison than
+HarmScope-vs-B1, where the systems differ threefold in granularity and the
+ordering was shown to flip with the threshold.
+
+_Cost:_ B3's 2024 cutoff took 516 minutes on credit_reporting alone. BERTopic's
+`min_cluster_size=10` against HarmScope's 50 produces 8,363 clusters on a 500k
+fit sample, and HDBSCAN's cost is driven by that. Recorded because a future
+sensitivity sweep over B3 is not affordable at this setting without a plan.
+
+### Phase 9 (partial) — Does the encoder choice matter? (2026-08-07)
+
+The README has carried a "provisional, dev model" flag on the Phase 4 gate
+numbers since Phase 3, with a full `bge-base` re-encode as the implied fix: 16.8
+hours for the corpus plus a re-run of Phases 4-7. Rather than pay that to find
+out whether it changes anything, the question was scoped down to one that a
+single family can answer — **does the encoder change the partition by more than
+resampling already does?**
+
+150,000 credit_reporting representatives at the 2024 cutoff, encoded on both
+models, clustered with identical config. Paired by construction: same texts, same
+`fit_family`, same `assign`, same seed.
+
+    metric                            MiniLM     bge-base
+    clusters                             336          350
+    fit noise                          65.4%        63.7%
+    assigned at the fixed 0.65 floor   94.5%       100.0%
+    nearest-centroid cosine p10/p50    0.684/0.794  0.831/0.890
+    ARI vs itself, disjoint halves     0.469        0.454
+    ARI across the two encoders                0.232
+
+Two guards made this interpretable, and both mattered:
+
+**The cross-encoder ARI is meaningless without its within-encoder baseline.**
+0.232 alone looks like proof the encoder matters enormously. Against a
+within-encoder disjoint-halves ARI of 0.469 on the same sample — reproducing the
+0.505 already recorded for this family — the honest statement is that the encoder
+disagrees about twice as much as resampling does. Real, but the same *kind* of
+instability the README already documents, not a new phenomenon.
+
+**`assign_max_distance = 0.35` is calibrated to MiniLM's geometry.** bge sits on
+a visibly higher cosine scale (p10 0.831 against 0.684), so its 100% assignment
+rate at a fixed 0.65 floor is the threshold moving, not coverage improving.
+Reporting "bge assigns 100% against MiniLM's 94.5%" would have reproduced the
+`min_supporting_groups` artifact in a new place, one entry after diagnosing it.
+An absolute cosine threshold is not comparable across encoders for the same
+reason an absolute support floor is not comparable across granularities, and the
+quantile fix recorded for one applies to the other.
+
+_What this does and does not settle._ It settles that cluster *identity* is
+encoder-sensitive, so the provisional flag was justified and nothing downstream
+may treat a cluster as the same object across encoders. It does not settle
+detection rates. But the mechanism driving the Phase 7 table is granularity —
+unit count and support per unit — and on that the two encoders are 4% apart (336
+against 350). The encoder swap is unlikely to move the ordering, and the full
+encode stays outstanding as a Phase 9 item for the whole table at once, because a
+cross-system comparison requires every system on one encoder.
+
+_Method note:_ ARI is computed by `src.cluster.stability` — the same held-out
+protocol and the same noise-excluding `ari()` that produced the recorded 0.505,
+because two ARIs computed differently are not comparable and that comparison is
+the entire point. Validated first on a positive control: with the bge matrix
+replaced by a copy of MiniLM's, cross-encoder ARI is 1.000 and within-encoder
+disjoint halves is 0.499 against the recorded 0.505.
+
 ### Phase 8 — LLM layer
 _Determinism test result:_
 _Label agreement rate on 50 verified:_

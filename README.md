@@ -14,24 +14,48 @@ lead time.
 
 ## Status
 
-**Phases 0–6 complete; Phase 7 in progress.** The backtest has run and the
-Results table at the bottom carries real numbers. B0 and B1 are done; B2
-(TF-IDF + LDA) and B3 (BERTopic defaults, no dedup) are running now, and Phase 7
-is not complete until all four are in the table.
+**Phases 0–7 complete.** All four baselines are in `baseline_results` and the
+Results table at the bottom carries real numbers.
 
-The headline so far, which two separate examinations agree on: **the pipeline
-beats naive volume by about 10 points and is indistinguishable from the CFPB
-taxonomy it was supposed to improve on.** Both apparent effects dissolved —
-B1's unadjudicated +5.3 was a threshold artifact, HarmScope's n=8 reversal was a
-sampling artifact — and they dissolved in opposite directions, which is what a
-genuine null looks like.
+The headline, which four independent examinations now agree on: **the pipeline
+beats naive volume by about 10 points and is beaten by, or tied with, every
+other way of defining a unit that was tried.** The ordering is
+`B1 (56.2%) > B2 = B3 (51.8%) > HarmScope (50.9%) > B0 (41.1%)`. Three separate
+apparent effects have dissolved on examination — B1's unadjudicated +5.3 was a
+threshold artifact, HarmScope's n=8 adjudication reversal was a sampling
+artifact, and adjudication at n=14 put the two at 29.1% vs 28.1% with p=1.00.
+
+The sharpest single result is B2, because it is the only comparison where
+granularity was controlled by design rather than left to chance: **a TF-IDF +
+LDA topic model at exactly HarmScope's unit count detects 58 actions to
+HarmScope's 57.**
 
 **Every system in the comparison runs on `all-MiniLM-L6-v2`, not the
-`bge-base-en-v1.5` default.** That is deliberate and cannot be partially undone:
-a cross-system comparison is only meaningful if all five systems see the same
-encoder, so re-running HarmScope on bge-base means re-running B3 on it too, and
-B0/B1/B2 do not use embeddings at all. The encoder swap is a Phase 9 item for
-the whole table at once, not a patch to one row.
+`bge-base-en-v1.5` default**, and a scoped experiment now says what that costs.
+150,000 credit_reporting representatives at the 2024 cutoff were encoded on both
+models and clustered with identical config:
+
+| | MiniLM | bge-base |
+|---|---|---|
+| clusters | 336 | 350 |
+| nearest-centroid cosine, p50 | 0.794 | 0.890 |
+| ARI vs itself, disjoint halves | 0.469 | 0.454 |
+| ARI across the two encoders | **0.232** | **0.232** |
+
+**The encoder changes which cluster a complaint lands in about twice as much as
+resampling does** (0.232 against ~0.46), so the "provisional" flag on the Phase 4
+gate numbers was justified. But it barely changes *how many* clusters there are —
+336 against 350, a 4% difference — and granularity, not cluster identity, is the
+mechanism behind the threshold artifact that drives the table above. Note also
+that `assign_max_distance = 0.35` is calibrated to MiniLM's geometry: bge sits on
+a visibly higher cosine scale, so its 100% assignment rate at that fixed floor is
+an artifact of the threshold, not better coverage. Same defect class as the
+support floor.
+
+A full `bge-base` re-encode is therefore still outstanding, and it is a Phase 9
+item for the whole table at once rather than a patch to one row: a cross-system
+comparison needs all systems on one encoder, so re-running HarmScope means
+re-running B3 too, and B0/B1/B2 use no embeddings at all.
 
 Phase 5's mandatory negative control — shuffle cluster labels, re-run detection,
 and see how much fires — **failed first at a 10.7% false-alert rate and found
@@ -72,7 +96,7 @@ decisions rather than presented as satisfying the original bar.
 | 4 — Clustering & novelty **[GATE]** | ✅ gate passed — ablation AUC 0.791; **disjoint-halves ARI 0.505** |
 | 5 — Signal detection | ✅ negative control passes at 0.0045 vs α 0.05 |
 | 6 — Ground truth & backtest **[GATE]** | ✅ gate passed — refit at one cutoff in 3.2 min, 7 anti-leakage checks, blind adjudication on 14 actions |
-| 7 — Baselines | 🔄 B0, B1 done; B2, B3 running |
+| 7 — Baselines | ✅ all four in `baseline_results` — B1 56.2% > B2 = B3 51.8% > HarmScope 50.9% > B0 41.1% |
 | 8 — LLM layer | ⬜ |
 | 9 — Evaluation & write-up | ⬜ |
 | 10 — Interface | ⬜ |
@@ -195,13 +219,38 @@ phase 'cluster' is not built.
 running.** Not the headline: the headline needs blind human adjudication
 (`EVALUATION.md` §1.3), all four baselines, and a `bge-base` encode.
 
-| System | Detected | Rate | Median lead* |
-|---|---|---|---|
-| B1 — CFPB taxonomy | 63 / 112 | **56.2%** | 1518 d |
-| HarmScope | 57 / 112 | 50.9% | 1747 d |
-| B0 — volume only | 46 / 112 | 41.1% | 1954 d |
+| System | Detected | Rate | Median lead* | Units at 2024 |
+|---|---|---|---|---|
+| B1 — CFPB taxonomy | 63 / 112 | **56.2%** | 1518 d | 634 |
+| B2 — TF-IDF + LDA | 58 / 112 | 51.8% | 1810 d | 2,010 |
+| B3 — BERTopic default, no dedup | 58 / 112 | 51.8% | 1679 d | 11,336 |
+| HarmScope | 57 / 112 | 50.9% | 1747 d | 2,010 |
+| B0 — volume only | 46 / 112 | 41.1% | 1954 d | 12 |
 
 \* Lead times are company-level and inflated; see `ENGINEERING_NOTES.md` Phase 6.
+
+**HarmScope finishes last of the four non-trivial systems.** Every alternative
+way of defining a unit — the published taxonomy, a bag-of-words topic model, and
+off-the-shelf BERTopic without any dedup — matches or beats the pipeline. The
+whole spread from B1 to HarmScope is 5.3 points, which the threshold sweep below
+shows is inside the range an arbitrary threshold choice can manufacture.
+
+**B2 is the comparison that carries the most weight, because it is the only one
+where granularity is not a confound.** B2's topic count was fixed, per family and
+per cutoff, to HarmScope's own discovered cluster count — decided before B2 had a
+detection rate, precisely so the artifact that produced B1's lead could not
+operate here. It lands on 2,010 units at 2024 against HarmScope's 2,010, median
+support 16 against 15, clearing the floor 54.4% against 51.6%. Matched on every
+dimension that mattered, **a TF-IDF topic model detects 58 enforcement actions to
+the embedding pipeline's 57.** `EVALUATION §2` says B2 "tests whether the
+embeddings buy anything". On this evidence they do not.
+
+B3 ties B2 at 58 while running with no dedup, no campaign detection, no novelty
+scoring, and default hyperparameters — the `pip install bertopic` comparison.
+Its numbers are not strictly commensurable: without dedup its groups are
+singletons, so `min_supporting_groups` gates it on fifteen *complaints* where
+every other system is gated on fifteen *dup-groups*. That was written down before
+B3 ran, not discovered after.
 
 **Adjudication closes the gap to nothing.** On 14 actions both systems detected,
 judged blind against the orders' own descriptions:
