@@ -17,11 +17,11 @@ It has zero authority over:
 byte-identical **`signals`** table. Add this as an integration test. If it fails, the LLM
 has leaked into the detection path.
 
-The test is scoped to `signals` on purpose. `backtest_results` is derived from
+The test is scoped to `signals` on purpose. `baseline_results` is derived from
 `backtest_links`, which is written by a *human adjudicator* who is shown LLM
 cluster labels alongside exemplar narratives (`EVALUATION.md` §1.3). LLM output
-therefore reaches `backtest_results` through a person, by design. Claiming
-byte-identical `backtest_results` would be a claim the pipeline cannot honour,
+therefore reaches `baseline_results` through a person, by design. Claiming
+byte-identical `baseline_results` would be a claim the pipeline cannot honour,
 and an overclaim here would undermine the one architectural guarantee this
 project actually has.
 
@@ -29,7 +29,7 @@ The honest pair of statements:
 
 - `signals` is byte-identical with `src/llm/` deleted. **Detection is fully
   deterministic and LLM-free.**
-- `backtest_results` is byte-identical *given the same `backtest_links`*.
+- `baseline_results` is byte-identical *given the same `backtest_links`*.
   Adjudication is a deliberate human step, and its inputs, blinding protocol,
   and intra-rater agreement are reported (`EVALUATION.md` §1.3).
 

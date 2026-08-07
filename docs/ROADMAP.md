@@ -159,7 +159,7 @@ unit being tracked. Anything else makes the comparison unfair in your favour.
 - Human verification of ≥ 50 labels.
 
 **Accept:**
-- **Determinism test passes:** removing `src/llm/` leaves `signals` and `backtest_results`
+- **Determinism test passes:** removing `src/llm/` leaves `signals` and `baseline_results`
   byte-identical.
 - Label agreement rate reported.
 - RAG Recall@10 and groundedness reported on the 30-question set.

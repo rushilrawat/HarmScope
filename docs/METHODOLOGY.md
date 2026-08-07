@@ -10,7 +10,7 @@ Five sequential problems, each with a defined output and an acceptance test:
 | 2 | What harm mechanisms exist in the text? | `clusters` | stability across sample sizes (ARI) |
 | 3 | Which mechanisms are *not* in the taxonomy? | `cluster_novelty` | separation on held-out labels |
 | 4 | Which are growing abnormally? | `signals` | calibration + FDR control |
-| 5 | Did we see it before enforcement? | `backtest_results` | see `EVALUATION.md` |
+| 5 | Did we see it before enforcement? | `baseline_results` | see `EVALUATION.md` |
 
 Problem 1 is the hardest and the one most likely to be skipped. Do not skip it.
 

@@ -179,23 +179,50 @@ def test_adjudication_is_blind_to_signal_status():
 def test_thresholds_were_not_tuned_on_the_backtest_set():
     """§5.6 — "the one most likely to be violated by accident".
 
-    No backtest has produced a result yet, so no threshold can have been tuned
-    on one. What this pins is the config fingerprint at that moment, so a later
-    change is visible as a mismatch rather than absorbed silently.
+    This check was armed against `backtest_results` until 2026-08-06, and
+    nothing has ever written that table — `src/evaluation/backtest.py` writes
+    `baseline_results`. So `n_results` was always 0, the "no backtest yet"
+    branch always ran, and the guard passed vacuously through the entire Phase 6
+    and 7 backtest. A leakage check pointed at an empty table is worse than no
+    check, which is the reason `_live()` skips rather than passes when the
+    database is locked.
+
+    Now that results exist, the requirement has teeth: the detection thresholds
+    in `CONFIG.signals` must equal the ones the runs behind those results
+    actually recorded. Compared field by field against each run's own stored
+    config rather than against the whole-config fingerprint, because
+    `config_hash` covers every science parameter — a Phase 8 change to the LLM
+    settings would trip a fingerprint comparison while changing no threshold,
+    and a check that cries wolf gets ignored, which is how this one died.
     """
+    from dataclasses import asdict
+
+    from src.config import CONFIG
+
     con = _live()
-    n_results = con.execute("SELECT count(*) FROM backtest_results").fetchone()[0]
+    n_results = con.execute("SELECT count(*) FROM baseline_results").fetchone()[0]
     if n_results == 0:
-        hashes = con.execute(
-            "SELECT DISTINCT config_hash FROM runs WHERE phase IN ('cluster', 'signals') "
-            "AND status = 'ok'"
-        ).fetchall()
-        assert len(hashes) <= 2, (
-            f"{len(hashes)} distinct config fingerprints across detection runs; "
-            f"thresholds must be frozen before the backtest produces anything"
-        )
-        return
-    pytest.fail("backtest_results exist — pin the frozen config hash here")
+        pytest.skip("no backtest results yet — nothing could have been tuned on them")
+
+    rows = con.execute(
+        """
+        SELECT DISTINCT r.run_id, r.params_json
+        FROM baseline_results b JOIN runs r ON r.run_id = b.run_id
+        WHERE r.status = 'ok'
+        """
+    ).fetchall()
+    assert rows, "baseline_results rows exist but reference no successful run"
+
+    frozen = asdict(CONFIG.signals)
+    for run_id, params_json in rows:
+        recorded = json.loads(params_json)["config"]["signals"]
+        for key, value in frozen.items():
+            assert str(recorded[key]) == str(value), (
+                f"signals.{key} is {value!r} in config.py but the backtest run "
+                f"{run_id} recorded {recorded[key]!r}. A detection threshold "
+                f"changed after the backtest produced a number — EVALUATION §5.6 "
+                f"is the check this is meant to fail."
+            )
 
 
 # 7 -------------------------------------------------------------------------

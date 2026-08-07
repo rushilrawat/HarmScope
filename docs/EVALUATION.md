@@ -86,7 +86,7 @@ Protocol:
    decision writes `backtest_links`. That is a designed human-in-the-loop step,
    not a leak of the LLM into the detection path — but it is why the
    determinism test in `LLM_LAYER.md` §1 is scoped to `signals` and not to
-   `backtest_results`. Present the labels alongside exemplar narratives, never
+   `baseline_results`. Present the labels alongside exemplar narratives, never
    instead of them, so an adjudicator can overrule a bad label.
 
 3. Adjudicator marks `strong` / `partial` / `none` against the action's `harm_summary`.
