@@ -142,7 +142,10 @@ Effort estimates assume part-time work alongside coursework and an internship.
 - B0 volume, B1 taxonomy, B2 TF-IDF+LDA, B3 BERTopic-default (no dedup).
 - All run through the identical harness.
 
-**Accept:** all four produce `backtest_results` rows under the same `run_id` scheme. B1 is
+**Accept:** all four produce `baseline_results` rows under the same `run_id` scheme. (This
+criterion said `backtest_results` until 2026-08-06. `db/schema.sql` defines both tables and
+`src/evaluation/backtest.py` writes only `baseline_results`, which is the one carrying
+`cutoff` and `match_quality`; `backtest_results` is vestigial and nothing writes it.) B1 is
 implemented with the *same* statistical machinery as HarmScope — the only difference is the
 unit being tracked. Anything else makes the comparison unfair in your favour.
 

@@ -14,8 +14,24 @@ lead time.
 
 ## Status
 
-**Phase 5 complete.** Nothing downstream has run, so there are no results yet —
-see the empty table at the bottom, which stays empty until Phase 9.
+**Phases 0–6 complete; Phase 7 in progress.** The backtest has run and the
+Results table at the bottom carries real numbers. B0 and B1 are done; B2
+(TF-IDF + LDA) and B3 (BERTopic defaults, no dedup) are running now, and Phase 7
+is not complete until all four are in the table.
+
+The headline so far, which two separate examinations agree on: **the pipeline
+beats naive volume by about 10 points and is indistinguishable from the CFPB
+taxonomy it was supposed to improve on.** Both apparent effects dissolved —
+B1's unadjudicated +5.3 was a threshold artifact, HarmScope's n=8 reversal was a
+sampling artifact — and they dissolved in opposite directions, which is what a
+genuine null looks like.
+
+**Every system in the comparison runs on `all-MiniLM-L6-v2`, not the
+`bge-base-en-v1.5` default.** That is deliberate and cannot be partially undone:
+a cross-system comparison is only meaningful if all five systems see the same
+encoder, so re-running HarmScope on bge-base means re-running B3 on it too, and
+B0/B1/B2 do not use embeddings at all. The encoder swap is a Phase 9 item for
+the whole table at once, not a patch to one row.
 
 Phase 5's mandatory negative control — shuffle cluster labels, re-run detection,
 and see how much fires — **failed first at a 10.7% false-alert rate and found
@@ -36,8 +52,10 @@ fit sample, so the partition has not converged.
 
 Phases 3 and 4 both ran on `all-MiniLM-L6-v2`, the model `METHODOLOGY §3` names
 for iteration, not the `bge-base-en-v1.5` default — 2.1 h versus 16.8 h measured
-for the full corpus. **The Phase 4 gate numbers above are therefore provisional**
-and must be reproduced on bge-base before Phase 6 freezes anything.
+for the full corpus. **The Phase 4 gate numbers are therefore provisional.** They
+were not reproduced on bge-base before Phase 6, as this section originally
+required; the encode is still outstanding and is recorded as such rather than
+quietly dropped.
 
 The Phase 2 gate passed on a **changed** criterion: ROADMAP asked for 300
 hand-labelled pairs, and no human was available, so the disagreements were
@@ -53,8 +71,8 @@ decisions rather than presented as satisfying the original bar.
 | 3 — Embedding & index | ✅ 2.48M vectors, 10/10 neighbour checks — on the dev model, see note |
 | 4 — Clustering & novelty **[GATE]** | ✅ gate passed — ablation AUC 0.791; **disjoint-halves ARI 0.505** |
 | 5 — Signal detection | ✅ negative control passes at 0.0045 vs α 0.05 |
-| 6 — Ground truth & backtest **[GATE]** | ⬜ |
-| 7 — Baselines | ⬜ |
+| 6 — Ground truth & backtest **[GATE]** | ✅ gate passed — refit at one cutoff in 3.2 min, 7 anti-leakage checks, blind adjudication on 14 actions |
+| 7 — Baselines | 🔄 B0, B1 done; B2, B3 running |
 | 8 — LLM layer | ⬜ |
 | 9 — Evaluation & write-up | ⬜ |
 | 10 — Interface | ⬜ |
@@ -173,10 +191,9 @@ phase 'cluster' is not built.
 
 ## Results
 
-_Populate after Phase 9. Do not write numbers here until the backtest has run._
-
-**Provisional, unadjudicated, dev model.** Not the headline — the headline needs
-blind human adjudication (`EVALUATION.md` §1.3) and a `bge-base` encode.
+**Provisional, unadjudicated, dev model, and incomplete — B2 and B3 are still
+running.** Not the headline: the headline needs blind human adjudication
+(`EVALUATION.md` §1.3), all four baselines, and a `bge-base` encode.
 
 | System | Detected | Rate | Median lead* |
 |---|---|---|---|
