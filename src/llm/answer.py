@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 
@@ -164,6 +165,164 @@ def _normalized_question(question: str) -> str:
     if not normalized:
         raise ValueError("question must not be blank")
     return normalized
+
+
+def normalize_question(question: str) -> str:
+    """Canonicalize a question for cache identity without changing prompt copy."""
+    return _normalized_question(question).casefold()
+
+
+def question_hash(question: str) -> str:
+    """Return the stable cache key component for a normalized question."""
+    return hashlib.sha256(normalize_question(question).encode("utf-8")).hexdigest()
+
+
+def _evidence_ids(evidence: list[RetrievedEvidence]) -> tuple[int, ...]:
+    complaint_ids = tuple(row.complaint_id for row in evidence)
+    if any(type(complaint_id) is not int for complaint_id in complaint_ids):
+        raise ValueError("evidence complaint IDs must be integers")
+    if len(set(complaint_ids)) != len(complaint_ids):
+        raise ValueError("evidence complaint IDs must be unique")
+    return complaint_ids
+
+
+def evidence_hash(evidence: list[RetrievedEvidence]) -> str:
+    """Return the cache key component for evidence IDs in retrieval order."""
+    evidence_json = json.dumps(list(_evidence_ids(evidence)), separators=(",", ":"))
+    return hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+
+
+def _cache_key(
+    question: str,
+    cluster_id: str,
+    company_id: str,
+    model: str,
+    prompt_version: str,
+    evidence: list[RetrievedEvidence],
+) -> tuple[str, str, str, str, str, str]:
+    return (
+        question_hash(question),
+        evidence_hash(evidence),
+        cluster_id,
+        company_id,
+        model,
+        prompt_version,
+    )
+
+
+def _parse_stored_json(value: object, label: str) -> object:
+    if type(value) is not str:
+        raise ValueError(f"stored {label} must be JSON text")
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"stored {label} is malformed JSON") from exc
+
+
+def _stored_evidence_ids(value: object, expected_ids: tuple[int, ...]) -> tuple[int, ...]:
+    parsed = _parse_stored_json(value, "evidence IDs")
+    if type(parsed) is not list or any(type(complaint_id) is not int for complaint_id in parsed):
+        raise ValueError("stored evidence IDs must be a list of integers")
+    if len(set(parsed)) != len(parsed):
+        raise ValueError("stored evidence IDs must be unique")
+    stored_ids = tuple(parsed)
+    if stored_ids != expected_ids:
+        raise ValueError("stored evidence IDs do not match the requested evidence")
+    return stored_ids
+
+
+def _answer_payload(value: GroundedAnswer) -> dict[str, object]:
+    if type(value) is not GroundedAnswer:
+        raise TypeError("cached answer must be a GroundedAnswer")
+    return {
+        "answer": value.answer,
+        "claims": [
+            {"text": claim.text, "complaint_ids": list(claim.complaint_ids)}
+            for claim in value.claims
+        ],
+        "insufficient_evidence": value.insufficient_evidence,
+        "limitations": list(value.limitations),
+    }
+
+
+def _delete_cached_answer(con, cache_key: tuple[str, str, str, str, str, str]) -> None:
+    con.execute(
+        """
+        DELETE FROM rag_answers
+        WHERE question_hash = ? AND evidence_hash = ? AND cluster_id = ?
+          AND company_id = ? AND model = ? AND prompt_version = ?
+        """,
+        list(cache_key),
+    )
+
+
+def load_cached_answer(
+    con,
+    question: str,
+    cluster_id: str,
+    company_id: str,
+    model: str,
+    prompt_version: str,
+    evidence: list[RetrievedEvidence],
+) -> GroundedAnswer | None:
+    """Load one exact valid cache entry, deleting corrupt entries fail-closed."""
+    expected_ids = _evidence_ids(evidence)
+    cache_key = _cache_key(question, cluster_id, company_id, model, prompt_version, evidence)
+    row = con.execute(
+        """
+        SELECT evidence_ids_json, answer_json, citation_valid
+        FROM rag_answers
+        WHERE question_hash = ? AND evidence_hash = ? AND cluster_id = ?
+          AND company_id = ? AND model = ? AND prompt_version = ?
+        """,
+        list(cache_key),
+    ).fetchone()
+    if row is None:
+        return None
+
+    try:
+        evidence_ids = _stored_evidence_ids(row[0], expected_ids)
+        if row[2] is not True:
+            raise AnswerSchemaError("stored answer is not citation-valid")
+        payload = _parse_stored_json(row[1], "answer")
+        return validate_answer(payload, set(evidence_ids))
+    except (AnswerSchemaError, TypeError, ValueError):
+        _delete_cached_answer(con, cache_key)
+        return None
+
+
+def write_cached_answer(
+    con,
+    question: str,
+    cluster_id: str,
+    company_id: str,
+    model: str,
+    prompt_version: str,
+    evidence: list[RetrievedEvidence],
+    cached_answer: GroundedAnswer,
+) -> None:
+    """Upsert a validated answer for its exact question, scope, and evidence identity."""
+    evidence_ids = _evidence_ids(evidence)
+    cache_key = _cache_key(question, cluster_id, company_id, model, prompt_version, evidence)
+    payload = _answer_payload(cached_answer)
+    validate_answer(payload, set(evidence_ids))
+    evidence_ids_json = json.dumps(list(evidence_ids), sort_keys=True, separators=(",", ":"))
+    answer_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    con.execute(
+        """
+        INSERT INTO rag_answers (
+            question_hash, evidence_hash, cluster_id, company_id, model, prompt_version,
+            evidence_ids_json, answer_json, citation_valid, generated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), TRUE, now())
+        ON CONFLICT (question_hash, evidence_hash, cluster_id, company_id, model, prompt_version)
+        DO UPDATE SET
+            evidence_ids_json = excluded.evidence_ids_json,
+            answer_json = excluded.answer_json,
+            citation_valid = excluded.citation_valid,
+            generated_at = excluded.generated_at
+        """,
+        [*cache_key, evidence_ids_json, answer_json],
+    )
 
 
 def _render_complaint(row: RetrievedEvidence) -> dict[str, object]:
