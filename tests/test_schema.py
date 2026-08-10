@@ -18,6 +18,7 @@ import pytest
 
 from src import db
 from src.ids import COMPANY_TOTAL
+from src.llm import verify
 
 
 def test_phase8_tables_exist_on_a_fresh_database(con):
@@ -46,6 +47,69 @@ def test_phase8_migration_upgrades_a_pre_phase8_database(con):
         row[1] for row in con.execute("PRAGMA table_info('label_verifications')").fetchall()
     }
     assert "reviewer_origin" in columns
+
+
+def test_phase8_provenance_migration_backfills_legacy_reviews_as_model(con):
+    """Migration 008 must preserve old reviews without letting them pass a human gate."""
+    cluster_run = "0000000000001-cluster1"
+    signals_run = "0000000000002-signal01"
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'cluster', 'test', 'test', '{}', now(), 'ok')",
+        [cluster_run],
+    )
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'signals', 'test', 'test', "
+        "'{\"params\": {\"cluster_run\": \"0000000000001-cluster1\"}}', now(), 'ok')",
+        [signals_run],
+    )
+    cluster_id = f"{cluster_run}:mortgage:0"
+    con.execute(
+        "INSERT INTO clusters (cluster_id, run_id, product_family, n_members, as_of) "
+        "VALUES (?, ?, 'mortgage', 30, DATE '2020-01-01')",
+        [cluster_id, cluster_run],
+    )
+    con.execute(
+        "INSERT INTO cluster_labels (cluster_id, confidence) VALUES (?, 'high')",
+        [cluster_id],
+    )
+
+    con.execute("DROP TABLE label_verifications")
+    legacy_007 = Path("db/migrations/007_phase_08_llm_layer.sql").read_text().replace(
+        "  reviewer_origin             VARCHAR NOT NULL CHECK (reviewer_origin IN ('human', 'model')),\n",
+        "",
+    )
+    con.execute(legacy_007)
+    con.execute(
+        "INSERT INTO label_verifications "
+        "(cluster_id, reviewer_id, worklist_version, signals_run, is_fired, "
+        "mechanism_accuracy, taxonomy_distinctness_accuracy, template_accuracy, "
+        "should_have_abstained, failure_category, notes, reviewed_at) "
+        "VALUES (?, 'legacy-reviewer', 'wl-v1', ?, false, 'agree', 'agree', "
+        "'agree', false, 'none', NULL, now())",
+        [cluster_id, signals_run],
+    )
+
+    migration = Path("db/migrations/008_label_verification_provenance.sql").read_text()
+    con.execute(migration)
+
+    assert con.execute(
+        "SELECT reviewer_origin FROM label_verifications WHERE reviewer_id = 'legacy-reviewer'"
+    ).fetchone() == ("model",)
+    assert verify.report(con, "wl-v1").mechanism_total == 0
+    with pytest.raises(duckdb.ConstraintException):
+        con.execute(
+            "UPDATE label_verifications SET reviewer_origin = 'robot' "
+            "WHERE reviewer_id = 'legacy-reviewer'"
+        )
+    with pytest.raises(duckdb.ConstraintException):
+        con.execute(
+            "UPDATE label_verifications SET reviewer_origin = NULL "
+            "WHERE reviewer_id = 'legacy-reviewer'"
+        )
+    con.execute(migration)
+    assert con.execute("SELECT count(*) FROM label_verifications").fetchone() == (1,)
 
 
 def test_schema_applies_and_is_idempotent(tmp_path):
