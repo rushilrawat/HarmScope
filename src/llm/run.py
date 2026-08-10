@@ -5,9 +5,10 @@ backtest refit is a large avoidable bill and produces labels nobody reads, so th
 default population is the clusters that actually fired a signal, plus a seeded
 random control sample so §2.5's verification is not drawn only from alerts.
 
-This module is the only one in `src/llm/` that touches the database. It writes
-only the downstream `cluster_labels` and `llm_usage` tables, neither of which a
-detection stage reads. The §1 determinism contract is a property of that:
+This module is the only writer in `src/llm/`; retrieval has a separate read-only
+evidence boundary. This writer touches only the downstream `cluster_labels` and
+`llm_usage` tables, neither of which a detection stage reads. The §1 determinism
+contract is a property of that:
 `tests/test_llm.py` asserts no detection module can import this package at all.
 """
 
@@ -277,7 +278,9 @@ def run(con, cluster_run: str, signals_run: str, control_n: int, limit: int | No
     import numpy as np
 
     if vectors is None:
-        memmap = PATHS.artifacts / f"embeddings.{embed_model.split('/')[-1]}.npy"
+        from src.embed.encode import embedding_artifact_paths
+
+        memmap = embedding_artifact_paths(PATHS.artifacts, embed_model).memmap
         vectors = np.load(memmap, mmap_mode="r")
     cache = cache_dir or PATHS.llm_cache
 

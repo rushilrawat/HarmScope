@@ -309,8 +309,9 @@ def phase_embed(args: argparse.Namespace) -> int:
 
     con = db.bootstrap()
     model_name = args.model or CONFIG.embed.model
-    memmap = PATHS.artifacts / f"embeddings.{model_name.split('/')[-1]}.npy"
-    index_path = PATHS.artifacts / f"faiss.{model_name.split('/')[-1]}.index"
+    artifact_paths = encode.embedding_artifact_paths(PATHS.artifacts, model_name)
+    memmap = artifact_paths.memmap
+    index_path = artifact_paths.index
 
     # `limit` belongs in params even when it is None. A --limit smoke run wrote a
     # runs row that was indistinguishable from a full encode — same phase, same
@@ -379,8 +380,9 @@ def cmd_neighbours(args: argparse.Namespace) -> int:
 
     con = db.connect(read_only=True)
     model_name = args.model or CONFIG.embed.model
-    memmap = PATHS.artifacts / f"embeddings.{model_name.split('/')[-1]}.npy"
-    index_path = PATHS.artifacts / f"faiss.{model_name.split('/')[-1]}.index"
+    artifact_paths = encode.embedding_artifact_paths(PATHS.artifacts, model_name)
+    memmap = artifact_paths.memmap
+    index_path = artifact_paths.index
     if not index_path.exists():
         raise SystemExit(f"no index at {index_path} — run `--phase embed` first")
 
@@ -449,11 +451,12 @@ def phase_cluster(args: argparse.Namespace) -> int:
 
     from src.cluster import assign as assign_mod
     from src.cluster import fit as fit_mod
+    from src.embed import encode
     from src.ids import cluster_id as make_cluster_id
 
     con = db.bootstrap()
     model = args.model or CONFIG.embed.model
-    memmap = PATHS.artifacts / f"embeddings.{model.split('/')[-1]}.npy"
+    memmap = encode.embedding_artifact_paths(PATHS.artifacts, model).memmap
     if not memmap.exists():
         raise SystemExit(f"no embeddings at {memmap} — run `--phase embed` first")
     vectors = np.load(memmap, mmap_mode="r")
@@ -1672,10 +1675,11 @@ def cmd_stability(args: argparse.Namespace) -> int:
     import numpy as np
 
     from src.cluster import stability
+    from src.embed import encode
 
     con = db.connect(read_only=True)
     model = args.model or CONFIG.embed.model
-    memmap = PATHS.artifacts / f"embeddings.{model.split('/')[-1]}.npy"
+    memmap = encode.embedding_artifact_paths(PATHS.artifacts, model).memmap
     vectors = np.load(memmap, mmap_mode="r")
     dedup_run = args.dedup_run or latest_run(con, "dedup")
 

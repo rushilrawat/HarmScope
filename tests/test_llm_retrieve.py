@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from datetime import date
 from pathlib import Path
@@ -48,6 +50,8 @@ def scoped_corpus():
         company_id="scope-company",
         embed_model="embed-m",
         rows=(evidence(complaint_id=1, row_idx=0),),
+        embed_dim=2,
+        embedding_rows=1,
     )
 
 
@@ -71,21 +75,39 @@ def vectors():
 
 @pytest.fixture
 def retrieval_fixture(con):
+    dedup_run = "0000000000000-dedup"
+    cluster_run = "0000000000001-test"
     wanted_cluster = "0000000000001-test:mortgage:1"
     other_cluster = "0000000000001-test:mortgage:2"
     wanted_company = "acme-bank"
     other_company = "other-bank"
     con.execute(
         "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
-        "started_at, status) VALUES (?, 'test', 'test', 'test', '{}', now(), 'ok')",
-        ["0000000000001-test"],
+        "started_at, status) VALUES (?, 'dedup', 'test', 'test', '{}', now(), 'ok')",
+        [dedup_run],
+    )
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'cluster', 'test', 'test', ?, now(), 'ok')",
+        [
+            cluster_run,
+            json.dumps(
+                {
+                    "params": {
+                        "model": "embed-m",
+                        "dedup_run": dedup_run,
+                        "cutoff": "",
+                    }
+                }
+            ),
+        ],
     )
     for cluster_id in (wanted_cluster, other_cluster):
         con.execute(
             "INSERT INTO clusters "
             "(cluster_id, run_id, product_family, n_members, as_of) "
-            "VALUES (?, '0000000000001-test', 'mortgage', 2, ?)",
-            [cluster_id, date(2020, 1, 1)],
+            "VALUES (?, ?, 'mortgage', 2, ?)",
+            [cluster_id, cluster_run, date(2020, 1, 1)],
         )
     for company_id, company_name in (
         (wanted_company, "Acme Bank"),
@@ -124,6 +146,7 @@ def retrieval_fixture(con):
             None,
         ),
     )
+    group_by_complaint = {10: ("group-10", True, 2), 30: ("group-10", False, 2)}
     for row_idx, (complaint_id, cluster_id, company_id, company_name, text, response) in enumerate(
         records
     ):
@@ -155,10 +178,27 @@ def retrieval_fixture(con):
             "VALUES (?, ?, 'embed-m', 2)",
             [complaint_id, row_idx],
         )
-        con.execute(
-            "INSERT INTO cluster_members (cluster_id, complaint_id) VALUES (?, ?)",
-            [cluster_id, complaint_id],
+        group_id, is_representative, group_size = group_by_complaint.get(
+            complaint_id, (f"group-{complaint_id}", True, 1)
         )
+        con.execute(
+            "INSERT INTO dup_groups "
+            "(run_id, complaint_id, group_id, is_representative, group_size, as_of) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                dedup_run,
+                complaint_id,
+                group_id,
+                is_representative,
+                group_size,
+                date(2020, 1, 31),
+            ],
+        )
+        if is_representative:
+            con.execute(
+                "INSERT INTO cluster_members (cluster_id, complaint_id) VALUES (?, ?)",
+                [cluster_id, complaint_id],
+            )
     return con, wanted_cluster, wanted_company
 
 
@@ -173,8 +213,8 @@ def test_load_corpus_cannot_escape_cluster_or_company(retrieval_fixture):
     assert [row.complaint_id for row in corpus.rows] == [10, 20]
 
 
-def test_load_corpus_uses_only_the_requested_embedding_model(retrieval_fixture):
-    """A competing model mapping cannot replace or duplicate the requested row."""
+def test_load_corpus_rejects_a_model_not_recorded_by_the_cluster_run(retrieval_fixture):
+    """Caller-selected rows cannot silently change the cluster's vector space."""
     con, wanted_cluster, wanted_company = retrieval_fixture
     con.execute(
         "INSERT INTO embedding_map (complaint_id, row_idx, model, dim) "
@@ -182,13 +222,118 @@ def test_load_corpus_uses_only_the_requested_embedding_model(retrieval_fixture):
     )
 
     requested = retrieve.load_corpus(con, wanted_cluster, wanted_company, "embed-m")
-    competing = retrieve.load_corpus(con, wanted_cluster, wanted_company, "competing-model")
-
     assert [(row.complaint_id, row.row_idx) for row in requested.rows] == [
         (10, 1),
         (20, 0),
     ]
-    assert [(row.complaint_id, row.row_idx) for row in competing.rows] == [(10, 99)]
+    with pytest.raises(ValueError, match="cluster run.*embed-m.*competing-model"):
+        retrieve.load_corpus(con, wanted_cluster, wanted_company, "competing-model")
+
+
+def test_load_corpus_expands_cross_company_duplicates_then_applies_company_scope(
+    retrieval_fixture,
+):
+    """A sibling company in the representative's dup group remains retrievable."""
+    con, cluster_id, _ = retrieval_fixture
+
+    corpus = retrieve.load_corpus(con, cluster_id, "other-bank", "embed-m")
+
+    assert [row.complaint_id for row in corpus.rows] == [30]
+    assert corpus.rows[0].company_id == "other-bank"
+
+
+def test_load_corpus_uses_the_cluster_runs_recorded_dedup_run(retrieval_fixture):
+    """A newer incompatible grouping cannot rebind an existing cluster's population."""
+    con, cluster_id, _ = retrieval_fixture
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES "
+        "('0000000000002-dedup', 'dedup', 'test', 'test', '{}', now(), 'ok')"
+    )
+    con.executemany(
+        "INSERT INTO dup_groups "
+        "(run_id, complaint_id, group_id, is_representative, group_size, as_of) "
+        "VALUES ('0000000000002-dedup', ?, ?, true, 1, DATE '2020-01-31')",
+        [(10, "new-group-10"), (30, "new-group-30")],
+    )
+
+    corpus = retrieve.load_corpus(con, cluster_id, "other-bank", "embed-m")
+
+    assert [row.complaint_id for row in corpus.rows] == [30]
+
+
+def test_load_corpus_selects_one_deterministic_evidence_row_per_group_and_company(
+    retrieval_fixture,
+):
+    """Duplicate filings cannot overweight a group/company evidence unit."""
+    con, cluster_id, _ = retrieval_fixture
+    con.execute(
+        "INSERT INTO complaints_raw "
+        "(complaint_id, date_received, company_raw, company_public_response) "
+        "VALUES (31, DATE '2020-01-05', 'Other Bank', NULL)"
+    )
+    con.execute(
+        "INSERT INTO complaints "
+        "(complaint_id, date_received, period_month, company_id, product_family, has_narrative) "
+        "VALUES (31, DATE '2020-01-05', DATE '2020-01-01', "
+        "'other-bank', 'mortgage', true)"
+    )
+    con.execute(
+        "INSERT INTO narratives (complaint_id, text_redacted, text_hash, redaction_count) "
+        "VALUES (31, 'later duplicate', 'hash-31', 0)"
+    )
+    con.execute(
+        "INSERT INTO embedding_map (complaint_id, row_idx, model, dim) VALUES (31, 4, 'embed-m', 2)"
+    )
+    con.execute(
+        "INSERT INTO dup_groups "
+        "(run_id, complaint_id, group_id, is_representative, group_size, as_of) "
+        "VALUES ('0000000000000-dedup', 31, 'group-10', false, 3, DATE '2020-01-31')"
+    )
+
+    corpus = retrieve.load_corpus(con, cluster_id, "other-bank", "embed-m")
+
+    assert [row.complaint_id for row in corpus.rows] == [30]
+
+
+def test_load_corpus_excludes_flagged_campaign_groups(retrieval_fixture):
+    """Evidence uses the same campaign-excluded population as signals."""
+    con, cluster_id, _ = retrieval_fixture
+    con.execute(
+        "INSERT INTO campaigns "
+        "(campaign_id, run_id, n_complaints, n_groups, product_family, "
+        "n_signals, flagged, as_of) VALUES "
+        "('0000000000000-dedup:campaign:1', '0000000000000-dedup', 2, 1, "
+        "'mortgage', 3, true, DATE '2020-01-31')"
+    )
+    con.executemany(
+        "INSERT INTO campaign_members (complaint_id, campaign_id) VALUES "
+        "(?, '0000000000000-dedup:campaign:1')",
+        [(10,), (30,)],
+    )
+
+    corpus = retrieve.load_corpus(con, cluster_id, None, "embed-m")
+
+    assert [row.complaint_id for row in corpus.rows] == [20]
+
+
+def test_load_corpus_carries_consistent_embedding_map_dimension(retrieval_fixture):
+    """The vector dimension recorded by embedding_map reaches dense validation."""
+    con, cluster_id, company_id = retrieval_fixture
+
+    corpus = retrieve.load_corpus(con, cluster_id, company_id, "embed-m")
+
+    assert corpus.embed_dim == 2
+    assert corpus.embedding_rows == 4
+
+
+def test_load_corpus_rejects_inconsistent_embedding_map_dimensions(retrieval_fixture):
+    """Mixed dimensions for one model are corrupt provenance, not evidence."""
+    con, cluster_id, company_id = retrieval_fixture
+    con.execute("UPDATE embedding_map SET dim = 3 WHERE complaint_id = 20 AND model = 'embed-m'")
+
+    with pytest.raises(ValueError, match="embedding_map.*dimension"):
+        retrieve.load_corpus(con, cluster_id, company_id, "embed-m")
 
 
 def test_load_corpus_carries_auditable_evidence_fields(retrieval_fixture):
@@ -303,6 +448,29 @@ def test_dense_ties_break_on_complaint_id(scoped_corpus):
     got = retrieve.dense_rank(corpus, vectors, np.array([[1.0, 0.0]], dtype=np.float32), 2)
 
     assert [hit.complaint_id for hit in got] == [10, 20]
+
+
+def test_dense_rank_normalizes_corpus_vectors_at_the_cosine_boundary(scoped_corpus):
+    """Vector magnitude cannot outrank a more directionally similar complaint."""
+    vectors = np.array([[1.0, 1.0], [0.9, 0.0]], dtype=np.float32)
+    corpus = replace(
+        scoped_corpus,
+        rows=(
+            evidence(complaint_id=10, row_idx=0),
+            evidence(complaint_id=20, row_idx=1),
+        ),
+        embedding_rows=2,
+    )
+
+    got = retrieve.dense_rank(
+        corpus,
+        vectors,
+        np.array([[2.0, 0.0]], dtype=np.float32),
+        limit=2,
+    )
+
+    assert [hit.complaint_id for hit in got] == [20, 10]
+    assert got[0].score == pytest.approx(1.0)
 
 
 def test_dense_rank_rejects_out_of_bounds_scoped_row_index(scoped_corpus):
@@ -529,6 +697,37 @@ def test_malformed_sparse_cache_is_quarantined(scoped_corpus, tmp_path, payload)
     assert len(list(tmp_path.glob(f"{path.name}.corrupt-*"))) == 1
 
 
+def test_concurrent_malformed_sparse_cache_quarantine_is_race_safe(
+    scoped_corpus, tmp_path, monkeypatch
+):
+    """Two readers observing one corrupt cache cannot race into FileNotFoundError."""
+    key = retrieve.membership_hash(scoped_corpus, "word-v1")
+    path = tmp_path / f"bm25.{key}.json"
+    path.write_text("{")
+    barrier = threading.Barrier(2)
+    quarantine = retrieve._quarantine_sparse_cache
+
+    def synchronized_quarantine(cache_path):
+        barrier.wait(timeout=5)
+        quarantine(cache_path)
+
+    monkeypatch.setattr(retrieve, "_quarantine_sparse_cache", synchronized_quarantine)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                retrieve.load_sparse_corpus,
+                scoped_corpus,
+                tmp_path,
+                "word-v1",
+            )
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=5) for future in futures]
+
+    assert all(sparse.complaint_ids == (1,) for sparse, _ in results)
+    assert path.exists()
+
+
 def test_rrf_combines_component_ranks_and_breaks_ties_by_id():
     """Equal reciprocal-rank totals resolve deterministically on source ID."""
     dense = [retrieve.RankedHit(10, 1, 0.9), retrieve.RankedHit(20, 2, 0.8)]
@@ -542,6 +741,20 @@ def test_rrf_combines_component_ranks_and_breaks_ties_by_id():
     assert got[0].sparse_rank == 2
     assert got[1].dense_score == pytest.approx(0.8)
     assert got[1].sparse_score == pytest.approx(4.0)
+    assert got[0].fused_score == pytest.approx(1 / 61 + 1 / 62)
+
+
+def test_rrf_preserves_disjoint_component_maps_and_uses_configured_constant():
+    """One-channel candidates keep missing fields and the supplied RRF constant."""
+    dense = [retrieve.RankedHit(10, 1, 0.9)]
+    sparse = [retrieve.RankedHit(20, 1, 4.0)]
+
+    got = retrieve.reciprocal_rank_fusion(dense, sparse, rrf_k=7, top_k=10)
+
+    assert got == [
+        retrieve.FusedHit(10, 1 / 8, 1, 0.9, None, None),
+        retrieve.FusedHit(20, 1 / 8, None, None, 1, 4.0),
+    ]
 
 
 @pytest.mark.parametrize(("rrf_k", "top_k"), [(0, 10), (-1, 10), (60, 0), (60, -1)])
@@ -657,17 +870,67 @@ def test_retrieve_variants_is_scoped_auditable_cached_and_observable(
     assert (cache_path.stat().st_ino, cache_path.stat().st_mtime_ns) == first_cache_identity
 
 
+def _configure_provider_artifact(
+    con,
+    cluster_id: str,
+    tmp_path: Path,
+    model: str = "provider/embed-m",
+    *,
+    metadata_model: str | None = None,
+    n_done: int = 4,
+    n_total: int = 4,
+    dim: int = 2,
+):
+    from src.embed import encode
+
+    cluster_run = con.execute(
+        "SELECT run_id FROM clusters WHERE cluster_id = ?", [cluster_id]
+    ).fetchone()[0]
+    con.execute(
+        "UPDATE runs SET params_json = ? WHERE run_id = ?",
+        [
+            json.dumps(
+                {
+                    "params": {
+                        "model": model,
+                        "dedup_run": "0000000000000-dedup",
+                        "cutoff": "",
+                    }
+                }
+            ),
+            cluster_run,
+        ],
+    )
+    con.execute(
+        "INSERT INTO embedding_map "
+        "SELECT complaint_id, row_idx, ?, dim FROM embedding_map WHERE model = 'embed-m'",
+        [model],
+    )
+    artifacts = tmp_path / "artifacts"
+    artifact = encode.embedding_artifact_paths(artifacts, model).memmap
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    encode.Progress(
+        artifact.with_suffix(".progress.json"),
+        n_done=n_done,
+        n_total=n_total,
+        dim=dim,
+        model=model if metadata_model is None else metadata_model,
+    ).write()
+    return artifact
+
+
 def test_retrieve_variants_uses_default_embedding_artifact_contract(
     retrieval_fixture, fake_encoder, vectors, tmp_path, monkeypatch
 ):
-    """Omitted heavy dependencies load one model and the model-tail vector artifact."""
+    """Default vectors use full-model addressing and validated encode metadata."""
     con, cluster_id, company_id = retrieval_fixture
     loaded_models: list[str] = []
     loaded_vectors: list[tuple[Path, str | None]] = []
-    con.execute(
-        "INSERT INTO embedding_map "
-        "SELECT complaint_id, row_idx, 'provider/embed-m', dim "
-        "FROM embedding_map WHERE model = 'embed-m'"
+    artifact = _configure_provider_artifact(con, cluster_id, tmp_path)
+    monkeypatch.setattr(
+        retrieve,
+        "PATHS",
+        SimpleNamespace(artifacts=tmp_path / "artifacts", llm_cache=tmp_path / "cache"),
     )
 
     def fake_load_model(model_name):
@@ -695,8 +958,69 @@ def test_retrieve_variants_uses_default_embedding_artifact_contract(
 
     assert len(got.evidence) == 1
     assert loaded_models == ["provider/embed-m"]
-    assert loaded_vectors == [(retrieve.PATHS.artifacts / "embeddings.embed-m.npy", "r")]
+    assert loaded_vectors == [(artifact, "r")]
     assert fake_encoder.calls == [["escrow refund"]]
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        ({"metadata_model": "other/embed-m"}, "model"),
+        ({"n_done": 3}, "complete"),
+        ({"n_done": 3, "n_total": 3}, "row count"),
+        ({"dim": 3}, "dimension"),
+    ],
+)
+def test_default_embedding_artifact_rejects_metadata_mismatch(
+    retrieval_fixture, fake_encoder, vectors, tmp_path, monkeypatch, metadata, message
+):
+    """Sidecar provenance must match the cluster-bound map before vectors load."""
+    con, cluster_id, company_id = retrieval_fixture
+    _configure_provider_artifact(con, cluster_id, tmp_path, **metadata)
+    monkeypatch.setattr(
+        retrieve,
+        "PATHS",
+        SimpleNamespace(artifacts=tmp_path / "artifacts", llm_cache=tmp_path / "cache"),
+    )
+    monkeypatch.setattr(retrieve.np, "load", lambda *_args, **_kwargs: vectors)
+
+    with pytest.raises(ValueError, match=message):
+        retrieve.retrieve_variants(
+            con,
+            cluster_id,
+            company_id,
+            "escrow refund",
+            "provider/embed-m",
+            encoder=fake_encoder,
+            cache_dir=tmp_path / "cache",
+            top_k=1,
+        )
+
+
+def test_default_embedding_artifact_rejects_array_dimension_mismatch(
+    retrieval_fixture, fake_encoder, vectors, tmp_path, monkeypatch
+):
+    """A correctly named artifact with the wrong array shape cannot be searched."""
+    con, cluster_id, company_id = retrieval_fixture
+    _configure_provider_artifact(con, cluster_id, tmp_path)
+    monkeypatch.setattr(
+        retrieve,
+        "PATHS",
+        SimpleNamespace(artifacts=tmp_path / "artifacts", llm_cache=tmp_path / "cache"),
+    )
+    monkeypatch.setattr(retrieve.np, "load", lambda *_args, **_kwargs: vectors[:, :1])
+
+    with pytest.raises(ValueError, match="artifact.*dimension"):
+        retrieve.retrieve_variants(
+            con,
+            cluster_id,
+            company_id,
+            "escrow refund",
+            "provider/embed-m",
+            encoder=fake_encoder,
+            cache_dir=tmp_path / "cache",
+            top_k=1,
+        )
 
 
 def test_retrieve_variants_honors_configured_candidate_and_default_top_k(
@@ -726,6 +1050,40 @@ def test_retrieve_variants_honors_configured_candidate_and_default_top_k(
     assert len(got.sparse) == 1
     assert len(got.fused) == 1
     assert len(got.evidence) == 1
+
+
+def test_retrieve_variants_uses_configured_rrf_tokenizer_and_default_cache_path(
+    retrieval_fixture, fake_encoder, vectors, tmp_path, monkeypatch
+):
+    """Orchestration passes measured config and defaults cache writes to PATHS."""
+    con, cluster_id, company_id = retrieval_fixture
+    configured_llm = replace(
+        retrieve.CONFIG.llm,
+        rrf_k=7,
+        bm25_tokenizer_version="word-v99",
+    )
+    default_cache = tmp_path / "default-cache"
+    monkeypatch.setattr(retrieve, "CONFIG", SimpleNamespace(llm=configured_llm))
+    monkeypatch.setattr(
+        retrieve,
+        "PATHS",
+        SimpleNamespace(artifacts=tmp_path / "artifacts", llm_cache=default_cache),
+    )
+
+    got = retrieve.retrieve_variants(
+        con,
+        cluster_id,
+        company_id,
+        "escrow refund",
+        "embed-m",
+        encoder=fake_encoder,
+        vectors=vectors,
+        top_k=1,
+    )
+
+    assert got.fused[0].fused_score == pytest.approx(2 / 8)
+    cache_key = retrieve.membership_hash(got.corpus, "word-v99")
+    assert (default_cache / f"bm25.{cache_key}.json").exists()
 
 
 def test_retrieve_evidence_is_a_thin_list_wrapper(

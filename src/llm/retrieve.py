@@ -16,6 +16,7 @@ import duckdb
 import numpy as np
 
 from src.config import CONFIG, PATHS
+from src.population import EXPANDED_SELECT_SQL
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,8 @@ class ScopedCorpus:
     company_id: str | None
     embed_model: str
     rows: tuple[EvidenceRecord, ...]
+    embed_dim: int | None = None
+    embedding_rows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -165,7 +168,13 @@ def _quarantine_sparse_cache(path: Path) -> None:
     while corrupt.exists():
         corrupt = path.with_name(f"{path.name}.corrupt-{stamp}-{suffix}")
         suffix += 1
-    os.replace(path, corrupt)
+    try:
+        os.replace(path, corrupt)
+    except FileNotFoundError:
+        # Another reader may have observed and quarantined the same bad file
+        # after this caller read it. Both callers may safely rebuild because
+        # writes use independent temporary files and atomic replacement.
+        return
 
 
 def _write_sparse_cache(path: Path, sparse: SparseCorpus, tokenizer_version: str) -> None:
@@ -233,17 +242,97 @@ def bm25_rank(sparse: SparseCorpus, question: str, limit: int) -> list[RankedHit
     ]
 
 
+@dataclass(frozen=True)
+class _ClusterProvenance:
+    run_id: str
+    dedup_run: str
+    embed_model: str
+    cutoff: date | None
+
+
+def _cluster_provenance(
+    con: duckdb.DuckDBPyConnection,
+    cluster_id: str,
+    requested_model: str,
+) -> _ClusterProvenance:
+    row = con.execute(
+        """
+        SELECT
+            c.run_id,
+            json_extract_string(r.params_json, '$.params.dedup_run'),
+            json_extract_string(r.params_json, '$.params.model'),
+            nullif(json_extract_string(r.params_json, '$.params.cutoff'), '')
+        FROM clusters c
+        JOIN runs r ON r.run_id = c.run_id
+        WHERE c.cluster_id = ?
+        """,
+        [cluster_id],
+    ).fetchone()
+    if row is None:
+        raise ValueError("no evidence exists for the requested cluster/company/model scope")
+    run_id, dedup_run, recorded_model, cutoff_text = row
+    if not isinstance(dedup_run, str) or not dedup_run.strip():
+        raise ValueError(f"cluster run {run_id} does not record a dedup_run")
+    if not isinstance(recorded_model, str) or not recorded_model.strip():
+        raise ValueError(f"cluster run {run_id} does not record an embedding model")
+    if requested_model != recorded_model:
+        raise ValueError(
+            f"cluster run {run_id} records embedding model {recorded_model!r}; "
+            f"requested {requested_model!r}"
+        )
+    try:
+        cutoff = None if cutoff_text is None else date.fromisoformat(cutoff_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"cluster run {run_id} records an invalid cutoff {cutoff_text!r}") from exc
+    return _ClusterProvenance(run_id, dedup_run, recorded_model, cutoff)
+
+
+def _embedding_map_metadata(con: duckdb.DuckDBPyConnection, model: str) -> tuple[int, int]:
+    n_dims, embed_dim, n_rows, max_row, min_row = con.execute(
+        """
+        SELECT count(DISTINCT dim), min(dim), count(DISTINCT row_idx),
+               max(row_idx), min(row_idx)
+        FROM embedding_map
+        WHERE model = ?
+        """,
+        [model],
+    ).fetchone()
+    if n_dims != 1 or not isinstance(embed_dim, int) or embed_dim <= 0:
+        raise ValueError(f"embedding_map has inconsistent dimension metadata for model {model!r}")
+    expected_rows = int(max_row) + 1
+    if min_row != 0 or n_rows != expected_rows:
+        raise ValueError(f"embedding_map row indices are not contiguous for model {model!r}")
+    return int(embed_dim), expected_rows
+
+
 def load_corpus(
     con: duckdb.DuckDBPyConnection,
     cluster_id: str,
     company_id: str | None,
     embed_model: str,
 ) -> ScopedCorpus:
-    """Load redacted narratives from exactly one requested evidence scope."""
-    query = """
+    """Load one signal-consistent, deduplicated redacted evidence scope."""
+    provenance = _cluster_provenance(con, cluster_id, embed_model)
+    embed_dim, embedding_rows = _embedding_map_metadata(con, provenance.embed_model)
+    query = f"""
+        WITH expanded AS (
+            {EXPANDED_SELECT_SQL}
+        ),
+        scoped AS (
+            SELECT expanded.*, dates.date_received,
+                   row_number() OVER (
+                       PARTITION BY expanded.group_id, expanded.company_id
+                       ORDER BY dates.date_received, expanded.complaint_id
+                   ) AS evidence_rank
+            FROM expanded
+            JOIN complaints dates ON dates.complaint_id = expanded.complaint_id
+            WHERE expanded.cluster_id = ?
+              AND expanded.product_family = expanded.cluster_family
+              AND (? IS NULL OR expanded.company_id = ?)
+        )
         SELECT
-            m.complaint_id,
-            m.cluster_id,
+            s.complaint_id,
+            s.cluster_id,
             e.row_idx,
             c.date_received,
             c.company_id,
@@ -251,21 +340,28 @@ def load_corpus(
             c.product_family,
             n.text_redacted,
             r.company_public_response
-        FROM cluster_members m
+        FROM scoped s
         JOIN narratives n USING (complaint_id)
         JOIN complaints c USING (complaint_id)
         JOIN embedding_map e
-          ON e.complaint_id = m.complaint_id AND e.model = ?
-        LEFT JOIN company_canonical cc USING (company_id)
-        LEFT JOIN complaints_raw r USING (complaint_id)
-        WHERE m.cluster_id = ?
-    """
-    parameters: list[str] = [embed_model, cluster_id]
-    if company_id is not None:
-        query += " AND c.company_id = ?"
-        parameters.append(company_id)
-    query += " ORDER BY m.complaint_id"
-
+          ON e.complaint_id = s.complaint_id AND e.model = ? AND e.dim = ?
+        LEFT JOIN company_canonical cc ON cc.company_id = c.company_id
+        LEFT JOIN complaints_raw r ON r.complaint_id = s.complaint_id
+        WHERE s.evidence_rank = 1
+        ORDER BY s.complaint_id
+    """  # noqa: S608 - interpolation is the static shared population SQL
+    parameters = [
+        provenance.run_id,
+        provenance.dedup_run,
+        provenance.dedup_run,
+        provenance.cutoff,
+        provenance.cutoff,
+        cluster_id,
+        company_id,
+        company_id,
+        provenance.embed_model,
+        embed_dim,
+    ]
     records = con.execute(query, parameters).fetchall()
     if not records:
         raise ValueError("no evidence exists for the requested cluster/company/model scope")
@@ -294,7 +390,14 @@ def load_corpus(
             response,
         ) in records
     )
-    return ScopedCorpus(cluster_id, company_id, embed_model, rows)
+    return ScopedCorpus(
+        cluster_id,
+        company_id,
+        provenance.embed_model,
+        rows,
+        embed_dim=embed_dim,
+        embedding_rows=embedding_rows,
+    )
 
 
 def membership_hash(corpus: ScopedCorpus, tokenizer_version: str) -> str:
@@ -345,6 +448,11 @@ def dense_rank(
     all_vectors = np.asarray(vectors, dtype=np.float32)
     if all_vectors.ndim != 2 or all_vectors.shape[0] == 0 or all_vectors.shape[1] == 0:
         raise ValueError("vectors must have shape (n, dim)")
+    if corpus.embed_dim is not None and all_vectors.shape[1] != corpus.embed_dim:
+        raise ValueError(
+            "embedding vector dimension does not match embedding_map dimension "
+            f"({all_vectors.shape[1]} != {corpus.embed_dim})"
+        )
 
     row_indices = [row.row_idx for row in corpus.rows]
     if any(row_idx < 0 or row_idx >= all_vectors.shape[0] for row_idx in row_indices):
@@ -352,8 +460,10 @@ def dense_rank(
     matrix = np.ascontiguousarray(all_vectors[row_indices], dtype=np.float32)
     if not np.isfinite(matrix).all():
         raise ValueError("scoped embedding matrix contains non-finite values")
-    if np.any(np.linalg.norm(matrix, axis=1) == 0.0):
+    matrix_norms = np.linalg.norm(matrix, axis=1)
+    if np.any(matrix_norms == 0.0):
         raise ValueError("scoped embedding matrix contains a zero norm vector")
+    matrix = np.ascontiguousarray(matrix / matrix_norms[:, None], dtype=np.float32)
 
     query = np.ascontiguousarray(np.asarray(query_vector, dtype=np.float32))
     if query.ndim != 2 or query.shape[0] != 1:
@@ -362,8 +472,10 @@ def dense_rank(
         raise ValueError("query vector dimension must match embedding dimension")
     if not np.isfinite(query).all():
         raise ValueError("query vector contains non-finite values")
-    if float(np.linalg.norm(query)) == 0.0:
+    query_norm = float(np.linalg.norm(query))
+    if query_norm == 0.0:
         raise ValueError("query vector has zero norm")
+    query = np.ascontiguousarray(query / query_norm, dtype=np.float32)
 
     index = faiss.IndexFlatIP(matrix.shape[1])
     index.add(matrix)
@@ -438,6 +550,57 @@ def reciprocal_rank_fusion(
     return fused[:top_k]
 
 
+def _load_default_vectors(corpus: ScopedCorpus) -> np.ndarray:
+    """Load the cluster-bound vector artifact after validating its sidecar."""
+    from src.embed.encode import Progress, embedding_artifact_paths
+
+    if corpus.embed_dim is None or corpus.embedding_rows is None:
+        raise ValueError("scoped corpus is missing embedding_map metadata")
+    artifact = embedding_artifact_paths(PATHS.artifacts, corpus.embed_model).memmap
+    metadata_path = artifact.with_suffix(".progress.json")
+    try:
+        metadata = Progress.read(metadata_path)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid embedding artifact metadata at {metadata_path}") from exc
+    if metadata is None:
+        raise ValueError(f"missing embedding artifact metadata at {metadata_path}")
+    if metadata.model != corpus.embed_model:
+        raise ValueError(
+            "embedding artifact metadata model does not match the cluster run "
+            f"({metadata.model!r} != {corpus.embed_model!r})"
+        )
+    if metadata.n_total != corpus.embedding_rows:
+        raise ValueError(
+            "embedding artifact metadata row count does not match embedding_map "
+            f"({metadata.n_total} != {corpus.embedding_rows})"
+        )
+    if metadata.dim != corpus.embed_dim:
+        raise ValueError(
+            "embedding artifact metadata dimension does not match embedding_map "
+            f"({metadata.dim} != {corpus.embed_dim})"
+        )
+    if metadata.n_done != metadata.n_total:
+        raise ValueError(
+            "embedding artifact metadata does not describe a complete encode "
+            f"({metadata.n_done} of {metadata.n_total})"
+        )
+
+    vectors = np.load(artifact, mmap_mode="r")
+    if vectors.ndim != 2:
+        raise ValueError("embedding artifact must be a two-dimensional array")
+    if vectors.shape[0] != metadata.n_total:
+        raise ValueError(
+            "embedding artifact row count does not match metadata "
+            f"({vectors.shape[0]} != {metadata.n_total})"
+        )
+    if vectors.shape[1] != metadata.dim:
+        raise ValueError(
+            "embedding artifact dimension does not match metadata "
+            f"({vectors.shape[1]} != {metadata.dim})"
+        )
+    return vectors
+
+
 def retrieve_variants(
     con: duckdb.DuckDBPyConnection,
     cluster_id: str,
@@ -456,8 +619,7 @@ def retrieve_variants(
 
         encoder, _device = load_model(embed_model)
     if vectors is None:
-        artifact = PATHS.artifacts / f"embeddings.{embed_model.split('/')[-1]}.npy"
-        vectors = np.load(artifact, mmap_mode="r")
+        vectors = _load_default_vectors(corpus)
 
     dense_started = time.perf_counter()
     query_vector = encode_query(encoder, question)

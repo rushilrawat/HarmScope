@@ -255,6 +255,15 @@ class LLMConfig:
     verification_seed: int = 20260809
 
     def __post_init__(self) -> None:
+        for name in ("rag_top_k", "rag_candidate_k", "rrf_k"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive non-boolean integer")
+        if (
+            not isinstance(self.bm25_tokenizer_version, str)
+            or not self.bm25_tokenizer_version.strip()
+        ):
+            raise ValueError("bm25_tokenizer_version must be a nonblank string")
         if self.rag_candidate_k < self.rag_top_k:
             raise ValueError(
                 "rag_candidate_k must be at least rag_top_k "

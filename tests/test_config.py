@@ -25,6 +25,25 @@ def test_llm_candidate_pool_cannot_be_smaller_than_returned_evidence():
         LLMConfig(rag_top_k=11, rag_candidate_k=10)
 
 
+@pytest.mark.parametrize("field", ["rag_top_k", "rag_candidate_k", "rrf_k"])
+@pytest.mark.parametrize("value", [0, -1, False, True, 1.5])
+def test_llm_retrieval_integer_settings_must_be_positive_non_boolean(field, value):
+    """Invalid retrieval limits cannot reach ranking or fusion at runtime."""
+    kwargs = {field: value}
+    if field == "rag_top_k" and isinstance(value, int) and not isinstance(value, bool):
+        kwargs["rag_candidate_k"] = max(50, value)
+
+    with pytest.raises(ValueError, match=field):
+        LLMConfig(**kwargs)
+
+
+@pytest.mark.parametrize("value", ["", "   ", None, 1])
+def test_llm_tokenizer_version_must_be_a_nonblank_string(value):
+    """Every sparse cache must be keyed by an explicit tokenizer contract."""
+    with pytest.raises(ValueError, match="bm25_tokenizer_version"):
+        LLMConfig(bm25_tokenizer_version=value)
+
+
 def test_config_is_frozen():
     with pytest.raises(dataclasses.FrozenInstanceError):
         CONFIG.seed = 1  # type: ignore[misc]
