@@ -11,12 +11,33 @@ after several hours of embedding.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import duckdb
 import pytest
 
 from src import db
 from src.ids import COMPANY_TOTAL
+
+
+def test_phase8_tables_exist_on_a_fresh_database(con):
+    """Fresh installs must expose the Phase 8 persistence contract."""
+    required = {
+        "llm_usage", "label_verifications", "rag_answers", "rag_eval_results"
+    }
+    assert required <= set(db.table_names(con))
+
+
+def test_phase8_migration_upgrades_a_pre_phase8_database(con):
+    """Migration 007 must be repeatable when upgrading an existing database."""
+    for table in ("rag_eval_results", "rag_answers", "label_verifications", "llm_usage"):
+        con.execute("DROP TABLE IF EXISTS " + table)
+    migration = Path("db/migrations/007_phase_08_llm_layer.sql").read_text()
+    con.execute(migration)
+    con.execute(migration)
+    assert {
+        "llm_usage", "label_verifications", "rag_answers", "rag_eval_results"
+    } <= set(db.table_names(con))
 
 
 def test_schema_applies_and_is_idempotent(tmp_path):

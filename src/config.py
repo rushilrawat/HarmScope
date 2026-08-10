@@ -241,6 +241,16 @@ class LLMConfig:
     rag_top_k: int = 10
     rrf_k: int = 60
     human_verify_n: int = 50             # docs/LLM_LAYER.md §2.5, required
+    max_retries: int = 3
+    retry_base_seconds: float = 1.0
+    retry_max_seconds: float = 30.0
+    # Re-check official list pricing before a paid run. A change here produces
+    # a new config fingerprint, preserving cost-accounting provenance.
+    input_usd_per_million: float = 5.0
+    output_usd_per_million: float = 25.0
+    cache_write_usd_per_million: float = 6.25
+    cache_read_usd_per_million: float = 0.50
+    verification_seed: int = 20260809
 
 
 @dataclass(frozen=True)

@@ -7,6 +7,15 @@ import pytest
 from src.config import CONFIG, Config, NoveltyConfig, Paths, paths
 
 
+def test_llm_operational_parameters_are_fingerprinted():
+    """Retries and pricing must travel with every recorded configuration."""
+    payload = CONFIG.to_dict()["llm"]
+    assert payload["max_retries"] == 3
+    assert payload["retry_base_seconds"] == 1.0
+    assert payload["input_usd_per_million"] > 0
+    assert payload["output_usd_per_million"] > 0
+
+
 def test_config_is_frozen():
     with pytest.raises(dataclasses.FrozenInstanceError):
         CONFIG.seed = 1  # type: ignore[misc]
