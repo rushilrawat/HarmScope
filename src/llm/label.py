@@ -129,7 +129,9 @@ def validate_label(payload: dict) -> dict:
     return dict(payload)
 
 
-def _validate_cached_payload(payload: dict) -> dict:
+def _validate_cached_payload(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        raise LabelSchemaError("label must be an object")
     if set(payload) == REFUSAL_FIELDS:
         if payload["refused"] is True and isinstance(payload["stop_reason"], str):
             return dict(payload)

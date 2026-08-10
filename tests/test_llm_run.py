@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from src import pipeline
+from src.llm import label as label_mod
 from src.llm import run as llm_run
 from src.llm.client import ModelCallError, ModelCallResult, TokenUsage
 
@@ -144,6 +145,46 @@ def test_terminal_billing_failure_stops_remaining_population(label_fixture, tmp_
     assert con.execute(
         "SELECT count(*) FROM llm_usage WHERE error_category = 'billing'"
     ).fetchone()[0] == 1
+
+
+def test_scalar_model_payload_is_recorded_and_next_target_continues(
+    label_fixture, tmp_path,
+):
+    con, vectors, cluster_run, signals_run = label_fixture
+    client = FakeModelClient([result(None), result(complete_label())])
+
+    stats = llm_run.run(
+        con, cluster_run, signals_run, control_n=1, limit=None,
+        embed_model="m", client=client, vectors=vectors, cache_dir=tmp_path,
+    )
+
+    assert stats.failed == 1
+    assert stats.labelled == 1
+    assert client.calls == 2
+    assert con.execute(
+        "SELECT outcome, error_category FROM llm_usage ORDER BY created_at, usage_id"
+    ).fetchall() == [("failed", "schema"), ("ok", None)]
+
+
+def test_cache_only_replay_never_constructs_a_default_client(
+    label_fixture, tmp_path, monkeypatch,
+):
+    con, vectors, cluster_run, signals_run = label_fixture
+    key = label_mod.input_hash("v1", "claude-opus-5", [1, 2])
+    label_mod.write_cache(tmp_path, key, complete_label())
+
+    def fail_construction():
+        raise AssertionError("cache-only replay must not construct a provider client")
+
+    monkeypatch.setattr(llm_run, "AnthropicModelClient", fail_construction)
+
+    stats = llm_run.run(
+        con, cluster_run, signals_run, control_n=0, limit=1,
+        embed_model="m", vectors=vectors, cache_dir=tmp_path,
+    )
+
+    assert stats.cached == 1
+    assert stats.labelled == 1
 
 
 def test_label_phase_passes_its_run_id_to_the_typed_runner(monkeypatch):

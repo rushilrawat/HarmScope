@@ -209,8 +209,6 @@ def run(con, cluster_run: str, signals_run: str, control_n: int, limit: int | No
     if vectors is None:
         memmap = PATHS.artifacts / f"embeddings.{embed_model.split('/')[-1]}.npy"
         vectors = np.load(memmap, mmap_mode="r")
-    if client is None:
-        client = AnthropicModelClient()
     cache = cache_dir or PATHS.llm_cache
 
     targets, n_fired, n_control = population(con, cluster_run, signals_run, control_n)
@@ -236,6 +234,8 @@ def run(con, cluster_run: str, signals_run: str, control_n: int, limit: int | No
 
         payload = label_mod.cached(cache, key)
         if payload is None:
+            if client is None:
+                client = AnthropicModelClient()
             if not preflight_done:
                 try:
                     client.preflight(CONFIG.llm.model)

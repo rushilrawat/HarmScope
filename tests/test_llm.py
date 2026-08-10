@@ -160,7 +160,7 @@ def test_corrupt_cache_is_quarantined(tmp_path):
     assert len(list(tmp_path.glob("broken.json.corrupt-*"))) == 1
 
 
-def test_label_validation_rejects_missing_or_extra_fields():
+def test_label_validation_rejects_missing_or_extra_fields(tmp_path):
     missing = complete_label()
     missing.pop("confidence")
     with pytest.raises(label_mod.LabelSchemaError, match="confidence"):
@@ -169,6 +169,9 @@ def test_label_validation_rejects_missing_or_extra_fields():
     extra = complete_label() | {"extra": True}
     with pytest.raises(label_mod.LabelSchemaError, match="extra"):
         label_mod.validate_label(extra)
+
+    with pytest.raises(label_mod.LabelSchemaError, match="object"):
+        label_mod.write_cache(tmp_path, "scalar", None)
 
 
 # --- output contract --------------------------------------------------------
