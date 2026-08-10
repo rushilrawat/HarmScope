@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import date
+from hashlib import sha256
 
 import pytest
 
 from src.llm import answer
+from src.llm.client import ModelCallError, ModelCallResult, TokenUsage
 from src.llm.retrieve import RetrievedEvidence
 
 
@@ -37,7 +39,14 @@ def evidence(
 def enforcement_context(
     action_id: str = "a1", *, harm_summary: str = "Public action summary."
 ) -> answer.EnforcementContext:
-    return answer.EnforcementContext(action_id=action_id, harm_summary=harm_summary)
+    return answer.EnforcementContext(
+        action_id=action_id,
+        filed_date=date(2021, 2, 3),
+        company_id="scope-company",
+        product_family="mortgage",
+        harm_summary=harm_summary,
+        source_url="https://example.test/action",
+    )
 
 
 def answer_payload(**changes: object) -> dict[str, object]:
@@ -58,6 +67,50 @@ def answer_payload(**changes: object) -> dict[str, object]:
 
 def grounded_answer(**changes: object) -> answer.GroundedAnswer:
     return answer.validate_answer(answer_payload(**changes), {10, 20})
+
+
+def model_result(payload: dict[str, object] | None = None) -> ModelCallResult:
+    return ModelCallResult(
+        payload=answer_payload() if payload is None else payload,
+        model="answer-model",
+        stop_reason="end_turn",
+        usage=TokenUsage(
+            input_tokens=12,
+            output_tokens=4,
+            cache_read_input_tokens=3,
+            cache_creation_input_tokens=2,
+        ),
+        attempts=2,
+        latency_seconds=0.25,
+        estimated_cost_usd=0.00016,
+    )
+
+
+class FakeRetriever:
+    def __init__(self, rows):
+        self.rows = rows
+        self.arguments = []
+
+    def __call__(self, *args):
+        self.arguments.append(args)
+        return self.rows
+
+
+class FakeModelClient:
+    def __init__(self, outcomes):
+        self.outcomes = iter(outcomes)
+        self.preflight_models = []
+        self.call_arguments = []
+
+    def preflight(self, model):
+        self.preflight_models.append(model)
+
+    def call_json(self, **kwargs):
+        self.call_arguments.append(kwargs)
+        outcome = next(self.outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
 @pytest.fixture
@@ -269,7 +322,14 @@ def test_prompt_marks_enforcement_as_context_not_citation_evidence():
     data = json.loads(prompt.partition("\n")[2])
 
     assert data["enforcement_context"] == [
-        {"action_id": "action-7", "harm_summary": "Agency summary."}
+        {
+            "action_id": "action-7",
+            "filed_date": "2021-02-03",
+            "company_id": "scope-company",
+            "product_family": "mortgage",
+            "harm_summary": "Agency summary.",
+            "source_url": "https://example.test/action",
+        }
     ]
     assert "must not be used as complaint citations" in prompt
 
@@ -388,3 +448,717 @@ def test_cached_answer_deletes_mismatched_citations(answer_fixture):
 
     assert answer.load_cached_answer(con, *args) is None
     assert con.execute("SELECT count(*) FROM rag_answers").fetchone() == (0,)
+
+
+def test_load_enforcement_context_is_scoped_usable_ordered_and_limited(answer_fixture):
+    con, _, _ = answer_fixture
+    rows = [
+        ("same-b", date(2022, 1, 2), "company-1", None, "Null-family context", None, True),
+        (
+            "same-a",
+            date(2022, 1, 2),
+            "company-1",
+            "mortgage",
+            "Mortgage context",
+            "https://example.test/same-a",
+            True,
+        ),
+        ("older", date(2021, 1, 1), "company-1", "mortgage", "Older", None, True),
+        ("wrong-company", date(2023, 1, 1), "company-2", "mortgage", "Other", None, True),
+        ("wrong-family", date(2023, 1, 1), "company-1", "card", "Other", None, True),
+        ("unusable", date(2024, 1, 1), "company-1", "mortgage", "Other", None, False),
+    ]
+    con.executemany(
+        "INSERT INTO enforcement_actions "
+        "(action_id, filed_date, company_id, product_family, harm_summary, source_url, usable) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+
+    got = answer.load_enforcement_context(con, "company-1", "mortgage", limit=2)
+
+    assert got == [
+        answer.EnforcementContext(
+            action_id="same-a",
+            filed_date=date(2022, 1, 2),
+            company_id="company-1",
+            product_family="mortgage",
+            harm_summary="Mortgage context",
+            source_url="https://example.test/same-a",
+        ),
+        answer.EnforcementContext(
+            action_id="same-b",
+            filed_date=date(2022, 1, 2),
+            company_id="company-1",
+            product_family=None,
+            harm_summary="Null-family context",
+            source_url=None,
+        ),
+    ]
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_load_enforcement_context_requires_a_positive_integer_limit(answer_fixture, limit):
+    con, _, _ = answer_fixture
+
+    with pytest.raises(ValueError, match="positive integer"):
+        answer.load_enforcement_context(con, "company-1", "mortgage", limit=limit)
+
+
+def test_empty_retrieval_abstains_and_records_usage_without_a_provider(
+    answer_fixture,
+    monkeypatch,
+):
+    con, cluster_id, _ = answer_fixture
+
+    def fail_construction():
+        raise AssertionError("empty retrieval must not construct a provider client")
+
+    monkeypatch.setattr(answer, "AnthropicModelClient", fail_construction, raising=False)
+
+    got = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question with no evidence",
+        "embed-only-model",
+        run_id="evaluation-run",
+        retriever=FakeRetriever([]),
+    )
+
+    assert got == answer.AnswerResult(
+        answer=answer.GroundedAnswer(
+            answer="",
+            claims=(),
+            insufficient_evidence=True,
+            limitations=("No relevant complaint evidence was retrieved.",),
+        ),
+        evidence=(),
+        enforcement_context=(),
+        cached=False,
+        usage=TokenUsage(),
+        latency_seconds=0.0,
+        estimated_cost_usd=0.0,
+    )
+    assert con.execute(
+        "SELECT run_id, operation, cache_status, attempts, input_tokens, "
+        "output_tokens, latency_seconds, estimated_cost_usd, outcome, error_category "
+        "FROM llm_usage"
+    ).fetchone() == (
+        "evaluation-run",
+        "answer",
+        "bypass",
+        0,
+        0,
+        0,
+        0.0,
+        0.0,
+        "skipped",
+        None,
+    )
+
+
+def test_answer_question_uses_config_answer_identity_and_caches_exact_replay(
+    answer_fixture,
+    monkeypatch,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+    configured = replace(
+        answer.CONFIG,
+        llm=replace(answer.CONFIG.llm, model="answer-model", prompt_version="answer-v9"),
+    )
+    monkeypatch.setattr(answer, "CONFIG", configured)
+    retriever = FakeRetriever(evidence_rows)
+    client = FakeModelClient([model_result()])
+
+    first = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "  Why   delayed? ",
+        "embed-only-model",
+        run_id="evaluation-run",
+        model_client=client,
+        retriever=retriever,
+    )
+    second = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "why delayed?",
+        "embed-only-model",
+        run_id="evaluation-run",
+        model_client=client,
+        retriever=retriever,
+    )
+
+    assert first.cached is False
+    assert first.usage == TokenUsage(12, 4, 3, 2)
+    assert first.latency_seconds == pytest.approx(0.25)
+    assert first.estimated_cost_usd == pytest.approx(0.00016)
+    assert second.cached is True
+    assert second.usage == TokenUsage()
+    assert tuple(row.complaint_id for row in second.evidence) == (10, 20)
+    assert client.preflight_models == ["answer-model"]
+    assert len(client.call_arguments) == 1
+    assert client.call_arguments[0]["model"] == "answer-model"
+    assert client.call_arguments[0]["max_tokens"] == 2000
+    assert client.call_arguments[0]["schema"] is answer.ANSWER_SCHEMA
+    assert [call[4] for call in retriever.arguments] == [
+        "embed-only-model",
+        "embed-only-model",
+    ]
+    assert con.execute("SELECT count(*) FROM rag_answers").fetchone() == (1,)
+
+    expected_question_hash = sha256(b"why delayed?").hexdigest()
+    expected_evidence_hash = sha256(b"[10,20]").hexdigest()
+    identity = json.dumps(
+        {
+            "cluster_id": cluster_id,
+            "company_id": "company-1",
+            "evidence_hash": expected_evidence_hash,
+            "model": "answer-model",
+            "prompt_version": "answer-v9",
+            "question_hash": expected_question_hash,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected_input_hash = sha256(identity.encode()).hexdigest()
+    assert con.execute(
+        "SELECT question_hash, model, prompt_version, input_hash, cache_status, "
+        "attempts, input_tokens, output_tokens, cache_read_input_tokens, "
+        "cache_creation_input_tokens, outcome FROM llm_usage ORDER BY created_at, usage_id"
+    ).fetchall() == [
+        (
+            expected_question_hash,
+            "answer-model",
+            "answer-v9",
+            expected_input_hash,
+            "miss",
+            2,
+            12,
+            4,
+            3,
+            2,
+            "ok",
+        ),
+        (
+            expected_question_hash,
+            "answer-model",
+            "answer-v9",
+            expected_input_hash,
+            "hit",
+            0,
+            0,
+            0,
+            0,
+            0,
+            "ok",
+        ),
+    ]
+
+
+def test_cache_hit_never_constructs_preflights_or_calls_a_default_provider(
+    answer_fixture,
+    monkeypatch,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+    answer.write_cached_answer(
+        con,
+        "Question",
+        cluster_id,
+        "company-1",
+        answer.CONFIG.llm.model,
+        answer.CONFIG.llm.prompt_version,
+        evidence_rows,
+        grounded_answer(),
+    )
+
+    def fail_construction():
+        raise AssertionError("cache hit must not construct a provider client")
+
+    monkeypatch.setattr(answer, "AnthropicModelClient", fail_construction, raising=False)
+
+    got = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question",
+        "embed-model",
+        retriever=FakeRetriever(evidence_rows),
+    )
+
+    assert got.cached is True
+    assert con.execute("SELECT cache_status, outcome FROM llm_usage").fetchone() == (
+        "hit",
+        "ok",
+    )
+
+
+def test_default_provider_is_constructed_only_for_a_cache_miss(answer_fixture, monkeypatch):
+    con, cluster_id, evidence_rows = answer_fixture
+    client = FakeModelClient([model_result()])
+    constructions = []
+
+    def construct_client():
+        constructions.append(None)
+        return client
+
+    monkeypatch.setattr(answer, "AnthropicModelClient", construct_client, raising=False)
+
+    got = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question",
+        "embed-model",
+        retriever=FakeRetriever(evidence_rows),
+    )
+
+    assert got.cached is False
+    assert constructions == [None]
+    assert client.preflight_models == [answer.CONFIG.llm.model]
+    assert len(client.call_arguments) == 1
+
+
+@pytest.mark.parametrize(
+    ("payload", "exception_type", "category"),
+    [
+        (
+            answer_payload(claims=[{"text": "Unsupported.", "complaint_ids": [999]}]),
+            answer.CitationError,
+            "citation",
+        ),
+        ({"answer": "wrong shape"}, answer.AnswerSchemaError, "schema"),
+    ],
+)
+def test_invalid_paid_model_answer_records_usage_without_caching(
+    answer_fixture,
+    payload,
+    exception_type,
+    category,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+    client = FakeModelClient([model_result(payload)])
+
+    with pytest.raises(exception_type):
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            model_client=client,
+            retriever=FakeRetriever(evidence_rows),
+        )
+
+    assert con.execute("SELECT count(*) FROM rag_answers").fetchone() == (0,)
+    assert con.execute(
+        "SELECT cache_status, attempts, input_tokens, output_tokens, "
+        "cache_read_input_tokens, cache_creation_input_tokens, latency_seconds, "
+        "estimated_cost_usd, outcome, error_category FROM llm_usage"
+    ).fetchone() == (
+        "miss",
+        2,
+        12,
+        4,
+        3,
+        2,
+        0.25,
+        0.00016,
+        "failed",
+        category,
+    )
+
+
+@pytest.mark.parametrize(
+    "provider_error",
+    [
+        ModelCallError("billing", 1, False, latency_seconds=0.1),
+        ModelCallError("transient", 4, True, latency_seconds=3.5),
+        ModelCallError(
+            "malformed_response",
+            1,
+            False,
+            usage=TokenUsage(21, 8, 5, 3),
+            latency_seconds=0.75,
+            estimated_cost_usd=0.002,
+            response_received=True,
+        ),
+    ],
+    ids=["terminal", "retry-exhausted", "paid-post-response"],
+)
+def test_model_call_error_is_recorded_once_with_terminal_accounting(
+    answer_fixture,
+    provider_error,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+    client = FakeModelClient([provider_error])
+
+    with pytest.raises(ModelCallError) as caught:
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            model_client=client,
+            retriever=FakeRetriever(evidence_rows),
+        )
+
+    assert caught.value is provider_error
+    assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (1,)
+    assert con.execute(
+        "SELECT attempts, input_tokens, output_tokens, cache_read_input_tokens, "
+        "cache_creation_input_tokens, latency_seconds, estimated_cost_usd, "
+        "outcome, error_category FROM llm_usage"
+    ).fetchone() == (
+        provider_error.attempts,
+        provider_error.usage.input_tokens,
+        provider_error.usage.output_tokens,
+        provider_error.usage.cache_read_input_tokens,
+        provider_error.usage.cache_creation_input_tokens,
+        provider_error.latency_seconds,
+        provider_error.estimated_cost_usd,
+        "failed",
+        provider_error.category,
+    )
+
+
+def test_preflight_error_is_recorded_without_calling_the_provider(answer_fixture):
+    con, cluster_id, evidence_rows = answer_fixture
+    error = ModelCallError("authentication", 1, False, latency_seconds=0.2)
+    client = FakeModelClient([])
+
+    def fail_preflight(model):
+        client.preflight_models.append(model)
+        raise error
+
+    client.preflight = fail_preflight
+
+    with pytest.raises(ModelCallError) as caught:
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            model_client=client,
+            retriever=FakeRetriever(evidence_rows),
+        )
+
+    assert caught.value is error
+    assert client.call_arguments == []
+    assert con.execute("SELECT attempts, outcome, error_category FROM llm_usage").fetchone() == (
+        1,
+        "failed",
+        "authentication",
+    )
+
+
+def test_enforcement_context_is_optional_and_passed_as_context_only(answer_fixture):
+    con, cluster_id, evidence_rows = answer_fixture
+    con.execute(
+        "INSERT INTO enforcement_actions "
+        "(action_id, filed_date, company_id, product_family, harm_summary, source_url, usable) "
+        "VALUES ('action-1', '2021-02-03', 'company-1', 'mortgage', "
+        "'Agency summary', 'https://example.test/action-1', true)"
+    )
+    client = FakeModelClient([model_result(), model_result()])
+
+    without_context = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question one",
+        "embed-model",
+        model_client=client,
+        retriever=FakeRetriever(evidence_rows),
+    )
+    with_context = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question two",
+        "embed-model",
+        include_enforcement_context=True,
+        model_client=client,
+        retriever=FakeRetriever(evidence_rows),
+    )
+
+    assert without_context.enforcement_context == ()
+    assert [row.action_id for row in with_context.enforcement_context] == ["action-1"]
+    first_prompt = json.loads(client.call_arguments[0]["prompt"].partition("\n")[2])
+    second_prompt = json.loads(client.call_arguments[1]["prompt"].partition("\n")[2])
+    assert first_prompt["enforcement_context"] == []
+    assert second_prompt["enforcement_context"][0]["action_id"] == "action-1"
+    assert second_prompt["enforcement_context"][0]["harm_summary"] == "Agency summary"
+
+
+def test_effective_prompt_version_hashes_every_ordered_context_field():
+    context = [
+        enforcement_context("action-7", harm_summary="Agency summary."),
+        enforcement_context("action-8", harm_summary="Second summary."),
+    ]
+    payload = json.dumps(
+        {
+            "include_enforcement_context": True,
+            "enforcement_context": [
+                {
+                    "action_id": "action-7",
+                    "filed_date": "2021-02-03",
+                    "company_id": "scope-company",
+                    "product_family": "mortgage",
+                    "harm_summary": "Agency summary.",
+                    "source_url": "https://example.test/action",
+                },
+                {
+                    "action_id": "action-8",
+                    "filed_date": "2021-02-03",
+                    "company_id": "scope-company",
+                    "product_family": "mortgage",
+                    "harm_summary": "Second summary.",
+                    "source_url": "https://example.test/action",
+                },
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    expected = f"v1+enforcement-{sha256(payload.encode()).hexdigest()}"
+
+    assert answer.effective_prompt_version("v1", False, []) == "v1"
+    assert answer.effective_prompt_version("v1", True, context) == expected
+    assert answer.effective_prompt_version("v1", True, list(reversed(context))) != expected
+
+
+@pytest.mark.parametrize(
+    ("first_include", "second_include"),
+    [(False, True), (True, False)],
+    ids=["off-to-on", "on-to-off"],
+)
+def test_enforcement_mode_change_is_an_exact_cache_miss(
+    answer_fixture,
+    first_include,
+    second_include,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+    con.execute(
+        "INSERT INTO enforcement_actions "
+        "(action_id, filed_date, company_id, product_family, harm_summary, usable) "
+        "VALUES ('action-1', '2021-02-03', 'company-1', 'mortgage', 'Agency summary', true)"
+    )
+    client = FakeModelClient([model_result(), model_result()])
+    retriever = FakeRetriever(evidence_rows)
+
+    first = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question",
+        "embed-model",
+        include_enforcement_context=first_include,
+        model_client=client,
+        retriever=retriever,
+    )
+    second = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question",
+        "embed-model",
+        include_enforcement_context=second_include,
+        model_client=client,
+        retriever=retriever,
+    )
+
+    assert first.cached is False
+    assert second.cached is False
+    assert len(client.call_arguments) == 2
+    assert con.execute("SELECT count(*) FROM rag_answers").fetchone() == (2,)
+    versions = con.execute(
+        "SELECT DISTINCT prompt_version FROM rag_answers ORDER BY prompt_version"
+    ).fetchall()
+    assert (answer.CONFIG.llm.prompt_version,) in versions
+    assert any(
+        version.startswith(f"{answer.CONFIG.llm.prompt_version}+enforcement-")
+        for (version,) in versions
+    )
+
+
+def test_unchanged_enforcement_context_has_a_stable_cache_hit(answer_fixture):
+    con, cluster_id, evidence_rows = answer_fixture
+    con.execute(
+        "INSERT INTO enforcement_actions "
+        "(action_id, filed_date, company_id, product_family, harm_summary, usable) "
+        "VALUES ('action-1', '2021-02-03', 'company-1', NULL, 'Agency summary', true)"
+    )
+    client = FakeModelClient([model_result()])
+    retriever = FakeRetriever(evidence_rows)
+
+    first = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question",
+        "embed-model",
+        include_enforcement_context=True,
+        model_client=client,
+        retriever=retriever,
+    )
+    second = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "question",
+        "embed-model",
+        include_enforcement_context=True,
+        model_client=client,
+        retriever=retriever,
+    )
+
+    assert first.cached is False
+    assert second.cached is True
+    assert [row.action_id for row in second.enforcement_context] == ["action-1"]
+    assert len(client.call_arguments) == 1
+    assert con.execute(
+        "SELECT cache_status FROM llm_usage ORDER BY created_at, usage_id"
+    ).fetchall() == [("miss",), ("hit",)]
+
+
+def test_changed_enforcement_context_invalidates_the_cache(answer_fixture):
+    con, cluster_id, evidence_rows = answer_fixture
+    con.execute(
+        "INSERT INTO enforcement_actions "
+        "(action_id, filed_date, company_id, product_family, harm_summary, source_url, usable) "
+        "VALUES ('action-1', '2021-02-03', 'company-1', 'mortgage', 'First summary', "
+        "'https://example.test/first', true)"
+    )
+    client = FakeModelClient([model_result(), model_result()])
+    retriever = FakeRetriever(evidence_rows)
+
+    first = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question",
+        "embed-model",
+        include_enforcement_context=True,
+        model_client=client,
+        retriever=retriever,
+    )
+    con.execute(
+        "UPDATE enforcement_actions SET harm_summary = 'Changed summary', "
+        "source_url = 'https://example.test/changed' WHERE action_id = 'action-1'"
+    )
+    second = answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        "Question",
+        "embed-model",
+        include_enforcement_context=True,
+        model_client=client,
+        retriever=retriever,
+    )
+
+    assert first.cached is False
+    assert second.cached is False
+    assert len(client.call_arguments) == 2
+    assert con.execute("SELECT count(DISTINCT prompt_version) FROM rag_answers").fetchone() == (2,)
+
+
+@pytest.mark.parametrize(
+    "bad_rows",
+    [
+        [object()],
+        (evidence(10),),
+        [evidence(True)],
+        [evidence(10), evidence(10)],
+    ],
+    ids=["wrong-row-type", "wrong-container-type", "boolean-id", "duplicate-id"],
+)
+def test_retriever_output_is_validated_before_provider_or_hashing(
+    answer_fixture,
+    monkeypatch,
+    bad_rows,
+):
+    con, cluster_id, _ = answer_fixture
+
+    def fail_hash(_rows):
+        raise AssertionError("invalid evidence must be rejected before hashing")
+
+    monkeypatch.setattr(answer, "evidence_hash", fail_hash)
+
+    with pytest.raises((TypeError, ValueError)):
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            model_client=FakeModelClient([]),
+            retriever=FakeRetriever(bad_rows),
+        )
+
+    assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (0,)
+
+
+def test_successful_answer_and_usage_rollback_together_on_database_failure(
+    answer_fixture,
+    monkeypatch,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+    client = FakeModelClient([model_result()])
+
+    def fail_usage(*_args, **_kwargs):
+        raise RuntimeError("usage insert failed")
+
+    monkeypatch.setattr(answer, "_record_usage", fail_usage, raising=False)
+
+    with pytest.raises(RuntimeError, match="usage insert failed"):
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            model_client=client,
+            retriever=FakeRetriever(evidence_rows),
+        )
+
+    assert con.execute("SELECT count(*) FROM rag_answers").fetchone() == (0,)
+    assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (0,)
+
+
+def test_usage_rows_contain_no_question_prompt_response_or_narrative_content(answer_fixture):
+    con, cluster_id, _ = answer_fixture
+    question = "PRIVATE QUESTION SENTINEL"
+    narrative = "PRIVATE NARRATIVE SENTINEL"
+    response = "PRIVATE RESPONSE SENTINEL"
+    evidence_rows = [
+        evidence(
+            10,
+            text_redacted=narrative,
+            company_public_response="PRIVATE COMPANY RESPONSE SENTINEL",
+        )
+    ]
+    payload = answer_payload(answer=response, claims=[{"text": response, "complaint_ids": [10]}])
+
+    answer.answer_question(
+        con,
+        cluster_id,
+        "company-1",
+        question,
+        "embed-model",
+        model_client=FakeModelClient([model_result(payload)]),
+        retriever=FakeRetriever(evidence_rows),
+    )
+
+    columns = [row[1] for row in con.execute("PRAGMA table_info('llm_usage')").fetchall()]
+    assert not {"question", "prompt", "response", "narrative"} & set(columns)
+    stored_values = con.execute("SELECT * FROM llm_usage").fetchone()
+    serialized = "|".join("" if value is None else str(value) for value in stored_values)
+    for sentinel in (question, narrative, response, "PRIVATE COMPANY RESPONSE SENTINEL"):
+        assert sentinel not in serialized
