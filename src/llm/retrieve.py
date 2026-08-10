@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date
 
 import duckdb
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,13 @@ class ScopedCorpus:
     company_id: str | None
     embed_model: str
     rows: tuple[EvidenceRecord, ...]
+
+
+@dataclass(frozen=True)
+class RankedHit:
+    complaint_id: int
+    rank: int
+    score: float
 
 
 def load_corpus(
@@ -110,3 +118,76 @@ def membership_hash(corpus: ScopedCorpus, tokenizer_version: str) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def encode_query(encoder, question: str) -> np.ndarray:
+    """Encode one question as a unit vector in the evidence vector space."""
+    encoded = encoder.encode(
+        [question],
+        convert_to_numpy=True,
+        normalize_embeddings=False,
+        show_progress_bar=False,
+    )
+    query_vector = np.ascontiguousarray(np.asarray(encoded, dtype=np.float32))
+    if query_vector.ndim != 2 or query_vector.shape[0] != 1 or query_vector.shape[1] == 0:
+        raise ValueError("encoder must return one query vector with shape (1, dim)")
+    if not np.isfinite(query_vector).all():
+        raise ValueError("query vector contains non-finite values")
+
+    norm = float(np.linalg.norm(query_vector))
+    if not np.isfinite(norm) or norm == 0.0:
+        raise ValueError("query vector has zero norm")
+    return np.ascontiguousarray(query_vector / norm, dtype=np.float32)
+
+
+def dense_rank(
+    corpus: ScopedCorpus,
+    vectors: np.ndarray,
+    query_vector: np.ndarray,
+    limit: int,
+) -> list[RankedHit]:
+    """Rank only the requested evidence scope with exact FAISS inner products."""
+    import faiss
+
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if not corpus.rows:
+        raise ValueError("cannot rank an empty scoped corpus")
+
+    all_vectors = np.asarray(vectors, dtype=np.float32)
+    if all_vectors.ndim != 2 or all_vectors.shape[0] == 0 or all_vectors.shape[1] == 0:
+        raise ValueError("vectors must have shape (n, dim)")
+
+    row_indices = [row.row_idx for row in corpus.rows]
+    if any(row_idx < 0 or row_idx >= all_vectors.shape[0] for row_idx in row_indices):
+        raise ValueError("scoped corpus row_idx is outside the embedding matrix")
+    matrix = np.ascontiguousarray(all_vectors[row_indices], dtype=np.float32)
+    if not np.isfinite(matrix).all():
+        raise ValueError("scoped embedding matrix contains non-finite values")
+    if np.any(np.linalg.norm(matrix, axis=1) == 0.0):
+        raise ValueError("scoped embedding matrix contains a zero norm vector")
+
+    query = np.ascontiguousarray(np.asarray(query_vector, dtype=np.float32))
+    if query.ndim != 2 or query.shape[0] != 1:
+        raise ValueError("query vector must have shape (1, dim)")
+    if query.shape[1] != matrix.shape[1]:
+        raise ValueError("query vector dimension must match embedding dimension")
+    if not np.isfinite(query).all():
+        raise ValueError("query vector contains non-finite values")
+    if float(np.linalg.norm(query)) == 0.0:
+        raise ValueError("query vector has zero norm")
+
+    index = faiss.IndexFlatIP(matrix.shape[1])
+    index.add(matrix)
+    scores, positions = index.search(query, len(corpus.rows))
+    pairs = [
+        (corpus.rows[int(position)].complaint_id, float(score))
+        for position, score in zip(positions[0], scores[0], strict=True)
+        if position >= 0
+    ]
+    pairs.sort(key=lambda item: (-item[1], item[0]))
+    ranked = [
+        RankedHit(complaint_id=complaint_id, rank=rank, score=score)
+        for rank, (complaint_id, score) in enumerate(pairs, start=1)
+    ]
+    return ranked[:limit]
