@@ -113,6 +113,40 @@ class VerificationReport:
     def mechanism_ci_high(self) -> float:
         return self.overall.mechanism.ci_high
 
+    def render(self) -> str:
+        """Render denominator-bearing human-review metrics for the pipeline CLI."""
+        def rate(name: str, value: Rate) -> str:
+            return (
+                f"  {name:<24} {value.successes}/{value.total} "
+                f"({value.rate:.1%}; Wilson {value.ci_low:.1%}..{value.ci_high:.1%})"
+            )
+
+        def metrics(title: str, value: VerificationMetrics) -> list[str]:
+            return [
+                title,
+                rate("mechanism", value.mechanism),
+                rate("mechanism (lenient)", value.mechanism_lenient),
+                rate("taxonomy distinctness", value.taxonomy_distinctness),
+                rate("template", value.template),
+            ]
+
+        lines = metrics("human label verification", self.overall)
+        lines.append("fired/control breakdown")
+        for status in ("fired", "control"):
+            lines.extend(metrics(f"  {status}", self.by_fired_status[status]))
+        lines.append("confidence breakdown")
+        for confidence, value in self.by_confidence.items():
+            lines.extend(metrics(f"  {confidence}", value))
+        lines.append("failure categories")
+        if self.failure_categories:
+            lines.extend(
+                f"  {category:<24} {count}"
+                for category, count in self.failure_categories.items()
+            )
+        else:
+            lines.append("  (none recorded)")
+        return "\n".join(lines)
+
 
 @dataclass(frozen=True)
 class _Candidate:

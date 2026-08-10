@@ -13,6 +13,8 @@ a dispatch table is exactly how that trap gets sprung.
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -1290,10 +1292,18 @@ def phase_label(args: argparse.Namespace) -> int:
                             args.limit, model, run_id=r.run_id)
         r.finish(output_rows=stats.labelled)
 
-    print(f"\nlabelled   : {stats.labelled:,}  "
-          f"(cache hits {stats.cached:,}, refused {stats.refused:,}, "
-          f"no narratives {stats.skipped:,})")
-    print("  next: `pipeline verify --n 50` for the LLM_LAYER §2.5 read")
+    print(f"\nlabelled       : {stats.labelled:,}")
+    print(f"cache hits     : {stats.cached:,}")
+    print(f"refused        : {stats.refused:,}")
+    print(f"failed         : {stats.failed:,}")
+    print(f"skipped        : {stats.skipped:,} (no narratives)")
+    print(f"input tokens   : {stats.input_tokens:,}")
+    print(f"output tokens  : {stats.output_tokens:,}")
+    print(f"latency        : {stats.latency_seconds:.2f} s")
+    print(f"estimated cost : ${stats.estimated_cost_usd:.6f} "
+          "(estimated, not invoice)")
+    print("  next: `label-verify export --n 50 --output PATH` for the "
+          "LLM_LAYER §2.5 human read")
     return 0
 
 
@@ -1906,7 +1916,57 @@ def cmd_runs(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _worklist_version(cluster_ids: list[str]) -> str:
+    """Fingerprint a review population and the label version it evaluates."""
+    material = "\n".join([
+        CONFIG.llm.model,
+        CONFIG.llm.prompt_version,
+        *cluster_ids,
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _exported_worklist_version(path: Path) -> str:
+    """Derive the record default from exactly the IDs written for review."""
+    with path.open(newline="", encoding="utf-8") as handle:
+        cluster_ids = [
+            row["cluster_id"].strip()
+            for row in csv.DictReader(handle)
+        ]
+    return _worklist_version(cluster_ids)
+
+
+def cmd_label_verify(args: argparse.Namespace) -> int:
+    """Export, ingest, and report the blinded human label-review workflow."""
+    from src.llm import verify
+
+    con = db.bootstrap()
+    if args.verify_action == "export":
+        signals_run = args.signals_run or latest_run(con, "signals")
+        path = verify.export_worklist(
+            con, signals_run, args.n, CONFIG.llm.verification_seed, Path(args.output),
+        )
+        print(f"worklist  : {path}")
+        print(f"version   : {_exported_worklist_version(path)}")
+        return 0
+    if args.verify_action == "record":
+        signals_run = args.signals_run or latest_run(con, "signals")
+        # This CLI is the human-review ingestion path. Model-origin reviews
+        # remain available to callers of src.llm.verify, never as CLI input.
+        rows = verify.parse_worklist(
+            Path(args.input), args.reviewer, reviewer_origin="human",
+        )
+        version = args.worklist_version or _worklist_version(
+            [row.cluster_id for row in rows]
+        )
+        print(f"recorded  : {verify.record(con, rows, signals_run, version)}")
+        print(f"version   : {version}")
+        return 0
+    print(verify.report(con, args.worklist_version).render())
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="harmscope", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2010,10 +2070,34 @@ def main(argv: list[str] | None = None) -> int:
     p_tax = sub.add_parser("taxonomy", help="label vocabulary by volume")
     p_tax.set_defaults(func=cmd_taxonomy)
 
+    p_verify = sub.add_parser(
+        "label-verify", help="export, ingest, or report blinded human label review",
+    )
+    verify_sub = p_verify.add_subparsers(dest="verify_action", required=True)
+    p_verify_export = verify_sub.add_parser("export", help="write a blinded worklist")
+    p_verify_export.add_argument("--n", type=int, default=CONFIG.llm.human_verify_n)
+    p_verify_export.add_argument("--output", required=True)
+    p_verify_export.add_argument("--signals-run")
+    p_verify_export.set_defaults(func=cmd_label_verify)
+    p_verify_record = verify_sub.add_parser("record", help="ingest completed human review")
+    p_verify_record.add_argument("--input", required=True)
+    p_verify_record.add_argument("--reviewer", required=True)
+    p_verify_record.add_argument("--signals-run")
+    p_verify_record.add_argument("--worklist-version")
+    p_verify_record.set_defaults(func=cmd_label_verify)
+    p_verify_report = verify_sub.add_parser("report", help="show human-review agreement")
+    p_verify_report.add_argument("--worklist-version")
+    p_verify_report.set_defaults(func=cmd_label_verify)
+
     p_runs = sub.add_parser("runs", help="show the run registry")
     p_runs.add_argument("-n", type=int, default=20)
     p_runs.set_defaults(func=cmd_runs)
 
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
 

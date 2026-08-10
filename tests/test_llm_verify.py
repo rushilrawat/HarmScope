@@ -272,6 +272,17 @@ def test_report_has_denominators_and_wilson_intervals(verification_fixture):
     assert report.by_confidence["high"].mechanism.total > 0
 
 
+def test_report_render_exposes_human_rates_and_breakdowns(verification_fixture):
+    """The CLI report must retain its denominator and hidden-strata context."""
+    con, signals_run = verification_fixture
+    verify.record(con, _reviewed_rows(agree=39, total=50), signals_run, "wl-v1")
+
+    rendered = verify.report(con, "wl-v1").render().lower()
+
+    for term in ("39/50", "78.0%", "wilson", "fired", "control", "confidence"):
+        assert term in rendered
+
+
 def test_model_origin_reviews_do_not_count_as_human_verification(verification_fixture):
     """Stored model reviews remain auditable but cannot satisfy the human gate."""
     con, signals_run = verification_fixture
