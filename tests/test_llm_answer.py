@@ -17,22 +17,29 @@ from src.llm.retrieve import RetrievedEvidence
 def evidence(
     complaint_id: int = 10,
     *,
+    company_id: str = "scope-company",
+    product_family: str = "mortgage",
     text_redacted: str = "Consumers describe a delayed refund.",
     company_public_response: str | None = None,
+    dense_rank: int | None = 1,
+    dense_score: float | None = 0.9,
+    sparse_rank: int | None = 1,
+    sparse_score: float | None = 0.8,
+    fused_score: float = 0.1,
 ) -> RetrievedEvidence:
     return RetrievedEvidence(
         complaint_id=complaint_id,
         date_received=date(2020, 1, 2),
-        company_id="scope-company",
+        company_id=company_id,
         company_name="Scope Company",
-        product_family="mortgage",
+        product_family=product_family,
         text_redacted=text_redacted,
         company_public_response=company_public_response,
-        dense_rank=1,
-        dense_score=0.9,
-        sparse_rank=1,
-        sparse_score=0.8,
-        fused_score=0.1,
+        dense_rank=dense_rank,
+        dense_score=dense_score,
+        sparse_rank=sparse_rank,
+        sparse_score=sparse_score,
+        fused_score=fused_score,
     )
 
 
@@ -116,7 +123,22 @@ class FakeModelClient:
 @pytest.fixture
 def answer_fixture(seeded):
     con, _, cluster_id = seeded
-    return con, cluster_id, [evidence(10), evidence(20)]
+    return (
+        con,
+        cluster_id,
+        [
+            evidence(10, company_id="company-1"),
+            evidence(
+                20,
+                company_id="company-1",
+                dense_rank=2,
+                dense_score=0.7,
+                sparse_rank=2,
+                sparse_score=0.6,
+                fused_score=0.09,
+            ),
+        ],
+    )
 
 
 def test_answer_schema_is_closed_and_complete():
@@ -558,6 +580,52 @@ def test_empty_retrieval_abstains_and_records_usage_without_a_provider(
     )
 
 
+@pytest.mark.parametrize(
+    ("resolution", "expected_rows"),
+    [("COMMIT", [(1,)]), ("ROLLBACK", [])],
+    ids=["caller-commits", "caller-rolls-back"],
+)
+def test_answer_question_rejects_caller_transaction_before_side_effects(
+    answer_fixture,
+    monkeypatch,
+    resolution,
+    expected_rows,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+    con.execute("CREATE TABLE caller_work (value INTEGER)")
+    retriever = FakeRetriever(evidence_rows)
+    client = FakeModelClient([model_result()])
+    client_constructions = []
+
+    def construct_client():
+        client_constructions.append(None)
+        return client
+
+    monkeypatch.setattr(answer, "AnthropicModelClient", construct_client)
+    con.execute("BEGIN TRANSACTION")
+    con.execute("INSERT INTO caller_work VALUES (1)")
+
+    with pytest.raises(answer.AnswerTransactionError, match="autocommit"):
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            retriever=retriever,
+        )
+
+    assert con.execute("SELECT value FROM caller_work").fetchall() == [(1,)]
+    assert retriever.arguments == []
+    assert client_constructions == []
+    assert client.preflight_models == []
+    assert client.call_arguments == []
+    assert con.execute("SELECT count(*) FROM rag_answers").fetchone() == (0,)
+    assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (0,)
+    con.execute(resolution)
+    assert con.execute("SELECT value FROM caller_work").fetchall() == expected_rows
+
+
 def test_answer_question_uses_config_answer_identity_and_caches_exact_replay(
     answer_fixture,
     monkeypatch,
@@ -770,6 +838,44 @@ def test_invalid_paid_model_answer_records_usage_without_caching(
         "failed",
         category,
     )
+
+
+def test_provider_refusal_records_paid_usage_and_raises_typed_semantics(answer_fixture):
+    con, cluster_id, evidence_rows = answer_fixture
+    refusal = ModelCallResult(
+        payload={"refused": True, "stop_reason": "refusal"},
+        model="answer-model",
+        stop_reason="refusal",
+        usage=TokenUsage(
+            input_tokens=12,
+            output_tokens=4,
+            cache_read_input_tokens=3,
+            cache_creation_input_tokens=2,
+        ),
+        attempts=2,
+        latency_seconds=0.25,
+        estimated_cost_usd=0.00016,
+    )
+
+    with pytest.raises(answer.AnswerRefusalError) as caught:
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            model_client=FakeModelClient([refusal]),
+            retriever=FakeRetriever(evidence_rows),
+        )
+
+    assert caught.value.category == "refusal"
+    assert caught.value.result is refusal
+    assert con.execute("SELECT count(*) FROM rag_answers").fetchone() == (0,)
+    assert con.execute(
+        "SELECT cache_status, attempts, input_tokens, output_tokens, "
+        "cache_read_input_tokens, cache_creation_input_tokens, latency_seconds, "
+        "estimated_cost_usd, outcome, error_category FROM llm_usage"
+    ).fetchall() == [("miss", 2, 12, 4, 3, 2, 0.25, 0.00016, "refused", "refusal")]
 
 
 @pytest.mark.parametrize(
@@ -1105,6 +1211,86 @@ def test_retriever_output_is_validated_before_provider_or_hashing(
     assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (0,)
 
 
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("wrong-company", "company_id"),
+        ("oversize", "rag_top_k"),
+        ("unsorted", "sorted"),
+        ("wrong-family", "product_family"),
+        ("nonfinite-fused", "fused_score"),
+        ("nonfinite-component", "dense_score"),
+        ("invalid-rank", "dense_rank"),
+        ("rank-without-score", "dense_rank and dense_score"),
+        ("duplicate-rank", "dense_rank"),
+    ],
+)
+def test_out_of_contract_evidence_never_reaches_cache_or_provider(
+    answer_fixture,
+    monkeypatch,
+    case,
+    message,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+    monkeypatch.setattr(
+        answer,
+        "CONFIG",
+        replace(answer.CONFIG, llm=replace(answer.CONFIG.llm, rag_top_k=2)),
+    )
+    rows = list(evidence_rows)
+    if case == "wrong-company":
+        rows[0] = replace(rows[0], company_id="company-2")
+    elif case == "oversize":
+        rows.append(
+            evidence(
+                30,
+                company_id="company-1",
+                dense_rank=3,
+                dense_score=0.5,
+                sparse_rank=3,
+                sparse_score=0.4,
+                fused_score=0.08,
+            )
+        )
+    elif case == "unsorted":
+        rows.reverse()
+    elif case == "wrong-family":
+        rows[0] = replace(rows[0], product_family="card")
+    elif case == "nonfinite-fused":
+        rows[0] = replace(rows[0], fused_score=float("nan"))
+    elif case == "nonfinite-component":
+        rows[0] = replace(rows[0], dense_score=float("inf"))
+    elif case == "invalid-rank":
+        rows[0] = replace(rows[0], dense_rank=0)
+    elif case == "rank-without-score":
+        rows[0] = replace(rows[0], dense_score=None)
+    elif case == "duplicate-rank":
+        rows[1] = replace(rows[1], dense_rank=1)
+
+    def fail_cache(*_args, **_kwargs):
+        raise AssertionError("invalid evidence must be rejected before cache lookup")
+
+    monkeypatch.setattr(answer, "load_cached_answer", fail_cache)
+    retriever = FakeRetriever(rows)
+    client = FakeModelClient([])
+
+    with pytest.raises(ValueError, match=message):
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            model_client=client,
+            retriever=retriever,
+        )
+
+    assert client.preflight_models == []
+    assert client.call_arguments == []
+    assert con.execute("SELECT count(*) FROM rag_answers").fetchone() == (0,)
+    assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (0,)
+
+
 def test_successful_answer_and_usage_rollback_together_on_database_failure(
     answer_fixture,
     monkeypatch,
@@ -1140,6 +1326,7 @@ def test_usage_rows_contain_no_question_prompt_response_or_narrative_content(ans
     evidence_rows = [
         evidence(
             10,
+            company_id="company-1",
             text_redacted=narrative,
             company_public_response="PRIVATE COMPANY RESPONSE SENTINEL",
         )

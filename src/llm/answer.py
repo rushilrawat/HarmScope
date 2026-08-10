@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -122,6 +123,32 @@ class CitationError(AnswerSchemaError):
     """A claim's complaint citations are absent, malformed, or out of scope."""
 
 
+class AnswerTransactionError(RuntimeError):
+    """The caller did not provide the required autocommit connection state."""
+
+
+class AnswerRefusalError(RuntimeError):
+    """A paid provider response explicitly refused the answer request."""
+
+    category = "refusal"
+
+    def __init__(self, result: ModelCallResult) -> None:
+        super().__init__("provider refused the answer request")
+        self.result = result
+
+
+def _require_autocommit(con) -> None:
+    """Reject caller-owned transactions without changing or aborting their state.
+
+    DuckDB assigns a new transaction ID to each statement in autocommit mode,
+    while consecutive reads share one ID inside an explicit transaction.
+    """
+    first_id = con.execute("SELECT current_transaction_id()").fetchone()[0]
+    second_id = con.execute("SELECT current_transaction_id()").fetchone()[0]
+    if first_id == second_id:
+        raise AnswerTransactionError("answer_question requires an autocommit connection")
+
+
 def _require_exact_keys(payload: dict[object, object], expected: set[str], label: str) -> None:
     actual = set(payload)
     if actual != expected:
@@ -218,13 +245,85 @@ def question_hash(question: str) -> str:
     return hashlib.sha256(normalize_question(question).encode("utf-8")).hexdigest()
 
 
-def _validate_retrieved_evidence(value: object) -> list[RetrievedEvidence]:
+def _require_finite_score(value: object, label: str) -> None:
+    if isinstance(value, bool):
+        raise ValueError(f"evidence {label} must be a finite number")
+    try:
+        finite = math.isfinite(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(f"evidence {label} must be a finite number") from exc
+    if not finite:
+        raise ValueError(f"evidence {label} must be a finite number")
+
+
+def _validate_component_metadata(
+    evidence: list[RetrievedEvidence],
+    component: str,
+) -> None:
+    ranks: set[int] = set()
+    rank_field = f"{component}_rank"
+    score_field = f"{component}_score"
+    for row in evidence:
+        rank = getattr(row, rank_field)
+        score = getattr(row, score_field)
+        if (rank is None) != (score is None):
+            raise ValueError(
+                f"evidence {rank_field} and {score_field} must both be present or null"
+            )
+        if rank is None:
+            continue
+        if type(rank) is not int or rank <= 0:
+            raise ValueError(f"evidence {rank_field} must be a positive integer")
+        if rank in ranks:
+            raise ValueError(f"evidence {rank_field} values must be unique")
+        ranks.add(rank)
+        _require_finite_score(score, score_field)
+
+
+def _validate_retrieved_evidence(
+    value: object,
+    *,
+    company_id: str,
+    product_family: str,
+    top_k: int,
+) -> list[RetrievedEvidence]:
+    """Validate every scope dimension represented by RetrievedEvidence.
+
+    RetrievedEvidence has no cluster_id field, so direct cluster membership is
+    the retriever's contract; this boundary independently checks the requested
+    cluster's recorded family rather than claiming an unavailable ID check.
+    """
     if type(value) is not list:
         raise TypeError("retriever must return a list of RetrievedEvidence")
     if any(type(row) is not RetrievedEvidence for row in value):
         raise TypeError("retriever rows must be RetrievedEvidence values")
     _evidence_ids(value)
+    if len(value) > top_k:
+        raise ValueError(f"retriever returned more than configured rag_top_k={top_k}")
+    if any(row.company_id != company_id for row in value):
+        raise ValueError("evidence company_id must match the requested company_id")
+    if any(row.product_family != product_family for row in value):
+        raise ValueError("evidence product_family must match the requested cluster product_family")
+    for row in value:
+        _require_finite_score(row.fused_score, "fused_score")
+    _validate_component_metadata(value, "dense")
+    _validate_component_metadata(value, "sparse")
+    if value != sorted(value, key=lambda row: (-row.fused_score, row.complaint_id)):
+        raise ValueError("evidence must be sorted by descending fused_score then complaint_id")
     return value
+
+
+def _cluster_product_family(con, cluster_id: str) -> str:
+    row = con.execute(
+        "SELECT product_family FROM clusters WHERE cluster_id = ?",
+        [cluster_id],
+    ).fetchone()
+    if row is None:
+        raise ValueError("requested cluster_id does not exist")
+    product_family = row[0]
+    if type(product_family) is not str or not product_family.strip():
+        raise ValueError("requested cluster has no valid product_family")
+    return product_family
 
 
 def _evidence_ids(evidence: list[RetrievedEvidence]) -> tuple[int, ...]:
@@ -635,19 +734,30 @@ def answer_question(
     model_client=None,
     retriever=None,
 ) -> AnswerResult:
-    """Retrieve, generate, validate, cache, and account for one grounded answer."""
+    """Retrieve, generate, validate, cache, and account for one grounded answer.
+
+    The connection must be in autocommit mode so this function can own the
+    atomic answer-and-usage transaction without nesting or altering caller work.
+    """
+    _require_autocommit(con)
     question_digest = question_hash(question)
+    product_family = _cluster_product_family(con, cluster_id)
     if retriever is None:
         from src.llm.retrieve import retrieve_evidence
 
         retriever = retrieve_evidence
     raw_evidence = retriever(con, cluster_id, company_id, question, embed_model)
-    evidence = _validate_retrieved_evidence(raw_evidence)
+    evidence = _validate_retrieved_evidence(
+        raw_evidence,
+        company_id=company_id,
+        product_family=product_family,
+        top_k=CONFIG.llm.rag_top_k,
+    )
 
     model = CONFIG.llm.model
     base_prompt_version = CONFIG.llm.prompt_version
     enforcement = (
-        load_enforcement_context(con, company_id, evidence[0].product_family)
+        load_enforcement_context(con, company_id, product_family)
         if evidence and include_enforcement_context
         else []
     )
@@ -750,6 +860,15 @@ def answer_question(
     except ModelCallError as error:
         persist_usage(cache_status="miss", outcome="failed", error=error)
         raise
+
+    if result.payload == {"refused": True, "stop_reason": "refusal"}:
+        persist_usage(
+            cache_status="miss",
+            outcome="refused",
+            result=result,
+            error_category=AnswerRefusalError.category,
+        )
+        raise AnswerRefusalError(result)
 
     try:
         generated_answer = validate_answer(result.payload, set(_evidence_ids(evidence)))
