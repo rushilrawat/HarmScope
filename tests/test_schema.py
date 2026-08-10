@@ -49,39 +49,90 @@ def test_phase8_migration_upgrades_a_pre_phase8_database(con):
     assert "reviewer_origin" in columns
 
 
-def test_phase8_provenance_migration_backfills_legacy_reviews_as_model(con):
+def test_phase8_provenance_migration_backfills_legacy_reviews_as_model(tmp_path):
     """Migration 008 must preserve old reviews without letting them pass a human gate."""
+    legacy = duckdb.connect(str(tmp_path / "pre-provenance.duckdb"))
+    legacy.execute(
+        """
+        CREATE TABLE runs (
+          run_id VARCHAR PRIMARY KEY,
+          phase VARCHAR NOT NULL,
+          git_sha VARCHAR NOT NULL,
+          config_hash VARCHAR NOT NULL,
+          params_json VARCHAR NOT NULL,
+          started_at TIMESTAMP NOT NULL,
+          status VARCHAR NOT NULL
+        );
+        CREATE TABLE clusters (
+          cluster_id VARCHAR PRIMARY KEY,
+          run_id VARCHAR NOT NULL REFERENCES runs(run_id),
+          product_family VARCHAR NOT NULL,
+          n_members BIGINT NOT NULL,
+          as_of DATE NOT NULL
+        );
+        CREATE TABLE cluster_labels (
+          cluster_id VARCHAR PRIMARY KEY REFERENCES clusters(cluster_id),
+          confidence VARCHAR
+        );
+        CREATE TABLE signals (
+          run_id VARCHAR NOT NULL,
+          cluster_id VARCHAR NOT NULL,
+          q_value DOUBLE
+        );
+        CREATE TABLE label_verifications (
+          cluster_id VARCHAR NOT NULL REFERENCES cluster_labels(cluster_id),
+          reviewer_id VARCHAR NOT NULL,
+          worklist_version VARCHAR NOT NULL,
+          signals_run VARCHAR NOT NULL,
+          is_fired BOOLEAN NOT NULL,
+          mechanism_accuracy VARCHAR NOT NULL CHECK (
+            mechanism_accuracy IN ('agree', 'partial', 'disagree')
+          ),
+          taxonomy_distinctness_accuracy VARCHAR NOT NULL CHECK (
+            taxonomy_distinctness_accuracy IN ('agree', 'disagree')
+          ),
+          template_accuracy VARCHAR NOT NULL CHECK (
+            template_accuracy IN ('agree', 'disagree')
+          ),
+          should_have_abstained BOOLEAN NOT NULL,
+          failure_category VARCHAR NOT NULL CHECK (
+            failure_category IN (
+              'none', 'incoherent_cluster', 'overgeneralized', 'overspecific',
+              'missed_submechanism', 'taxonomy_error', 'template_error',
+              'unsupported_claim', 'other'
+            )
+          ),
+          notes VARCHAR,
+          reviewed_at TIMESTAMP NOT NULL,
+          PRIMARY KEY (cluster_id, reviewer_id, worklist_version)
+        );
+        """
+    )
     cluster_run = "0000000000001-cluster1"
     signals_run = "0000000000002-signal01"
-    con.execute(
+    legacy.execute(
         "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
         "started_at, status) VALUES (?, 'cluster', 'test', 'test', '{}', now(), 'ok')",
         [cluster_run],
     )
-    con.execute(
+    legacy.execute(
         "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
         "started_at, status) VALUES (?, 'signals', 'test', 'test', "
         "'{\"params\": {\"cluster_run\": \"0000000000001-cluster1\"}}', now(), 'ok')",
         [signals_run],
     )
     cluster_id = f"{cluster_run}:mortgage:0"
-    con.execute(
+    legacy.execute(
         "INSERT INTO clusters (cluster_id, run_id, product_family, n_members, as_of) "
         "VALUES (?, ?, 'mortgage', 30, DATE '2020-01-01')",
         [cluster_id, cluster_run],
     )
-    con.execute(
+    legacy.execute(
         "INSERT INTO cluster_labels (cluster_id, confidence) VALUES (?, 'high')",
         [cluster_id],
     )
 
-    con.execute("DROP TABLE label_verifications")
-    legacy_007 = Path("db/migrations/007_phase_08_llm_layer.sql").read_text().replace(
-        "  reviewer_origin             VARCHAR NOT NULL CHECK (reviewer_origin IN ('human', 'model')),\n",
-        "",
-    )
-    con.execute(legacy_007)
-    con.execute(
+    legacy.execute(
         "INSERT INTO label_verifications "
         "(cluster_id, reviewer_id, worklist_version, signals_run, is_fired, "
         "mechanism_accuracy, taxonomy_distinctness_accuracy, template_accuracy, "
@@ -92,24 +143,25 @@ def test_phase8_provenance_migration_backfills_legacy_reviews_as_model(con):
     )
 
     migration = Path("db/migrations/008_label_verification_provenance.sql").read_text()
-    con.execute(migration)
+    legacy.execute(migration)
 
-    assert con.execute(
+    assert legacy.execute(
         "SELECT reviewer_origin FROM label_verifications WHERE reviewer_id = 'legacy-reviewer'"
     ).fetchone() == ("model",)
-    assert verify.report(con, "wl-v1").mechanism_total == 0
+    assert verify.report(legacy, "wl-v1").mechanism_total == 0
     with pytest.raises(duckdb.ConstraintException):
-        con.execute(
+        legacy.execute(
             "UPDATE label_verifications SET reviewer_origin = 'robot' "
             "WHERE reviewer_id = 'legacy-reviewer'"
         )
     with pytest.raises(duckdb.ConstraintException):
-        con.execute(
+        legacy.execute(
             "UPDATE label_verifications SET reviewer_origin = NULL "
             "WHERE reviewer_id = 'legacy-reviewer'"
         )
-    con.execute(migration)
-    assert con.execute("SELECT count(*) FROM label_verifications").fetchone() == (1,)
+    legacy.execute(migration)
+    assert legacy.execute("SELECT count(*) FROM label_verifications").fetchone() == (1,)
+    legacy.close()
 
 
 def test_schema_applies_and_is_idempotent(tmp_path):
