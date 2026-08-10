@@ -4,7 +4,7 @@ import dataclasses
 
 import pytest
 
-from src.config import CONFIG, Config, NoveltyConfig, Paths, paths
+from src.config import CONFIG, Config, LLMConfig, NoveltyConfig, Paths, paths
 
 
 def test_llm_operational_parameters_are_fingerprinted():
@@ -15,6 +15,14 @@ def test_llm_operational_parameters_are_fingerprinted():
     assert payload["input_usd_per_million"] > 0
     assert payload["output_usd_per_million"] > 0
     assert payload["human_verify_n"] == 50
+    assert payload["rag_candidate_k"] == 50
+    assert payload["bm25_tokenizer_version"] == "word-v1"
+
+
+def test_llm_candidate_pool_cannot_be_smaller_than_returned_evidence():
+    """A truncation setting cannot silently make the requested top-k impossible."""
+    with pytest.raises(ValueError, match="rag_candidate_k"):
+        LLMConfig(rag_top_k=11, rag_candidate_k=10)
 
 
 def test_config_is_frozen():

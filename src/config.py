@@ -239,6 +239,8 @@ class LLMConfig:
     min_cluster_size_for_label: int = 30
     max_narrative_chars: int = 1_200
     rag_top_k: int = 10
+    rag_candidate_k: int = 50
+    bm25_tokenizer_version: str = "word-v1"
     rrf_k: int = 60
     human_verify_n: int = 50             # docs/LLM_LAYER.md §2.5, required
     max_retries: int = 3
@@ -251,6 +253,13 @@ class LLMConfig:
     cache_write_usd_per_million: float = 6.25
     cache_read_usd_per_million: float = 0.50
     verification_seed: int = 20260809
+
+    def __post_init__(self) -> None:
+        if self.rag_candidate_k < self.rag_top_k:
+            raise ValueError(
+                "rag_candidate_k must be at least rag_top_k "
+                f"({self.rag_candidate_k} < {self.rag_top_k})"
+            )
 
 
 @dataclass(frozen=True)
