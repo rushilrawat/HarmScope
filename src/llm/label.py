@@ -31,6 +31,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 # §2.2. `additionalProperties: false` and a full `required` list are what make
@@ -90,6 +93,50 @@ from the text alone.\
 """
 
 
+class LabelSchemaError(ValueError):
+    """A label does not satisfy the locally enforced response contract."""
+
+
+REFUSAL_FIELDS = {"refused", "stop_reason"}
+
+
+def validate_label(payload: dict) -> dict:
+    """Validate and copy a model label before it enters the durable cache."""
+    if not isinstance(payload, dict):
+        raise LabelSchemaError("label must be an object")
+    expected = set(LABEL_SCHEMA["properties"])
+    actual = set(payload)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise LabelSchemaError(f"missing={missing} extra={extra}")
+
+    string_fields = {
+        "harm_mechanism", "preconditions", "consumer_impact",
+        "distinctness_rationale", "confidence",
+    }
+    if any(not isinstance(payload[field], str) for field in string_fields):
+        raise LabelSchemaError("label text fields must be strings")
+    if not isinstance(payload["actors"], list) or not all(
+        isinstance(item, str) for item in payload["actors"]
+    ):
+        raise LabelSchemaError("actors must be a list of strings")
+    for field in ("distinct_from_taxonomy", "is_likely_template"):
+        if not isinstance(payload[field], bool):
+            raise LabelSchemaError(f"{field} must be boolean")
+    if payload["confidence"] not in {"high", "medium", "low"}:
+        raise LabelSchemaError("invalid confidence")
+    return dict(payload)
+
+
+def _validate_cached_payload(payload: dict) -> dict:
+    if set(payload) == REFUSAL_FIELDS:
+        if payload["refused"] is True and isinstance(payload["stop_reason"], str):
+            return dict(payload)
+        raise LabelSchemaError("invalid refusal payload")
+    return validate_label(payload)
+
+
 def build_prompt(narratives: list[str], taxonomy_labels: list[str],
                  max_chars: int) -> str:
     """The per-cluster user turn. Stable content lives in SYSTEM, not here."""
@@ -124,13 +171,30 @@ def cached(cache_dir: Path, key: str) -> dict | None:
     path = cache_dir / f"{key}.json"
     if not path.exists():
         return None
-    # Written by this module, so it is a trusted local artifact.
-    return json.loads(path.read_text())
+    try:
+        return _validate_cached_payload(json.loads(path.read_text()))
+    except (json.JSONDecodeError, LabelSchemaError, TypeError, UnicodeDecodeError):
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        corrupt = path.with_name(f"{path.name}.corrupt-{stamp}")
+        suffix = 1
+        while corrupt.exists():
+            corrupt = path.with_name(f"{path.name}.corrupt-{stamp}-{suffix}")
+            suffix += 1
+        os.replace(path, corrupt)
+        return None
 
 
 def write_cache(cache_dir: Path, key: str, label: dict) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    (cache_dir / f"{key}.json").write_text(json.dumps(label, sort_keys=True))
+    payload = _validate_cached_payload(label)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=cache_dir, suffix=".tmp", delete=False
+    ) as temp:
+        json.dump(payload, temp, sort_keys=True)
+        temp.flush()
+        os.fsync(temp.fileno())
+        temp_path = Path(temp.name)
+    os.replace(temp_path, cache_dir / f"{key}.json")
 
 
 def label_cluster(client, model: str, narratives: list[str],

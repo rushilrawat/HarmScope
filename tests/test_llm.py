@@ -31,6 +31,19 @@ ROOT = Path(__file__).resolve().parents[1]
 DETECTION = ["signals", "cluster", "dedup", "embed", "evaluation"]
 
 
+def complete_label() -> dict:
+    return {
+        "harm_mechanism": "A servicer applies fees after a payment.",
+        "actors": ["servicer"],
+        "preconditions": "The consumer makes a payment.",
+        "consumer_impact": "The consumer pays an unexpected fee.",
+        "distinct_from_taxonomy": True,
+        "distinctness_rationale": "The existing label does not describe fees.",
+        "confidence": "high",
+        "is_likely_template": False,
+    }
+
+
 def _imports(path: Path) -> set[str]:
     tree = ast.parse(path.read_text())
     out: set[str] = set()
@@ -129,11 +142,33 @@ def test_cache_key_ignores_selection_order_but_not_prompt_version():
     assert label_mod.input_hash("v1", "other", [1, 2, 3]) != a
 
 
-def test_cache_roundtrip(tmp_path):
+def test_cache_write_is_atomic_and_validated(tmp_path):
     key = label_mod.input_hash("v1", "m", [1])
     assert label_mod.cached(tmp_path, key) is None
-    label_mod.write_cache(tmp_path, key, {"harm_mechanism": "x"})
-    assert label_mod.cached(tmp_path, key)["harm_mechanism"] == "x"
+    label_mod.write_cache(tmp_path, key, complete_label())
+    assert label_mod.cached(tmp_path, key) == complete_label()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_corrupt_cache_is_quarantined(tmp_path):
+    key = "broken"
+    path = tmp_path / "broken.json"
+    path.write_text("{")
+
+    assert label_mod.cached(tmp_path, key) is None
+    assert not path.exists()
+    assert len(list(tmp_path.glob("broken.json.corrupt-*"))) == 1
+
+
+def test_label_validation_rejects_missing_or_extra_fields():
+    missing = complete_label()
+    missing.pop("confidence")
+    with pytest.raises(label_mod.LabelSchemaError, match="confidence"):
+        label_mod.validate_label(missing)
+
+    extra = complete_label() | {"extra": True}
+    with pytest.raises(label_mod.LabelSchemaError, match="extra"):
+        label_mod.validate_label(extra)
 
 
 # --- output contract --------------------------------------------------------

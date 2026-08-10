@@ -1287,12 +1287,12 @@ def phase_label(args: argparse.Namespace) -> int:
               "limit": args.limit, "control_n": args.control_n}
     with db.run(con, "label", CONFIG, params=params) as r:
         stats = llm_run.run(con, cluster_run, signals_run, args.control_n,
-                            args.limit, model)
-        r.finish(output_rows=stats["labelled"])
+                            args.limit, model, run_id=r.run_id)
+        r.finish(output_rows=stats.labelled)
 
-    print(f"\nlabelled   : {stats['labelled']:,}  "
-          f"(cache hits {stats['cached']:,}, refused {stats['refused']:,}, "
-          f"no narratives {stats['skipped']:,})")
+    print(f"\nlabelled   : {stats.labelled:,}  "
+          f"(cache hits {stats.cached:,}, refused {stats.refused:,}, "
+          f"no narratives {stats.skipped:,})")
     print("  next: `pipeline verify --n 50` for the LLM_LAYER §2.5 read")
     return 0
 
