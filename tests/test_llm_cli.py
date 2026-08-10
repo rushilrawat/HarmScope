@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import csv
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
+
 from src import pipeline
 from src.llm import run as llm_run
+from src.llm import verify
 
 
 def test_label_verify_subcommands_parse():
@@ -60,3 +64,34 @@ def test_label_summary_reports_all_operational_totals(monkeypatch, capsys):
         "output tokens", "latency", "estimated cost", "estimated, not invoice",
     ):
         assert term in out
+
+
+def test_default_worklist_version_is_stable_across_row_order():
+    """Sorting a completed sheet must not orphan the exported worklist version."""
+    original = pipeline._worklist_version(["cluster-b", "cluster-a"])
+
+    assert original == pipeline._worklist_version(["cluster-a", "cluster-b"])
+    assert original == pipeline._worklist_version([
+        "cluster-a", "cluster-b", "cluster-a",
+    ])
+
+
+def test_label_verify_rejects_duplicate_cluster_ids(tmp_path):
+    """One cluster cannot count twice toward the human-review denominator."""
+    row = dict.fromkeys(verify.HEADER, "")
+    row.update({
+        "cluster_id": "cluster-1",
+        "mechanism_accuracy": "agree",
+        "taxonomy_distinctness_accuracy": "agree",
+        "template_accuracy": "agree",
+        "should_have_abstained": "false",
+        "failure_category": "none",
+    })
+    path = tmp_path / "duplicate.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=verify.HEADER)
+        writer.writeheader()
+        writer.writerows([row, row])
+
+    with pytest.raises(ValueError, match="duplicate cluster_id"):
+        verify.parse_worklist(path, "reviewer-1")

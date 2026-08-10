@@ -1918,6 +1918,7 @@ def cmd_runs(args: argparse.Namespace) -> int:
 
 def _worklist_version(cluster_ids: list[str]) -> str:
     """Fingerprint a review population and the label version it evaluates."""
+    cluster_ids = sorted({cluster_id.strip() for cluster_id in cluster_ids})
     material = "\n".join([
         CONFIG.llm.model,
         CONFIG.llm.prompt_version,

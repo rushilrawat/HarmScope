@@ -367,10 +367,16 @@ def parse_worklist(
         if reader.fieldnames != HEADER:
             raise ValueError("worklist columns do not match the verification contract")
         parsed: list[Verification] = []
+        seen_cluster_ids: set[str] = set()
         for line_number, row in enumerate(reader, start=2):
             cluster_id = row.get("cluster_id", "").strip()
             if not cluster_id:
                 raise ValueError(f"line {line_number}: cluster_id is required")
+            if cluster_id in seen_cluster_ids:
+                raise ValueError(
+                    f"line {line_number}: duplicate cluster_id {cluster_id!r}"
+                )
+            seen_cluster_ids.add(cluster_id)
             mechanism = _decision(row, "mechanism_accuracy", MECHANISM_DECISIONS)
             taxonomy = _decision(
                 row, "taxonomy_distinctness_accuracy", BINARY_DECISIONS,
