@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import date
 
@@ -77,11 +78,20 @@ def retrieval_fixture(con):
 
     records = (
         (20, wanted_cluster, wanted_company, "Acme Bank", "second redacted narrative", " "),
-        (10, wanted_cluster, wanted_company, "Acme Bank", "first redacted narrative", "Company disputes the allegation."),
+        (
+            10,
+            wanted_cluster,
+            wanted_company,
+            "Acme Bank",
+            "first redacted narrative",
+            "Company disputes the allegation.",
+        ),
         (30, wanted_cluster, other_company, "Other Bank", "other-company redacted narrative", None),
         (40, other_cluster, wanted_company, "Acme Bank", "other-cluster redacted narrative", None),
     )
-    for row_idx, (complaint_id, cluster_id, company_id, company_name, text, response) in enumerate(records):
+    for row_idx, (complaint_id, cluster_id, company_id, company_name, text, response) in enumerate(
+        records
+    ):
         con.execute(
             "INSERT INTO complaints_raw "
             "(complaint_id, date_received, company_raw, company_public_response) "
@@ -220,9 +230,7 @@ def test_dense_rank_uses_only_scoped_row_indices(scoped_corpus):
         ),
     )
 
-    got = retrieve.dense_rank(
-        corpus, vectors, np.array([[1.0, 0.0]], dtype=np.float32), limit=10
-    )
+    got = retrieve.dense_rank(corpus, vectors, np.array([[1.0, 0.0]], dtype=np.float32), limit=10)
 
     assert [(hit.complaint_id, hit.rank) for hit in got] == [(11, 1), (12, 2)]
     assert {hit.complaint_id for hit in got} == {11, 12}
@@ -239,9 +247,7 @@ def test_dense_ties_break_on_complaint_id(scoped_corpus):
         ),
     )
 
-    got = retrieve.dense_rank(
-        corpus, vectors, np.array([[1.0, 0.0]], dtype=np.float32), 2
-    )
+    got = retrieve.dense_rank(corpus, vectors, np.array([[1.0, 0.0]], dtype=np.float32), 2)
 
     assert [hit.complaint_id for hit in got] == [10, 20]
 
@@ -252,9 +258,7 @@ def test_dense_rank_rejects_out_of_bounds_scoped_row_index(scoped_corpus):
     vectors = np.array([[1.0, 0.0]], dtype=np.float32)
 
     with pytest.raises(ValueError, match="row_idx"):
-        retrieve.dense_rank(
-            corpus, vectors, np.array([[1.0, 0.0]], dtype=np.float32), limit=1
-        )
+        retrieve.dense_rank(corpus, vectors, np.array([[1.0, 0.0]], dtype=np.float32), limit=1)
 
 
 def test_dense_rank_rejects_query_dimension_mismatch(scoped_corpus):
@@ -288,3 +292,152 @@ def test_dense_rank_rejects_zero_norm_query(scoped_corpus):
         retrieve.dense_rank(
             scoped_corpus, vectors, np.array([[0.0, 0.0]], dtype=np.float32), limit=1
         )
+
+
+def test_tokenizer_is_lowercase_and_deterministic():
+    """Changing token normalization would change lexical retrieval results."""
+    assert retrieve.tokenize("APR fees, APR-refund!") == [
+        "apr",
+        "fees",
+        "apr-refund",
+    ]
+
+
+def test_sparse_corpus_is_immutable():
+    """Cached tokens must not be mutable after the corpus is loaded."""
+    sparse = retrieve.SparseCorpus(
+        complaint_ids=(10,),
+        tokens=(("mortgage", "escrow"),),
+    )
+
+    with pytest.raises(AttributeError):
+        sparse.complaint_ids = (20,)
+
+
+def test_bm25_finds_exact_product_language():
+    """Dropping lexical scoring would miss the document with both exact terms."""
+    sparse = retrieve.SparseCorpus(
+        complaint_ids=(10, 20, 30),
+        tokens=(
+            ("mortgage", "escrow", "shortage"),
+            ("credit", "report", "dispute"),
+            ("generic", "customer", "service"),
+        ),
+    )
+
+    got = retrieve.bm25_rank(sparse, "escrow shortage", limit=3)
+
+    assert got[0].complaint_id == 10
+    assert got[0].rank == 1
+
+
+def test_bm25_ties_break_on_complaint_id():
+    """Equal lexical scores have a stable complaint-ID ordering."""
+    sparse = retrieve.SparseCorpus(
+        complaint_ids=(20, 10),
+        tokens=(("escrow",), ("escrow",)),
+    )
+
+    got = retrieve.bm25_rank(sparse, "escrow", limit=2)
+
+    assert [(hit.complaint_id, hit.rank) for hit in got] == [(10, 1), (20, 2)]
+
+
+def test_bm25_empty_query_returns_zero_score_ids_in_order():
+    """Punctuation-only questions have deterministic, score-free candidates."""
+    sparse = retrieve.SparseCorpus(
+        complaint_ids=(20, 10, 30),
+        tokens=(("escrow",), ("mortgage",), ("refund",)),
+    )
+
+    got = retrieve.bm25_rank(sparse, "?!", limit=2)
+
+    assert [(hit.complaint_id, hit.rank, hit.score) for hit in got] == [
+        (10, 1, 0.0),
+        (20, 2, 0.0),
+    ]
+
+
+def test_bm25_all_empty_documents_return_zero_score_ids_in_order():
+    """Fully redacted documents cannot make BM25 divide by zero."""
+    sparse = retrieve.SparseCorpus(
+        complaint_ids=(20, 10),
+        tokens=((), ()),
+    )
+
+    got = retrieve.bm25_rank(sparse, "refund", limit=2)
+
+    assert [(hit.complaint_id, hit.rank, hit.score) for hit in got] == [
+        (10, 1, 0.0),
+        (20, 2, 0.0),
+    ]
+
+
+def test_sparse_cache_invalidates_on_membership_or_tokenizer(scoped_corpus, tmp_path):
+    """Scope membership and tokenizer changes must rebuild sparse token data."""
+    first, hit1 = retrieve.load_sparse_corpus(scoped_corpus, tmp_path, "word-v1")
+    second, hit2 = retrieve.load_sparse_corpus(scoped_corpus, tmp_path, "word-v1")
+    changed = replace(scoped_corpus, rows=scoped_corpus.rows + (evidence(complaint_id=999),))
+    _, hit3 = retrieve.load_sparse_corpus(changed, tmp_path, "word-v1")
+    _, hit4 = retrieve.load_sparse_corpus(scoped_corpus, tmp_path, "word-v2")
+
+    assert first == second
+    assert (hit1, hit2, hit3, hit4) == (False, True, False, False)
+
+
+def test_sparse_cache_is_json_only_and_written_atomically(scoped_corpus, tmp_path):
+    """Sparse caches persist only the validated, replayable token payload."""
+    sparse, cache_hit = retrieve.load_sparse_corpus(scoped_corpus, tmp_path, "word-v1")
+    key = retrieve.membership_hash(scoped_corpus, "word-v1")
+    path = tmp_path / f"bm25.{key}.json"
+
+    assert cache_hit is False
+    assert sparse == retrieve.SparseCorpus(complaint_ids=(1,), tokens=(("redacted", "evidence"),))
+    assert json.loads(path.read_text()) == {
+        "complaint_ids": [1],
+        "tokenizer_version": "word-v1",
+        "tokens": [["redacted", "evidence"]],
+    }
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{",
+        json.dumps({"tokenizer_version": "word-v1", "complaint_ids": [1]}),
+        json.dumps(
+            {
+                "tokenizer_version": "word-v2",
+                "complaint_ids": [1],
+                "tokens": [["redacted", "evidence"]],
+            }
+        ),
+        json.dumps(
+            {
+                "tokenizer_version": "word-v1",
+                "complaint_ids": [999],
+                "tokens": [["redacted", "evidence"]],
+            }
+        ),
+        json.dumps(
+            {
+                "tokenizer_version": "word-v1",
+                "complaint_ids": [1],
+                "tokens": [["redacted", 1]],
+            }
+        ),
+    ],
+)
+def test_malformed_sparse_cache_is_quarantined(scoped_corpus, tmp_path, payload):
+    """Bad cache JSON cannot be trusted and is moved aside before rebuilding."""
+    key = retrieve.membership_hash(scoped_corpus, "word-v1")
+    path = tmp_path / f"bm25.{key}.json"
+    path.write_text(payload)
+
+    sparse, cache_hit = retrieve.load_sparse_corpus(scoped_corpus, tmp_path, "word-v1")
+
+    assert cache_hit is False
+    assert sparse.complaint_ids == (1,)
+    assert path.exists()
+    assert len(list(tmp_path.glob(f"{path.name}.corrupt-*"))) == 1

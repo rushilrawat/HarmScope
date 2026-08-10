@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import tempfile
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 import duckdb
 import numpy as np
@@ -37,6 +41,155 @@ class RankedHit:
     complaint_id: int
     rank: int
     score: float
+
+
+@dataclass(frozen=True)
+class SparseCorpus:
+    """Immutable tokenized representation of one scoped evidence corpus."""
+
+    complaint_ids: tuple[int, ...]
+    tokens: tuple[tuple[str, ...], ...]
+
+    def __post_init__(self) -> None:
+        complaint_ids = tuple(self.complaint_ids)
+        tokens = tuple(tuple(document) for document in self.tokens)
+        if len(complaint_ids) != len(tokens):
+            raise ValueError("sparse corpus IDs and token lists must have equal length")
+        if any(
+            not isinstance(complaint_id, int) or isinstance(complaint_id, bool)
+            for complaint_id in complaint_ids
+        ):
+            raise ValueError("sparse corpus complaint IDs must be integers")
+        if len(set(complaint_ids)) != len(complaint_ids):
+            raise ValueError("sparse corpus complaint IDs must be unique")
+        if any(not isinstance(token, str) for document in tokens for token in document):
+            raise ValueError("sparse corpus tokens must be strings")
+        object.__setattr__(self, "complaint_ids", complaint_ids)
+        object.__setattr__(self, "tokens", tokens)
+
+
+class SparseCacheError(ValueError):
+    """Raised when a persisted sparse corpus does not match its expected schema."""
+
+
+_TOKEN_PATTERN = re.compile(r"[a-z0-9]+(?:[-'][a-z0-9]+)*")
+
+
+def tokenize(text: str) -> list[str]:
+    """Split text into deterministic lowercase lexical-retrieval terms."""
+    return _TOKEN_PATTERN.findall(text.lower())
+
+
+def _sparse_cache_path(corpus: ScopedCorpus, cache_dir: Path, tokenizer_version: str) -> Path:
+    return cache_dir / f"bm25.{membership_hash(corpus, tokenizer_version)}.json"
+
+
+def _validate_sparse_cache(
+    payload: object,
+    expected_ids: tuple[int, ...],
+    tokenizer_version: str,
+) -> SparseCorpus:
+    if not isinstance(payload, dict):
+        raise SparseCacheError("sparse cache must be an object")
+    required_fields = {"tokenizer_version", "complaint_ids", "tokens"}
+    if set(payload) != required_fields:
+        raise SparseCacheError("sparse cache fields do not match the schema")
+    if payload["tokenizer_version"] != tokenizer_version:
+        raise SparseCacheError("sparse cache tokenizer version does not match")
+
+    complaint_ids = payload["complaint_ids"]
+    token_lists = payload["tokens"]
+    if not isinstance(complaint_ids, list) or any(
+        not isinstance(complaint_id, int) or isinstance(complaint_id, bool)
+        for complaint_id in complaint_ids
+    ):
+        raise SparseCacheError("sparse cache complaint IDs must be integer lists")
+    if tuple(complaint_ids) != expected_ids:
+        raise SparseCacheError("sparse cache complaint IDs do not match the scope")
+    if not isinstance(token_lists, list) or len(token_lists) != len(complaint_ids):
+        raise SparseCacheError("sparse cache token lists do not match complaint IDs")
+    if any(
+        not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens)
+        for tokens in token_lists
+    ):
+        raise SparseCacheError("sparse cache tokens must be string lists")
+    return SparseCorpus(tuple(complaint_ids), tuple(tuple(tokens) for tokens in token_lists))
+
+
+def _quarantine_sparse_cache(path: Path) -> None:
+    """Move an invalid cache aside using the label-cache corrupt-file convention."""
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    corrupt = path.with_name(f"{path.name}.corrupt-{stamp}")
+    suffix = 1
+    while corrupt.exists():
+        corrupt = path.with_name(f"{path.name}.corrupt-{stamp}-{suffix}")
+        suffix += 1
+    os.replace(path, corrupt)
+
+
+def _write_sparse_cache(path: Path, sparse: SparseCorpus, tokenizer_version: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "complaint_ids": list(sparse.complaint_ids),
+        "tokenizer_version": tokenizer_version,
+        "tokens": [list(tokens) for tokens in sparse.tokens],
+    }
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False
+    ) as temporary:
+        json.dump(payload, temporary, sort_keys=True)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary_path = Path(temporary.name)
+    os.replace(temporary_path, path)
+
+
+def load_sparse_corpus(
+    corpus: ScopedCorpus, cache_dir: Path, tokenizer_version: str
+) -> tuple[SparseCorpus, bool]:
+    """Load or atomically build the membership- and tokenizer-keyed BM25 cache."""
+    expected_ids = tuple(row.complaint_id for row in corpus.rows)
+    path = _sparse_cache_path(corpus, cache_dir, tokenizer_version)
+    if path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return _validate_sparse_cache(payload, expected_ids, tokenizer_version), True
+        except (json.JSONDecodeError, SparseCacheError, TypeError, UnicodeDecodeError):
+            _quarantine_sparse_cache(path)
+
+    sparse = SparseCorpus(
+        complaint_ids=expected_ids,
+        tokens=tuple(tuple(tokenize(row.text_redacted)) for row in corpus.rows),
+    )
+    _write_sparse_cache(path, sparse, tokenizer_version)
+    return sparse, False
+
+
+def bm25_rank(sparse: SparseCorpus, question: str, limit: int) -> list[RankedHit]:
+    """Rank one sparse corpus with deterministic lexical score tie-breaking."""
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if not sparse.complaint_ids:
+        return []
+
+    query_tokens = tokenize(question)
+    if not query_tokens or not any(sparse.tokens):
+        pairs = [(complaint_id, 0.0) for complaint_id in sparse.complaint_ids]
+    else:
+        from rank_bm25 import BM25Okapi
+
+        scorer = BM25Okapi([list(tokens) for tokens in sparse.tokens])
+        pairs = [
+            (complaint_id, float(score))
+            for complaint_id, score in zip(
+                sparse.complaint_ids, scorer.get_scores(query_tokens), strict=True
+            )
+        ]
+    pairs.sort(key=lambda item: (-item[1], item[0]))
+    return [
+        RankedHit(complaint_id=complaint_id, rank=rank, score=score)
+        for rank, (complaint_id, score) in enumerate(pairs[:limit], start=1)
+    ]
 
 
 def load_corpus(
@@ -74,9 +227,7 @@ def load_corpus(
 
     records = con.execute(query, parameters).fetchall()
     if not records:
-        raise ValueError(
-            "no evidence exists for the requested cluster/company/model scope"
-        )
+        raise ValueError("no evidence exists for the requested cluster/company/model scope")
 
     rows = tuple(
         EvidenceRecord(
@@ -88,9 +239,7 @@ def load_corpus(
             company_name=company_name,
             product_family=product_family,
             text_redacted=text_redacted,
-            company_public_response=(response.strip() or None)
-            if response is not None
-            else None,
+            company_public_response=(response.strip() or None) if response is not None else None,
         )
         for (
             complaint_id,
@@ -115,9 +264,7 @@ def membership_hash(corpus: ScopedCorpus, tokenizer_version: str) -> str:
         "tokenizer_version": tokenizer_version,
         "complaint_ids": [row.complaint_id for row in corpus.rows],
     }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def encode_query(encoder, question: str) -> np.ndarray:
