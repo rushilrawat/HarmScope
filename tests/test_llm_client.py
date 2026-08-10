@@ -45,10 +45,14 @@ def pricing() -> ModelPricing:
     return ModelPricing(5.0, 25.0, 6.25, 0.50)
 
 
-def response(*, payload: dict, input_tokens: int, output_tokens: int):
+def response(
+    *, payload: dict | None = None, raw_text: str | None = None,
+    input_tokens: int, output_tokens: int, stop_reason: str = "end_turn",
+):
+    text = raw_text if raw_text is not None else json.dumps(payload)
     return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=json.dumps(payload))],
-        stop_reason="end_turn",
+        content=[] if stop_reason == "refusal" else [SimpleNamespace(type="text", text=text)],
+        stop_reason=stop_reason,
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -149,3 +153,77 @@ def test_preflight_retrieves_the_configured_model():
     AnthropicModelClient(transport, pricing()).preflight("claude-opus-5")
 
     assert transport.retrieved == ["claude-opus-5"]
+
+
+def test_malformed_response_preserves_usage_latency_and_estimated_cost():
+    """JSON extraction failure after a response must retain paid usage evidence."""
+    client = AnthropicModelClient(
+        SequenceTransport([
+            response(raw_text="{", input_tokens=100, output_tokens=20),
+        ]),
+        pricing(),
+        clock=SequenceClock([0.0, 0.4]),
+    )
+
+    with pytest.raises(ModelCallError) as caught:
+        client.call_json(
+            model="m", system="s", prompt="p",
+            schema={"type": "object"}, max_tokens=50,
+        )
+
+    error = caught.value
+    assert error.category == "malformed_response"
+    assert error.retryable is False
+    assert error.response_received is True
+    assert error.usage == TokenUsage(100, 20, 0, 0)
+    assert error.latency_seconds == pytest.approx(0.4)
+    assert error.estimated_cost_usd == pytest.approx(0.001)
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [fake_anthropic.APIConnectionError, fake_anthropic.InternalServerError],
+    ids=["connection", "5xx"],
+)
+def test_exhausted_transient_errors_report_all_attempts_without_usage(error_type):
+    """Bounded connection/5xx failures report attempts and no invented tokens."""
+    errors = [error_type("offline") for _ in range(4)]
+    sleeps = []
+    client = AnthropicModelClient(
+        SequenceTransport(errors), pricing(), max_retries=3,
+        sleeper=sleeps.append, jitter=lambda _lo, _hi: 0.0,
+    )
+
+    with pytest.raises(ModelCallError) as caught:
+        client.call_json(
+            model="m", system="s", prompt="p",
+            schema={"type": "object"}, max_tokens=50,
+        )
+
+    assert caught.value.category == "transient"
+    assert caught.value.retryable is True
+    assert caught.value.attempts == 4
+    assert caught.value.response_received is False
+    assert caught.value.usage == TokenUsage()
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_refusal_returns_a_typed_result_with_paid_usage():
+    """A provider refusal is a normal per-cluster outcome with usage attached."""
+    client = AnthropicModelClient(
+        SequenceTransport([
+            response(
+                input_tokens=7, output_tokens=1, stop_reason="refusal",
+            ),
+        ]),
+        pricing(),
+        clock=SequenceClock([0.0, 0.2]),
+    )
+
+    got = client.call_json(
+        model="m", system="s", prompt="p", schema={"type": "object"}, max_tokens=50,
+    )
+
+    assert got.payload == {"refused": True, "stop_reason": "refusal"}
+    assert got.usage == TokenUsage(7, 1, 0, 0)
+    assert got.estimated_cost_usd == pytest.approx(0.00006)

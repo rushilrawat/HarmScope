@@ -10,6 +10,7 @@ after several hours of embedding.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from datetime import date
 from pathlib import Path
 
@@ -161,6 +162,66 @@ def test_phase8_provenance_migration_backfills_legacy_reviews_as_model(tmp_path)
         )
     legacy.execute(migration)
     assert legacy.execute("SELECT count(*) FROM label_verifications").fetchone() == (1,)
+    legacy.close()
+
+
+def test_phase8_provenance_migration_rolls_back_a_mid_rebuild_failure(tmp_path):
+    """A failed table rebuild must leave the legacy table, row, and schema intact."""
+    legacy = duckdb.connect(str(tmp_path / "rollback-provenance.duckdb"))
+    legacy.execute(
+        """
+        CREATE TABLE cluster_labels (cluster_id VARCHAR PRIMARY KEY);
+        CREATE TABLE label_verifications (
+          cluster_id VARCHAR NOT NULL REFERENCES cluster_labels(cluster_id),
+          reviewer_id VARCHAR NOT NULL,
+          worklist_version VARCHAR NOT NULL,
+          signals_run VARCHAR NOT NULL,
+          is_fired BOOLEAN NOT NULL,
+          mechanism_accuracy VARCHAR NOT NULL,
+          taxonomy_distinctness_accuracy VARCHAR NOT NULL,
+          template_accuracy VARCHAR NOT NULL,
+          should_have_abstained BOOLEAN NOT NULL,
+          failure_category VARCHAR NOT NULL,
+          notes VARCHAR,
+          reviewed_at TIMESTAMP NOT NULL,
+          PRIMARY KEY (cluster_id, reviewer_id, worklist_version)
+        );
+        INSERT INTO cluster_labels VALUES ('cluster-1');
+        INSERT INTO label_verifications VALUES (
+          'cluster-1', 'reviewer-1', 'wl-v1', 'signals-1', false,
+          'agree', 'agree', 'agree', false, 'none', 'keep me', now()
+        );
+        """
+    )
+    original_columns = [
+        row[1]
+        for row in legacy.execute(
+            "PRAGMA table_info('label_verifications')"
+        ).fetchall()
+    ]
+    migration = Path("db/migrations/008_label_verification_provenance.sql").read_text()
+    broken = migration.replace(
+        "ALTER TABLE label_verifications_v008 RENAME TO label_verifications;",
+        "SELECT * FROM deliberate_missing_table;\n"
+        "ALTER TABLE label_verifications_v008 RENAME TO label_verifications;",
+    )
+
+    with pytest.raises(duckdb.CatalogException, match="deliberate_missing_table"):
+        legacy.execute(broken)
+    with suppress(duckdb.TransactionException):
+        legacy.execute("ROLLBACK")
+
+    assert [
+        row[1]
+        for row in legacy.execute(
+            "PRAGMA table_info('label_verifications')"
+        ).fetchall()
+    ] == original_columns
+    assert "reviewer_origin" not in original_columns
+    assert legacy.execute(
+        "SELECT cluster_id, reviewer_id, notes FROM label_verifications"
+    ).fetchall() == [("cluster-1", "reviewer-1", "keep me")]
+    assert "label_verifications_v008" not in db.table_names(legacy)
     legacy.close()
 
 

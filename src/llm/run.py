@@ -5,10 +5,10 @@ backtest refit is a large avoidable bill and produces labels nobody reads, so th
 default population is the clusters that actually fired a signal, plus a seeded
 random control sample so §2.5's verification is not drawn only from alerts.
 
-This module is the only one in `src/llm/` that touches the database, and it only
-ever writes `cluster_labels` — a table no detection stage reads. The §1
-determinism contract is a property of that: `tests/test_llm.py` asserts no
-detection module can import this package at all.
+This module is the only one in `src/llm/` that touches the database. It writes
+only the downstream `cluster_labels` and `llm_usage` tables, neither of which a
+detection stage reads. The §1 determinism contract is a property of that:
+`tests/test_llm.py` asserts no detection module can import this package at all.
 """
 
 from __future__ import annotations
@@ -52,6 +52,10 @@ class LabelRunStats:
     output_tokens: int = 0
     estimated_cost_usd: float = 0.0
     latency_seconds: float = 0.0
+
+
+class ReviewedLabelChangeError(RuntimeError):
+    """A reviewed cluster cannot be rebound to a different model input."""
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,22 @@ def population(con, cluster_run: str, signals_run: str, control_n: int):
     return fired + control, len(fired), len(control)
 
 
+def _validate_run_provenance(con, cluster_run: str, signals_run: str) -> None:
+    """Prove the signals run scored the exact requested cluster refit."""
+    row = con.execute(
+        "SELECT json_extract_string(params_json, '$.params.cluster_run') "
+        "FROM runs WHERE run_id = ? AND phase = 'signals'",
+        [signals_run],
+    ).fetchone()
+    if row is None or not row[0]:
+        raise ValueError(f"signals run {signals_run!r} does not record a cluster_run")
+    if row[0] != cluster_run:
+        raise ValueError(
+            f"signals run {signals_run!r} records cluster_run {row[0]!r}; "
+            f"requested {cluster_run!r}"
+        )
+
+
 def narratives_for(con, vectors, cluster_id: str, medoid_idx, model: str):
     """The k narratives §2.1 selects, and the complaint ids they came from."""
     import numpy as np
@@ -136,12 +156,19 @@ def narratives_for(con, vectors, cluster_id: str, medoid_idx, model: str):
 
 
 def write_label(con, cluster_id: str, key: str, payload: dict) -> None:
-    con.execute("DELETE FROM cluster_labels WHERE cluster_id = ?", [cluster_id])
     con.execute(
         "INSERT INTO cluster_labels (cluster_id, harm_mechanism, actors, "
         "preconditions, consumer_impact, distinct_from_taxonomy, rationale, "
         "confidence, is_likely_template, model, prompt_version, input_hash, "
-        "generated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "generated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT (cluster_id) DO UPDATE SET "
+        "harm_mechanism = excluded.harm_mechanism, actors = excluded.actors, "
+        "preconditions = excluded.preconditions, consumer_impact = excluded.consumer_impact, "
+        "distinct_from_taxonomy = excluded.distinct_from_taxonomy, "
+        "rationale = excluded.rationale, confidence = excluded.confidence, "
+        "is_likely_template = excluded.is_likely_template, model = excluded.model, "
+        "prompt_version = excluded.prompt_version, input_hash = excluded.input_hash, "
+        "generated_at = excluded.generated_at",
         [
             cluster_id,
             payload.get("harm_mechanism"),
@@ -179,11 +206,52 @@ def _usage_from_result(
     )
 
 
+def _usage_from_error(
+    run_id: str | None,
+    cluster_id: str,
+    key: str,
+    cache_status: str,
+    error: ModelCallError,
+) -> UsageRecord:
+    return UsageRecord(
+        run_id,
+        cluster_id,
+        key,
+        cache_status,
+        error.attempts,
+        error.usage.input_tokens,
+        error.usage.output_tokens,
+        error.usage.cache_read_input_tokens,
+        error.usage.cache_creation_input_tokens,
+        error.latency_seconds,
+        error.estimated_cost_usd,
+        "failed",
+        error.category,
+    )
+
+
 def _add_result_totals(stats: LabelRunStats, result: ModelCallResult) -> None:
     stats.input_tokens += result.usage.input_tokens
     stats.output_tokens += result.usage.output_tokens
     stats.estimated_cost_usd += result.estimated_cost_usd
     stats.latency_seconds += result.latency_seconds
+
+
+def _add_error_totals(stats: LabelRunStats, error: ModelCallError) -> None:
+    stats.input_tokens += error.usage.input_tokens
+    stats.output_tokens += error.usage.output_tokens
+    stats.estimated_cost_usd += error.estimated_cost_usd
+    stats.latency_seconds += error.latency_seconds
+
+
+def _existing_label(con, cluster_id: str) -> tuple[str | None, bool] | None:
+    row = con.execute(
+        "SELECT l.input_hash, EXISTS ("
+        "SELECT 1 FROM label_verifications v WHERE v.cluster_id = l.cluster_id"
+        ") FROM cluster_labels l WHERE l.cluster_id = ?",
+        [cluster_id],
+    ).fetchone()
+    return None if row is None else (row[0], bool(row[1]))
 
 
 def _persist_target(con, cluster_id: str, key: str, payload: dict | None,
@@ -204,6 +272,8 @@ def run(con, cluster_run: str, signals_run: str, control_n: int, limit: int | No
         embed_model: str, log=print, *, client=None, vectors=None, cache_dir=None,
         run_id: str | None = None) -> LabelRunStats:
     """Label the lazy population with resumable cache and per-target accounting."""
+    _validate_run_provenance(con, cluster_run, signals_run)
+
     import numpy as np
 
     if vectors is None:
@@ -232,6 +302,24 @@ def run(con, cluster_run: str, signals_run: str, control_n: int, limit: int | No
             )
             continue
 
+        existing = _existing_label(con, cluster_id)
+        if existing is not None and existing[0] == key:
+            stats.cached += 1
+            _persist_target(
+                con,
+                cluster_id,
+                key,
+                None,
+                _usage_from_result(run_id, cluster_id, key, "hit", "ok"),
+            )
+            stats.labelled += 1
+            continue
+        if existing is not None and existing[1]:
+            raise ReviewedLabelChangeError(
+                f"reviewed cluster {cluster_id!r} already has input_hash "
+                f"{existing[0]!r}; refusing changed input_hash {key!r}"
+            )
+
         payload = label_mod.cached(cache, key)
         if payload is None:
             if client is None:
@@ -241,16 +329,12 @@ def run(con, cluster_run: str, signals_run: str, control_n: int, limit: int | No
                     client.preflight(CONFIG.llm.model)
                 except ModelCallError as error:
                     stats.failed += 1
+                    _add_error_totals(stats, error)
                     _persist_target(
                         con, cluster_id, key, None,
-                        _usage_from_result(
-                            run_id, cluster_id, key, "miss", "failed",
-                            error_category=error.category, attempts=error.attempts,
-                        ),
+                        _usage_from_error(run_id, cluster_id, key, "miss", error),
                     )
-                    if error.category in {
-                        "authentication", "billing", "permission", "invalid_request",
-                    }:
+                    if not error.retryable:
                         raise
                     continue
                 preflight_done = True
@@ -267,16 +351,12 @@ def run(con, cluster_run: str, signals_run: str, control_n: int, limit: int | No
                 )
             except ModelCallError as error:
                 stats.failed += 1
+                _add_error_totals(stats, error)
                 _persist_target(
                     con, cluster_id, key, None,
-                    _usage_from_result(
-                        run_id, cluster_id, key, "miss", "failed",
-                        error_category=error.category, attempts=error.attempts,
-                    ),
+                    _usage_from_error(run_id, cluster_id, key, "miss", error),
                 )
-                if error.category in {
-                    "authentication", "billing", "permission", "invalid_request",
-                }:
+                if not error.retryable and not error.response_received:
                     raise
                 continue
             _add_result_totals(stats, result)
@@ -290,6 +370,16 @@ def run(con, cluster_run: str, signals_run: str, control_n: int, limit: int | No
                                        "schema"),
                 )
                 continue
+            except Exception:
+                stats.failed += 1
+                _persist_target(
+                    con, cluster_id, key, None,
+                    _usage_from_result(
+                        run_id, cluster_id, key, "miss", "failed", result,
+                        "cache_write",
+                    ),
+                )
+                raise
             payload = result.payload
             usage = _usage_from_result(
                 run_id, cluster_id, key, "miss",

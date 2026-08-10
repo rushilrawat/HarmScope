@@ -105,6 +105,18 @@ Sample **≥ 50** labeled clusters. For each, read 10 narratives yourself and ma
 An unverified LLM label layer is decoration. A verified one with a reported 78% agreement rate
 is a result.
 
+The gate is evaluated only for one explicit worklist version and counts distinct
+human-reviewed clusters, not review rows. Export writes a non-reviewer-facing JSON
+sidecar beside the CSV; it pins the signals run, cluster run, model, prompt version,
+seed, canonical cluster IDs, and digest. Recording requires and validates that sidecar,
+so a later signals run or configuration change cannot silently alter provenance.
+
+Phase 8's CLI is a trusted local, human-only ingestion boundary. Its `--reviewer`
+value is an operator-supplied audit label, not authenticated identity, and model-origin
+reviews are intentionally unavailable through that command. Before Phase 10 exposes
+review ingestion through an API, bind both reviewer identity and `reviewer_origin` to
+the authenticated actor on the server; never accept either as client-asserted authority.
+
 ---
 
 ## 3. Evidence retrieval (RAG)

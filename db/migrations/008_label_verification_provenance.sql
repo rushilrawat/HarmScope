@@ -10,6 +10,8 @@
 -- explicit origin unchanged; on a legacy table the nullable added column is
 -- backfilled to model before the constrained replacement is created.
 
+BEGIN TRANSACTION;
+
 ALTER TABLE label_verifications ADD COLUMN IF NOT EXISTS reviewer_origin VARCHAR;
 UPDATE label_verifications SET reviewer_origin = 'model' WHERE reviewer_origin IS NULL;
 
@@ -52,3 +54,5 @@ FROM label_verifications;
 
 DROP TABLE label_verifications;
 ALTER TABLE label_verifications_v008 RENAME TO label_verifications;
+
+COMMIT;

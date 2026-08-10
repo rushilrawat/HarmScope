@@ -13,8 +13,6 @@ a dispatch table is exactly how that trap gets sprung.
 from __future__ import annotations
 
 import argparse
-import csv
-import hashlib
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -1916,27 +1914,6 @@ def cmd_runs(args: argparse.Namespace) -> int:
     return 0
 
 
-def _worklist_version(cluster_ids: list[str]) -> str:
-    """Fingerprint a review population and the label version it evaluates."""
-    cluster_ids = sorted({cluster_id.strip() for cluster_id in cluster_ids})
-    material = "\n".join([
-        CONFIG.llm.model,
-        CONFIG.llm.prompt_version,
-        *cluster_ids,
-    ])
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
-
-
-def _exported_worklist_version(path: Path) -> str:
-    """Derive the record default from exactly the IDs written for review."""
-    with path.open(newline="", encoding="utf-8") as handle:
-        cluster_ids = [
-            row["cluster_id"].strip()
-            for row in csv.DictReader(handle)
-        ]
-    return _worklist_version(cluster_ids)
-
-
 def cmd_label_verify(args: argparse.Namespace) -> int:
     """Export, ingest, and report the blinded human label-review workflow."""
     from src.llm import verify
@@ -1947,21 +1924,19 @@ def cmd_label_verify(args: argparse.Namespace) -> int:
         path = verify.export_worklist(
             con, signals_run, args.n, CONFIG.llm.verification_seed, Path(args.output),
         )
+        metadata = verify.load_worklist_metadata(con, path)
         print(f"worklist  : {path}")
-        print(f"version   : {_exported_worklist_version(path)}")
+        print(f"sidecar   : {verify.worklist_sidecar_path(path)}")
+        print(f"version   : {metadata.worklist_version}")
         return 0
     if args.verify_action == "record":
-        signals_run = args.signals_run or latest_run(con, "signals")
         # This CLI is the human-review ingestion path. Model-origin reviews
         # remain available to callers of src.llm.verify, never as CLI input.
-        rows = verify.parse_worklist(
-            Path(args.input), args.reviewer, reviewer_origin="human",
+        count, metadata = verify.record_worklist(
+            con, Path(args.input), args.reviewer,
         )
-        version = args.worklist_version or _worklist_version(
-            [row.cluster_id for row in rows]
-        )
-        print(f"recorded  : {verify.record(con, rows, signals_run, version)}")
-        print(f"version   : {version}")
+        print(f"recorded  : {count}")
+        print(f"version   : {metadata.worklist_version}")
         return 0
     print(verify.report(con, args.worklist_version).render())
     return 0
@@ -2083,8 +2058,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify_record = verify_sub.add_parser("record", help="ingest completed human review")
     p_verify_record.add_argument("--input", required=True)
     p_verify_record.add_argument("--reviewer", required=True)
-    p_verify_record.add_argument("--signals-run")
-    p_verify_record.add_argument("--worklist-version")
     p_verify_record.set_defaults(func=cmd_label_verify)
     p_verify_report = verify_sub.add_parser("report", help="show human-review agreement")
     p_verify_report.add_argument("--worklist-version")

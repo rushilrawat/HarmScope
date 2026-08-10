@@ -40,11 +40,27 @@ class ModelCallResult:
 
 
 class ModelCallError(RuntimeError):
-    def __init__(self, category: str, attempts: int, retryable: bool):
+    """A failed call, including paid accounting when a response arrived."""
+
+    def __init__(
+        self,
+        category: str,
+        attempts: int,
+        retryable: bool,
+        *,
+        usage: TokenUsage | None = None,
+        latency_seconds: float = 0.0,
+        estimated_cost_usd: float = 0.0,
+        response_received: bool = False,
+    ) -> None:
         super().__init__(f"{category} after {attempts} attempt(s)")
         self.category = category
         self.attempts = attempts
         self.retryable = retryable
+        self.usage = usage or TokenUsage()
+        self.latency_seconds = latency_seconds
+        self.estimated_cost_usd = estimated_cost_usd
+        self.response_received = response_received
 
 
 def estimate_cost(usage: TokenUsage, price: ModelPricing) -> float:
@@ -148,39 +164,79 @@ class AnthropicModelClient:
                     },
                     messages=[{"role": "user", "content": prompt}],
                 )
-                latency_seconds = self.clock() - started_at
-                usage = TokenUsage(
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    cache_read_input_tokens=getattr(
-                        response.usage, "cache_read_input_tokens", 0
-                    ),
-                    cache_creation_input_tokens=getattr(
-                        response.usage, "cache_creation_input_tokens", 0
-                    ),
-                )
-                payload = (
-                    {"refused": True, "stop_reason": "refusal"}
-                    if response.stop_reason == "refusal"
-                    else json.loads(next(
-                        block.text for block in response.content if block.type == "text"
-                    ))
-                )
-                return ModelCallResult(
-                    payload=payload,
-                    model=model,
-                    stop_reason=response.stop_reason,
-                    usage=usage,
-                    attempts=attempts,
-                    latency_seconds=latency_seconds,
-                    estimated_cost_usd=estimate_cost(usage, self.pricing),
-                )
             except Exception as exc:
                 category, retryable = classify_error(exc)
                 if not retryable or attempts > self.max_retries:
-                    raise ModelCallError(category, attempts, retryable) from exc
+                    raise ModelCallError(
+                        category,
+                        attempts,
+                        retryable,
+                        latency_seconds=self.clock() - started_at,
+                    ) from exc
                 base = min(
                     self.retry_base_seconds * 2 ** (attempts - 1),
                     self.retry_max_seconds,
                 )
                 self.sleeper(base + self.jitter(0, min(base * 0.25, 1.0)))
+                continue
+
+            # A response is paid usage even when its content is malformed.
+            # Keep extraction outside the transport exception block: parsing
+            # failures must never be misclassified as retryable provider calls.
+            latency_seconds = self.clock() - started_at
+            response_usage = getattr(response, "usage", None)
+            usage = TokenUsage(
+                input_tokens=getattr(response_usage, "input_tokens", 0),
+                output_tokens=getattr(response_usage, "output_tokens", 0),
+                cache_read_input_tokens=getattr(
+                    response_usage, "cache_read_input_tokens", 0
+                ),
+                cache_creation_input_tokens=getattr(
+                    response_usage, "cache_creation_input_tokens", 0
+                ),
+            )
+            estimated_cost_usd = estimate_cost(usage, self.pricing)
+            if response.stop_reason == "refusal":
+                payload = {"refused": True, "stop_reason": "refusal"}
+            else:
+                category = (
+                    "truncated_response"
+                    if response.stop_reason == "max_tokens"
+                    else "malformed_response"
+                )
+                try:
+                    text = next(
+                        block.text
+                        for block in response.content
+                        if block.type == "text"
+                    )
+                    payload = json.loads(text)
+                except (AttributeError, json.JSONDecodeError, StopIteration, TypeError) as exc:
+                    raise ModelCallError(
+                        category,
+                        attempts,
+                        False,
+                        usage=usage,
+                        latency_seconds=latency_seconds,
+                        estimated_cost_usd=estimated_cost_usd,
+                        response_received=True,
+                    ) from exc
+                if response.stop_reason == "max_tokens":
+                    raise ModelCallError(
+                        category,
+                        attempts,
+                        False,
+                        usage=usage,
+                        latency_seconds=latency_seconds,
+                        estimated_cost_usd=estimated_cost_usd,
+                        response_received=True,
+                    )
+            return ModelCallResult(
+                payload=payload,
+                model=model,
+                stop_reason=response.stop_reason,
+                usage=usage,
+                attempts=attempts,
+                latency_seconds=latency_seconds,
+                estimated_cost_usd=estimated_cost_usd,
+            )

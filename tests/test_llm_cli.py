@@ -66,16 +66,6 @@ def test_label_summary_reports_all_operational_totals(monkeypatch, capsys):
         assert term in out
 
 
-def test_default_worklist_version_is_stable_across_row_order():
-    """Sorting a completed sheet must not orphan the exported worklist version."""
-    original = pipeline._worklist_version(["cluster-b", "cluster-a"])
-
-    assert original == pipeline._worklist_version(["cluster-a", "cluster-b"])
-    assert original == pipeline._worklist_version([
-        "cluster-a", "cluster-b", "cluster-a",
-    ])
-
-
 def test_label_verify_rejects_duplicate_cluster_ids(tmp_path):
     """One cluster cannot count twice toward the human-review denominator."""
     row = dict.fromkeys(verify.HEADER, "")

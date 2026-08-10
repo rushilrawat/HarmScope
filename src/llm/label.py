@@ -201,29 +201,12 @@ def write_cache(cache_dir: Path, key: str, label: dict) -> None:
 
 def label_cluster(client, model: str, narratives: list[str],
                   taxonomy_labels: list[str], max_chars: int) -> dict:
-    """One API call. The only non-deterministic step in this package.
-
-    `cache_control` on the system block caches the guardrails across every
-    cluster in the run; the narratives sit after it and vary per call, which is
-    the ordering prompt caching requires — stable content first, volatile last.
-    """
-    response = client.messages.create(
+    """Delegate one typed request through the reliable transport boundary."""
+    result = client.call_json(
         model=model,
+        system=SYSTEM,
+        prompt=build_prompt(narratives, taxonomy_labels, max_chars),
+        schema=LABEL_SCHEMA,
         max_tokens=2000,
-        system=[{
-            "type": "text",
-            "text": SYSTEM,
-            "cache_control": {"type": "ephemeral"},
-        }],
-        output_config={"format": {"type": "json_schema", "schema": LABEL_SCHEMA}},
-        messages=[{
-            "role": "user",
-            "content": build_prompt(narratives, taxonomy_labels, max_chars),
-        }],
     )
-    if response.stop_reason == "refusal":
-        # Not an exception: a declined label is a fact about the cluster, and
-        # the run should record it and continue rather than abort a batch.
-        return {"refused": True, "stop_reason": "refusal"}
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+    return result.payload

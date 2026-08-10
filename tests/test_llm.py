@@ -15,7 +15,6 @@ can reach the package, deleting it cannot change their output.
 from __future__ import annotations
 
 import ast
-import json
 from pathlib import Path
 
 import numpy as np
@@ -209,38 +208,33 @@ def test_refusal_is_recorded_rather_than_raised():
     """A declined label is a fact about the cluster; a batch must not abort."""
 
     class _Refusing:
-        class messages:
-            @staticmethod
-            def create(**_):
-                return type("R", (), {"stop_reason": "refusal", "content": []})()
+        @staticmethod
+        def call_json(**_):
+            return type("R", (), {
+                "payload": {"refused": True, "stop_reason": "refusal"},
+            })()
 
     got = label_mod.label_cluster(_Refusing(), "m", ["n"], [], 1200)
     assert got == {"refused": True, "stop_reason": "refusal"}
 
 
 def test_label_call_uses_structured_outputs_and_caches_the_system_prompt():
-    """The two guarantees §2.2 and §2.4 turn on, asserted on the actual request."""
+    """Labeling delegates its typed request through the reliable client boundary."""
     seen = {}
 
     class _Recording:
-        class messages:
-            @staticmethod
-            def create(**kwargs):
-                seen.update(kwargs)
-                payload = json.dumps({"harm_mechanism": "x"})
-                block = type("B", (), {"type": "text", "text": payload})()
-                return type("R", (), {"stop_reason": "end_turn",
-                                      "content": [block]})()
+        @staticmethod
+        def call_json(**kwargs):
+            seen.update(kwargs)
+            return type("R", (), {"payload": {"harm_mechanism": "x"}})()
 
     label_mod.label_cluster(_Recording(), "claude-sonnet-5", ["n"], ["L"], 1200)
 
-    fmt = seen["output_config"]["format"]
-    assert fmt["type"] == "json_schema" and fmt["schema"] is label_mod.LABEL_SCHEMA
-    assert seen["system"][0]["cache_control"] == {"type": "ephemeral"}
-    # Sampling parameters are rejected on current models, and a prefilled
-    # assistant turn is a 400 — neither may creep back in.
-    assert not {"temperature", "top_p", "top_k"} & set(seen)
-    assert seen["messages"][-1]["role"] == "user"
+    assert seen["model"] == "claude-sonnet-5"
+    assert seen["schema"] is label_mod.LABEL_SCHEMA
+    assert seen["system"] == label_mod.SYSTEM
+    assert "Dominant existing taxonomy labels for this cluster: L" in seen["prompt"]
+    assert seen["max_tokens"] == 2000
 
 
 @pytest.mark.parametrize("field", ["confidence", "is_likely_template"])
