@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import date
 
 import pytest
@@ -15,10 +16,15 @@ def verification_fixture(con):
     cluster_run = "0000000000001-cluster1"
     signals_run = "0000000000002-signal01"
     for run_id, phase in ((cluster_run, "cluster"), (signals_run, "signals")):
+        params = (
+            json.dumps({"params": {"cluster_run": cluster_run}})
+            if phase == "signals"
+            else "{}"
+        )
         con.execute(
             "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
-            "started_at, status) VALUES (?, ?, 'test', 'test', '{}', now(), 'ok')",
-            [run_id, phase],
+            "started_at, status) VALUES (?, ?, 'test', 'test', ?, now(), 'ok')",
+            [run_id, phase, params],
         )
 
     for number in range(60):
@@ -85,6 +91,48 @@ def verification_fixture(con):
     return con, signals_run
 
 
+def _add_historical_cluster(con):
+    """A labelled cluster from another refit must not become a control row."""
+    historical_run = "0000000000000-cluster0"
+    cluster_id = f"{historical_run}:mortgage:0"
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'cluster', 'test', 'test', '{}', now(), 'ok')",
+        [historical_run],
+    )
+    con.execute(
+        "INSERT INTO clusters "
+        "(cluster_id, run_id, product_family, n_members, centroid_idx, as_of) "
+        "VALUES (?, ?, 'mortgage', 30, 700, ?)",
+        [cluster_id, historical_run, date(2020, 1, 1)],
+    )
+    con.execute(
+        "INSERT INTO cluster_labels "
+        "(cluster_id, harm_mechanism, distinct_from_taxonomy, confidence, "
+        "is_likely_template) VALUES (?, 'historical label', true, 'high', false)",
+        [cluster_id],
+    )
+    for number in range(10):
+        complaint_id = 1000 + number
+        con.execute(
+            "INSERT INTO complaints "
+            "(complaint_id, date_received, period_month, product_family, has_narrative) "
+            "VALUES (?, ?, ?, 'mortgage', true)",
+            [complaint_id, date(2020, 1, 1), date(2020, 1, 1)],
+        )
+        con.execute(
+            "INSERT INTO narratives "
+            "(complaint_id, text_redacted, text_hash, redaction_count) "
+            "VALUES (?, 'historical text', ?, 0)",
+            [complaint_id, f"historical-{number}"],
+        )
+        con.execute(
+            "INSERT INTO cluster_members (cluster_id, complaint_id) VALUES (?, ?)",
+            [cluster_id, complaint_id],
+        )
+    return cluster_id
+
+
 def test_export_is_seeded_stratified_and_signal_blinded(verification_fixture, tmp_path):
     """Sampling must be reproducible without leaking signal strength to reviewers."""
     con, signals_run = verification_fixture
@@ -103,6 +151,52 @@ def test_export_is_seeded_stratified_and_signal_blinded(verification_fixture, tm
     ))
     assert all(row["narrative_10"] for row in rows)
     assert all("  " not in row["narrative_1"] for row in rows)
+
+
+def test_export_requires_the_configured_human_review_minimum(
+    verification_fixture, tmp_path,
+):
+    """A smaller worklist cannot be presented as satisfying the human-review gate."""
+    con, signals_run = verification_fixture
+
+    with pytest.raises(ValueError, match="at least 50"):
+        verify.export_worklist(con, signals_run, 49, 7, tmp_path / "review.csv")
+
+
+def test_export_rejects_an_eligible_population_smaller_than_requested(
+    verification_fixture, tmp_path,
+):
+    """The exporter must not silently downgrade the required human denominator."""
+    con, signals_run = verification_fixture
+
+    with pytest.raises(ValueError, match="eligible.*60.*requested 61"):
+        verify.export_worklist(con, signals_run, 61, 7, tmp_path / "review.csv")
+
+
+def test_historical_cluster_run_cannot_enter_worklist_or_human_report(
+    verification_fixture, tmp_path,
+):
+    """Controls belong to the selected signals run's cluster refit, never history."""
+    con, signals_run = verification_fixture
+    historical_cluster = _add_historical_cluster(con)
+
+    rows = list(csv.DictReader(
+        verify.export_worklist(con, signals_run, 60, 7, tmp_path / "review.csv").open()
+    ))
+
+    assert historical_cluster not in {row["cluster_id"] for row in rows}
+    historical_review = verify.Verification(
+        cluster_id=historical_cluster,
+        reviewer_id="reviewer-1",
+        mechanism_accuracy="agree",
+        taxonomy_distinctness_accuracy="agree",
+        template_accuracy="agree",
+        should_have_abstained=False,
+        failure_category="none",
+        notes=None,
+    )
+    with pytest.raises(ValueError, match="does not belong"):
+        verify.record(con, [historical_review], signals_run, "wl-v1")
 
 
 def _filled_worklist(tmp_path, **changes):
@@ -176,6 +270,31 @@ def test_report_has_denominators_and_wilson_intervals(verification_fixture):
     assert set(report.by_fired_status) == {"fired", "control"}
     assert report.by_fired_status["fired"].mechanism.total == 25
     assert report.by_confidence["high"].mechanism.total > 0
+
+
+def test_model_origin_reviews_do_not_count_as_human_verification(verification_fixture):
+    """Stored model reviews remain auditable but cannot satisfy the human gate."""
+    con, signals_run = verification_fixture
+    verify.record(con, _reviewed_rows(agree=39, total=50), signals_run, "wl-v1")
+    model_review = verify.Verification(
+        cluster_id="0000000000001-cluster1:mortgage:0",
+        reviewer_id="model-judge",
+        mechanism_accuracy="agree",
+        taxonomy_distinctness_accuracy="agree",
+        template_accuracy="agree",
+        should_have_abstained=False,
+        failure_category="none",
+        notes=None,
+        reviewer_origin="model",
+    )
+    assert verify.record(con, [model_review], signals_run, "wl-v1") == 1
+
+    report = verify.report(con, "wl-v1")
+
+    assert report.mechanism_total == 50
+    assert con.execute(
+        "SELECT reviewer_origin FROM label_verifications WHERE reviewer_id = 'model-judge'"
+    ).fetchone() == ("model",)
 
 
 def test_wilson_is_bounded_for_empty_and_complete_samples():

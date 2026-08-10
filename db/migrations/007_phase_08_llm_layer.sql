@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 CREATE TABLE IF NOT EXISTS label_verifications (
   cluster_id                  VARCHAR NOT NULL REFERENCES cluster_labels(cluster_id),
   reviewer_id                 VARCHAR NOT NULL,
+  reviewer_origin             VARCHAR NOT NULL CHECK (reviewer_origin IN ('human', 'model')),
   worklist_version            VARCHAR NOT NULL,
   signals_run                 VARCHAR NOT NULL,
   is_fired                    BOOLEAN NOT NULL,

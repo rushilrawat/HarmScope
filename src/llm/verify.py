@@ -35,6 +35,7 @@ FAILURE_CATEGORIES = {
     "missed_submechanism", "taxonomy_error", "template_error",
     "unsupported_claim", "other",
 }
+REVIEWER_ORIGINS = {"human", "model"}
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class Verification:
     should_have_abstained: bool
     failure_category: str
     notes: str | None
+    reviewer_origin: str = "human"
 
 
 @dataclass(frozen=True)
@@ -178,7 +180,22 @@ def _sample(candidates: list[_Candidate], n: int, seed: int) -> list[_Candidate]
     return selected
 
 
+def _cluster_run_for(con, signals_run: str) -> str:
+    """Return the cluster refit that the selected signals run actually scored."""
+    row = con.execute(
+        """
+        SELECT json_extract_string(params_json, '$.params.cluster_run')
+        FROM runs WHERE run_id = ? AND phase = 'signals'
+        """,
+        [signals_run],
+    ).fetchone()
+    if row is None or not row[0]:
+        raise ValueError(f"signals run {signals_run!r} does not record a cluster_run")
+    return row[0]
+
+
 def _candidates(con, signals_run: str) -> list[_Candidate]:
+    cluster_run = _cluster_run_for(con, signals_run)
     rows = con.execute(
         """
         SELECT l.cluster_id, c.product_family, l.harm_mechanism, l.actors,
@@ -193,12 +210,12 @@ def _candidates(con, signals_run: str) -> list[_Candidate]:
         FROM cluster_labels l
         JOIN clusters c USING (cluster_id)
         LEFT JOIN cluster_novelty n USING (cluster_id)
-        WHERE (
+        WHERE c.run_id = ? AND (
             SELECT count(*) FROM cluster_members m WHERE m.cluster_id = l.cluster_id
         ) >= 10
         ORDER BY l.cluster_id
         """,
-        [signals_run, CONFIG.signals.fdr_alpha],
+        [signals_run, CONFIG.signals.fdr_alpha, cluster_run],
     ).fetchall()
     return [_Candidate(*row) for row in rows]
 
@@ -220,9 +237,16 @@ def _narratives(con, cluster_id: str) -> list[str]:
 
 def export_worklist(con, signals_run: str, n: int, seed: int, path: Path) -> Path:
     """Write a deterministic, stratified but signal-blinded CSV worklist."""
-    if n < 0:
-        raise ValueError("n must be non-negative")
-    selected = _sample(_candidates(con, signals_run), n, seed)
+    if n < CONFIG.llm.human_verify_n:
+        raise ValueError(
+            f"human verification requires at least {CONFIG.llm.human_verify_n} rows"
+        )
+    candidates = _candidates(con, signals_run)
+    if len(candidates) < n:
+        raise ValueError(
+            f"eligible population {len(candidates)} is smaller than requested {n}"
+        )
+    selected = _sample(candidates, n, seed)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=HEADER, extrasaction="raise")
@@ -290,10 +314,20 @@ def _failure_category(row: dict[str, str], fully_agrees: bool) -> str:
     return value
 
 
-def parse_worklist(path: Path, reviewer_id: str) -> list[Verification]:
+def _reviewer_origin(reviewer_origin: str) -> str:
+    origin = reviewer_origin.strip().lower()
+    if origin not in REVIEWER_ORIGINS:
+        raise ValueError("reviewer_origin must be human or model")
+    return origin
+
+
+def parse_worklist(
+    path: Path, reviewer_id: str, reviewer_origin: str = "human",
+) -> list[Verification]:
     """Parse completed reviewer decisions with a deliberately strict contract."""
     if not reviewer_id.strip():
         raise ValueError("reviewer_id is required")
+    origin = _reviewer_origin(reviewer_origin)
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames != HEADER:
@@ -316,7 +350,7 @@ def parse_worklist(path: Path, reviewer_id: str) -> list[Verification]:
             notes = row.get("notes", "").strip() or None
             parsed.append(Verification(
                 cluster_id, reviewer_id, mechanism, taxonomy, template, abstained,
-                category, notes,
+                category, notes, origin,
             ))
     return parsed
 
@@ -339,22 +373,33 @@ def record(
     """Persist completed reviews, deriving hidden signal status after review."""
     if not worklist_version.strip():
         raise ValueError("worklist_version is required")
+    cluster_run = _cluster_run_for(con, signals_run)
     con.execute("BEGIN TRANSACTION")
     try:
         for row in rows:
             labelled = con.execute(
-                "SELECT 1 FROM cluster_labels WHERE cluster_id = ?", [row.cluster_id],
+                """
+                SELECT c.run_id FROM cluster_labels l
+                JOIN clusters c USING (cluster_id)
+                WHERE l.cluster_id = ?
+                """,
+                [row.cluster_id],
             ).fetchone()
             if labelled is None:
                 raise ValueError(f"unknown labelled cluster_id: {row.cluster_id}")
+            if labelled[0] != cluster_run:
+                raise ValueError(
+                    f"cluster {row.cluster_id!r} does not belong to signals run {signals_run!r}"
+                )
+            origin = _reviewer_origin(row.reviewer_origin)
             con.execute(
                 "INSERT OR REPLACE INTO label_verifications "
-                "(cluster_id, reviewer_id, worklist_version, signals_run, is_fired, "
+                "(cluster_id, reviewer_id, reviewer_origin, worklist_version, signals_run, is_fired, "
                 "mechanism_accuracy, taxonomy_distinctness_accuracy, template_accuracy, "
                 "should_have_abstained, failure_category, notes, reviewed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    row.cluster_id, row.reviewer_id, worklist_version, signals_run,
+                    row.cluster_id, row.reviewer_id, origin, worklist_version, signals_run,
                     _is_fired(con, row.cluster_id, signals_run), row.mechanism_accuracy,
                     row.taxonomy_distinctness_accuracy, row.template_accuracy,
                     row.should_have_abstained, row.failure_category, row.notes,
@@ -418,7 +463,12 @@ def report(con, worklist_version: str | None = None) -> VerificationReport:
                coalesce(l.confidence, '(unknown)') AS confidence
         FROM label_verifications v
         JOIN cluster_labels l USING (cluster_id)
-        WHERE ? IS NULL OR v.worklist_version = ?
+        JOIN clusters c USING (cluster_id)
+        JOIN runs source_run ON source_run.run_id = v.signals_run
+                            AND source_run.phase = 'signals'
+        WHERE v.reviewer_origin = 'human'
+          AND c.run_id = json_extract_string(source_run.params_json, '$.params.cluster_run')
+          AND (? IS NULL OR v.worklist_version = ?)
         ORDER BY v.cluster_id, v.reviewer_id, v.worklist_version
         """,
         [CONFIG.signals.fdr_alpha, worklist_version, worklist_version],

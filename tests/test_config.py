@@ -14,6 +14,7 @@ def test_llm_operational_parameters_are_fingerprinted():
     assert payload["retry_base_seconds"] == 1.0
     assert payload["input_usd_per_million"] > 0
     assert payload["output_usd_per_million"] > 0
+    assert payload["human_verify_n"] == 50
 
 
 def test_config_is_frozen():

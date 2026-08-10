@@ -26,6 +26,10 @@ def test_phase8_tables_exist_on_a_fresh_database(con):
         "llm_usage", "label_verifications", "rag_answers", "rag_eval_results"
     }
     assert required <= set(db.table_names(con))
+    columns = {
+        row[1] for row in con.execute("PRAGMA table_info('label_verifications')").fetchall()
+    }
+    assert "reviewer_origin" in columns
 
 
 def test_phase8_migration_upgrades_a_pre_phase8_database(con):
@@ -38,6 +42,10 @@ def test_phase8_migration_upgrades_a_pre_phase8_database(con):
     assert {
         "llm_usage", "label_verifications", "rag_answers", "rag_eval_results"
     } <= set(db.table_names(con))
+    columns = {
+        row[1] for row in con.execute("PRAGMA table_info('label_verifications')").fetchall()
+    }
+    assert "reviewer_origin" in columns
 
 
 def test_schema_applies_and_is_idempotent(tmp_path):
