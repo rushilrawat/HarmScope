@@ -286,6 +286,77 @@ def test_render_cli_treats_untrusted_text_as_plain_console_data():
     assert "ignore next" in rendered
 
 
+def test_render_cli_neutralizes_osc_and_c1_terminal_controls():
+    """Control-string payloads must not become terminal commands or misleading prose."""
+    unsafe = "\x1b]8;;https://example.test\x07visible\x1b]8;;\x07\x9b31mred\x9b0m"
+    result = answer.AnswerResult(
+        answer=answer.GroundedAnswer(
+            answer=unsafe,
+            claims=(answer.Claim(unsafe, (10,)),),
+            insufficient_evidence=False,
+            limitations=(unsafe,),
+        ),
+        evidence=(evidence(10, text_redacted=unsafe),),
+        enforcement_context=(),
+        cached=False,
+        usage=TokenUsage(),
+        latency_seconds=0.0,
+        estimated_cost_usd=0.0,
+    )
+
+    rendered = answer.render_cli(result, disclaimer="Fixed disclaimer.")
+
+    assert "\x1b" not in rendered
+    assert "\x9b" not in rendered
+    assert "https://example.test" not in rendered
+    assert "visible" in rendered
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "👩🏽‍💻",
+        "क्‍ष",
+        "می‌خواهم",
+        "नमस्ते Café",
+    ],
+    ids=["emoji-zwj", "indic-zwj", "persian-zwnj", "non-latin-combining"],
+)
+def test_render_cli_preserves_safe_unicode_text(text):
+    """Removing joiners or combining marks corrupts analysts' source text."""
+    result = answer.AnswerResult(
+        answer=answer.GroundedAnswer(
+            answer=text,
+            claims=(answer.Claim(text, (10,)),),
+            insufficient_evidence=False,
+            limitations=(text,),
+        ),
+        evidence=(evidence(10, text_redacted=text),),
+        enforcement_context=(),
+        cached=False,
+        usage=TokenUsage(),
+        latency_seconds=0.0,
+        estimated_cost_usd=0.0,
+    )
+
+    rendered = answer.render_cli(result, disclaimer="Fixed disclaimer.")
+
+    assert text in rendered
+
+
+@pytest.mark.parametrize(
+    "control",
+    ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069"],
+    ids=["lre", "rle", "pdf", "lro", "rlo", "lri", "rli", "fsi", "pdi"],
+)
+def test_render_cli_neutralizes_bidi_display_spoofing_controls(control):
+    """Bidi override and isolate controls must not alter terminal display order."""
+    rendered = answer._console_text(f"before{control}after")
+
+    assert control not in rendered
+    assert rendered == "before after"
+
+
 def test_prompt_labels_evidence_and_company_response_separately():
     prompt = answer.build_prompt(
         "Why were refunds delayed?",

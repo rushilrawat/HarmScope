@@ -6,7 +6,6 @@ import hashlib
 import json
 import math
 import re
-import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -61,6 +60,13 @@ SYSTEM = (
     "If the complaint evidence cannot answer the question, return an empty answer, "
     "no claims, insufficient_evidence=true, and a nonblank limitation."
 )
+
+
+_OSC_SEQUENCE = re.compile(r"(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?")
+_ESC_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[ -/]*[@-~])?")
+# These Unicode Bidirectional Algorithm formatting controls can reorder visible
+# text. Other format characters, notably ZWJ and ZWNJ, remain meaningful data.
+_BIDI_DISPLAY_CONTROLS = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
 
 
 @dataclass(frozen=True)
@@ -729,9 +735,15 @@ def _console_text(value: object) -> str:
     """Render untrusted model and evidence text as one inert console line."""
     if type(value) is not str:
         raise TypeError("console text must be a string")
-    value = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[ -/]*[@-~])?", "", value)
+    value = _OSC_SEQUENCE.sub("", value)
+    value = _ESC_SEQUENCE.sub("", value)
     safe = "".join(
-        " " if unicodedata.category(character) in {"Cc", "Cf"} else character for character in value
+        " "
+        if ord(character) <= 0x1F
+        or 0x7F <= ord(character) <= 0x9F
+        or character in _BIDI_DISPLAY_CONTROLS
+        else character
+        for character in value
     )
     return " ".join(safe.split())
 
