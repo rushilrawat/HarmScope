@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -721,6 +723,92 @@ def build_prompt(
         "Enforcement action IDs are context only and must not be used as complaint citations.\n"
         f"{json.dumps(prompt_data, ensure_ascii=False, indent=2)}"
     )
+
+
+def _console_text(value: object) -> str:
+    """Render untrusted model and evidence text as one inert console line."""
+    if type(value) is not str:
+        raise TypeError("console text must be a string")
+    value = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[ -/]*[@-~])?", "", value)
+    safe = "".join(
+        " " if unicodedata.category(character) in {"Cc", "Cf"} else character for character in value
+    )
+    return " ".join(safe.split())
+
+
+def _section(title: str, lines: list[str]) -> str:
+    return "\n".join([title, "-" * len(title), *lines])
+
+
+def render_cli(result: AnswerResult, *, disclaimer: str) -> str:
+    """Render one typed answer with its evidence and context visibly separated."""
+    if type(result) is not AnswerResult:
+        raise TypeError("result must be an AnswerResult")
+    if type(disclaimer) is not str or not disclaimer.strip():
+        raise ValueError("disclaimer must be a nonblank string")
+
+    answer_value = result.answer
+    answer_lines = (
+        [_console_text(answer_value.answer)]
+        if not answer_value.insufficient_evidence
+        else ["Insufficient complaint evidence to answer this question."]
+    )
+    claim_lines = [
+        f"- {_console_text(claim.text)} [Complaint IDs: "
+        f"{', '.join(str(complaint_id) for complaint_id in claim.complaint_ids)}]"
+        for claim in answer_value.claims
+    ] or ["(none)"]
+    complaint_lines = [
+        (
+            f"Complaint {row.complaint_id} | {row.date_received.isoformat()} | "
+            f"Company: {_console_text(row.company_name)} ({_console_text(row.company_id)})\n"
+            f"  Redacted narrative: {_console_text(row.text_redacted)}"
+        )
+        for row in result.evidence
+    ] or ["(none)"]
+    response_lines = [
+        (
+            f"- Company: {_console_text(response['company_name'])} "
+            f"({_console_text(response['company_id'])})\n"
+            f"  Statement: {_console_text(response['text'])}"
+        )
+        for response in _render_company_responses(list(result.evidence))
+    ] or ["(none)"]
+    limitation_lines = [f"- {_console_text(limitation)}" for limitation in answer_value.limitations]
+    metadata_lines = [
+        f"Cache: {'hit' if result.cached else 'miss'}",
+        f"Input tokens: {result.usage.input_tokens}",
+        f"Output tokens: {result.usage.output_tokens}",
+        f"Prompt cache read tokens: {result.usage.cache_read_input_tokens}",
+        f"Prompt cache creation tokens: {result.usage.cache_creation_input_tokens}",
+        f"Estimated cost: ${result.estimated_cost_usd:.6f}",
+        f"Latency: {result.latency_seconds:.3f}s",
+    ]
+    sections = [
+        _section("Answer", answer_lines),
+        _section("Claims", claim_lines),
+        _section("Retrieved complaint evidence (fused order)", complaint_lines),
+        _section("Company public responses", response_lines),
+    ]
+    if result.enforcement_context:
+        enforcement_lines = [
+            (
+                f"- Action: {_console_text(context.action_id)} | "
+                f"Filed: {context.filed_date.isoformat()}\n"
+                f"  Summary: {_console_text(context.harm_summary)}\n"
+                f"  Source URL: {_console_text(context.source_url or '(none)')}"
+            )
+            for context in result.enforcement_context
+        ]
+        sections.append(_section("Enforcement context", enforcement_lines))
+    sections.extend(
+        [
+            _section("Limitations", limitation_lines),
+            _section("Metadata", metadata_lines),
+            _section("Disclaimer", [disclaimer]),
+        ]
+    )
+    return "\n\n".join(sections)
 
 
 def answer_question(

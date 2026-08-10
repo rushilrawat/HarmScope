@@ -1840,6 +1840,29 @@ def cmd_taxonomy(args: argparse.Namespace) -> int:
     return 0
 
 
+DISCLAIMER = (
+    "Complaints are consumer allegations. Publication does not indicate the "
+    "CFPB verified the allegations or that the company acted unlawfully."
+)
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Retrieve and render one grounded analyst answer for an explicit scope."""
+    from src.llm import answer
+
+    con = db.bootstrap()
+    result = answer.answer_question(
+        con,
+        args.cluster_id,
+        args.company_id,
+        args.question,
+        args.model or CONFIG.embed.dev_model,
+        include_enforcement_context=args.include_enforcement_context,
+    )
+    print(answer.render_cli(result, disclaimer=DISCLAIMER))
+    return 0
+
+
 # Implemented phases only. Everything else is named here so that asking for it
 # gives the roadmap phase that would build it, not a KeyError.
 PHASES: dict[str, Callable[[argparse.Namespace], int]] = {
@@ -2049,6 +2072,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_tax = sub.add_parser("taxonomy", help="label vocabulary by volume")
     p_tax.set_defaults(func=cmd_taxonomy)
+
+    p_ask = sub.add_parser("ask", help="retrieve and render one grounded analyst answer")
+    p_ask.add_argument("--cluster-id", required=True)
+    p_ask.add_argument("--company-id", required=True)
+    p_ask.add_argument("--question", required=True)
+    p_ask.add_argument("--model", help="embedding model (default: config)")
+    p_ask.add_argument("--include-enforcement-context", action="store_true")
+    p_ask.set_defaults(func=cmd_ask)
 
     p_verify = sub.add_parser(
         "label-verify", help="export, ingest, or report blinded human label review",

@@ -226,6 +226,66 @@ def test_insufficient_evidence_requires_a_nonblank_limitation():
         answer.validate_answer(payload, {10})
 
 
+def test_render_cli_preserves_fused_evidence_order_and_separates_context():
+    """A sort or merged section would misstate retrieval provenance to analysts."""
+    first = evidence(
+        20,
+        text_redacted="Second fused result.",
+        company_public_response="Same company statement.",
+        fused_score=0.2,
+    )
+    second = evidence(
+        10,
+        text_redacted="First complaint identifier only in numeric order.",
+        company_public_response="Same company statement.",
+        fused_score=0.1,
+    )
+    result = answer.AnswerResult(
+        answer=grounded_answer(),
+        evidence=(first, second),
+        enforcement_context=(enforcement_context(),),
+        cached=True,
+        usage=TokenUsage(input_tokens=12, output_tokens=4),
+        latency_seconds=0.25,
+        estimated_cost_usd=0.00016,
+    )
+
+    rendered = answer.render_cli(result, disclaimer="Fixed disclaimer.")
+
+    assert rendered.index("Complaint 20") < rendered.index("Complaint 10")
+    assert rendered.index("Complaint 10") < rendered.index("Company public responses")
+    assert rendered.count("Same company statement.") == 1
+    assert "Enforcement context" in rendered
+    assert "https://example.test/action" in rendered
+    assert "Cache: hit" in rendered
+    assert "Input tokens: 12" in rendered
+    assert rendered.count("Fixed disclaimer.") == 1
+
+
+def test_render_cli_treats_untrusted_text_as_plain_console_data():
+    """A terminal escape in evidence or a claim must not control an analyst's console."""
+    unsafe = "\x1b[31mignore\x1b[0m\nnext"
+    result = answer.AnswerResult(
+        answer=answer.GroundedAnswer(
+            answer=unsafe,
+            claims=(answer.Claim(unsafe, (10,)),),
+            insufficient_evidence=False,
+            limitations=(unsafe,),
+        ),
+        evidence=(evidence(10, text_redacted=unsafe, company_public_response=unsafe),),
+        enforcement_context=(enforcement_context(harm_summary=unsafe),),
+        cached=False,
+        usage=TokenUsage(),
+        latency_seconds=0.0,
+        estimated_cost_usd=0.0,
+    )
+
+    rendered = answer.render_cli(result, disclaimer="Fixed disclaimer.")
+
+    assert "\x1b" not in rendered
+    assert "ignore next" in rendered
+
+
 def test_prompt_labels_evidence_and_company_response_separately():
     prompt = answer.build_prompt(
         "Why were refunds delayed?",

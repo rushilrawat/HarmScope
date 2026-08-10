@@ -58,7 +58,7 @@ def _imports(path: Path) -> set[str]:
 def test_detection_path_never_imports_the_llm_layer():
     """§1 — deleting src/llm/ must leave `signals` byte-identical."""
     offenders = []
-    llm_only_tables = {"llm_usage", "rag_answers", "rag_eval_results"}
+    llm_only_tables = {"llm_usage", "rag_answers", "rag_eval_results", "label_verifications"}
     for package in DETECTION:
         for source in (ROOT / "src" / package).rglob("*.py"):
             tree = ast.parse(source.read_text())
@@ -102,6 +102,23 @@ def test_pipeline_imports_the_llm_layer_lazily():
                 "src/pipeline.py imports src.llm at module level; it must be "
                 "imported inside the function that uses it"
             )
+
+
+def test_cmd_ask_imports_the_llm_layer_inside_its_function():
+    """The analyst CLI must not make the deterministic pipeline import Phase 8."""
+    tree = ast.parse((ROOT / "src" / "pipeline.py").read_text())
+    cmd_ask = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "cmd_ask"
+    )
+    imports = [node for node in ast.walk(cmd_ask) if isinstance(node, (ast.Import, ast.ImportFrom))]
+    assert any(
+        (isinstance(node, ast.ImportFrom) and node.module == "src.llm")
+        or (
+            isinstance(node, ast.Import)
+            and any(alias.name.startswith("src.llm") for alias in node.names)
+        )
+        for node in imports
+    )
 
 
 # --- selection (deterministic, no API) --------------------------------------
