@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+import math
+from dataclasses import FrozenInstanceError, replace
 from datetime import date
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -49,6 +52,24 @@ def scoped_corpus():
 
 
 @pytest.fixture
+def fake_encoder():
+    return FakeEncoder(np.array([[1.0, 0.0]], dtype=np.float32))
+
+
+@pytest.fixture
+def vectors():
+    return np.array(
+        [
+            [0.0, 1.0],
+            [0.8, 0.6],
+            [1.0, 0.0],
+            [1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+@pytest.fixture
 def retrieval_fixture(con):
     wanted_cluster = "0000000000001-test:mortgage:1"
     other_cluster = "0000000000001-test:mortgage:2"
@@ -86,8 +107,22 @@ def retrieval_fixture(con):
             "first redacted narrative",
             "Company disputes the allegation.",
         ),
-        (30, wanted_cluster, other_company, "Other Bank", "other-company redacted narrative", None),
-        (40, other_cluster, wanted_company, "Acme Bank", "other-cluster redacted narrative", None),
+        (
+            30,
+            wanted_cluster,
+            other_company,
+            "Other Bank",
+            "escrow refund escrow refund strongest lexical match",
+            None,
+        ),
+        (
+            40,
+            other_cluster,
+            wanted_company,
+            "Acme Bank",
+            "escrow refund other-cluster narrative",
+            None,
+        ),
     )
     for row_idx, (complaint_id, cluster_id, company_id, company_name, text, response) in enumerate(
         records
@@ -136,6 +171,24 @@ def test_load_corpus_cannot_escape_cluster_or_company(retrieval_fixture):
     assert {row.cluster_id for row in corpus.rows} == {wanted_cluster}
     assert {row.company_id for row in corpus.rows} == {wanted_company}
     assert [row.complaint_id for row in corpus.rows] == [10, 20]
+
+
+def test_load_corpus_uses_only_the_requested_embedding_model(retrieval_fixture):
+    """A competing model mapping cannot replace or duplicate the requested row."""
+    con, wanted_cluster, wanted_company = retrieval_fixture
+    con.execute(
+        "INSERT INTO embedding_map (complaint_id, row_idx, model, dim) "
+        "VALUES (10, 99, 'competing-model', 2)"
+    )
+
+    requested = retrieve.load_corpus(con, wanted_cluster, wanted_company, "embed-m")
+    competing = retrieve.load_corpus(con, wanted_cluster, wanted_company, "competing-model")
+
+    assert [(row.complaint_id, row.row_idx) for row in requested.rows] == [
+        (10, 1),
+        (20, 0),
+    ]
+    assert [(row.complaint_id, row.row_idx) for row in competing.rows] == [(10, 99)]
 
 
 def test_load_corpus_carries_auditable_evidence_fields(retrieval_fixture):
@@ -294,6 +347,39 @@ def test_dense_rank_rejects_zero_norm_query(scoped_corpus):
         )
 
 
+@pytest.mark.parametrize(
+    ("vectors", "query", "message"),
+    [
+        (
+            np.array([[np.nan, 0.0]], dtype=np.float32),
+            np.array([[1.0, 0.0]], dtype=np.float32),
+            "embedding matrix",
+        ),
+        (
+            np.array([[1.0, 0.0]], dtype=np.float32),
+            np.array([[np.inf, 0.0]], dtype=np.float32),
+            "query vector",
+        ),
+    ],
+)
+def test_dense_rank_rejects_non_finite_inputs(scoped_corpus, vectors, query, message):
+    """NaN or infinity must fail before reaching FAISS ranking."""
+    with pytest.raises(ValueError, match=message):
+        retrieve.dense_rank(scoped_corpus, vectors, query, limit=1)
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_dense_rank_rejects_non_positive_limit(scoped_corpus, limit):
+    """A non-positive dense candidate count is invalid configuration."""
+    with pytest.raises(ValueError, match="limit must be positive"):
+        retrieve.dense_rank(
+            scoped_corpus,
+            np.array([[1.0, 0.0]], dtype=np.float32),
+            np.array([[1.0, 0.0]], dtype=np.float32),
+            limit=limit,
+        )
+
+
 def test_tokenizer_is_lowercase_and_deterministic():
     """Changing token normalization would change lexical retrieval results."""
     assert retrieve.tokenize("APR fees, APR-refund!") == [
@@ -441,3 +527,225 @@ def test_malformed_sparse_cache_is_quarantined(scoped_corpus, tmp_path, payload)
     assert sparse.complaint_ids == (1,)
     assert path.exists()
     assert len(list(tmp_path.glob(f"{path.name}.corrupt-*"))) == 1
+
+
+def test_rrf_combines_component_ranks_and_breaks_ties_by_id():
+    """Equal reciprocal-rank totals resolve deterministically on source ID."""
+    dense = [retrieve.RankedHit(10, 1, 0.9), retrieve.RankedHit(20, 2, 0.8)]
+    sparse = [retrieve.RankedHit(20, 1, 4.0), retrieve.RankedHit(10, 2, 3.0)]
+
+    got = retrieve.reciprocal_rank_fusion(dense, sparse, rrf_k=60, top_k=10)
+
+    assert [hit.complaint_id for hit in got] == [10, 20]
+    assert got[0].fused_score == pytest.approx(got[1].fused_score)
+    assert got[0].dense_rank == 1
+    assert got[0].sparse_rank == 2
+    assert got[1].dense_score == pytest.approx(0.8)
+    assert got[1].sparse_score == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize(("rrf_k", "top_k"), [(0, 10), (-1, 10), (60, 0), (60, -1)])
+def test_rrf_rejects_non_positive_configuration(rrf_k, top_k):
+    """Invalid fusion constants fail instead of producing meaningless ranks."""
+    with pytest.raises(ValueError, match="positive"):
+        retrieve.reciprocal_rank_fusion([], [], rrf_k=rrf_k, top_k=top_k)
+
+
+@pytest.mark.parametrize(
+    "hits",
+    [
+        [retrieve.RankedHit(10, 0, 1.0)],
+        [retrieve.RankedHit(10, 1, math.nan)],
+        [retrieve.RankedHit(10, 1, 1.0), retrieve.RankedHit(10, 2, 0.5)],
+        [retrieve.RankedHit(10, 1, 1.0), retrieve.RankedHit(20, 1, 0.5)],
+    ],
+)
+def test_rrf_rejects_malformed_component_rankings(hits):
+    """Fusion refuses invalid ranks, scores, duplicate IDs, and duplicate ranks."""
+    with pytest.raises(ValueError, match="rank|score|duplicate"):
+        retrieve.reciprocal_rank_fusion(hits, [], rrf_k=60, top_k=10)
+
+
+def test_retrieval_result_types_are_immutable():
+    """Evaluation inputs cannot drift after retrieval has been measured."""
+    fused = retrieve.FusedHit(10, 0.1, 1, 0.9, None, None)
+    evidence_row = retrieve.RetrievedEvidence(
+        complaint_id=10,
+        date_received=date(2020, 1, 1),
+        company_id="acme-bank",
+        company_name="Acme Bank",
+        product_family="mortgage",
+        text_redacted="evidence",
+        company_public_response=None,
+        dense_rank=1,
+        dense_score=0.9,
+        sparse_rank=None,
+        sparse_score=None,
+        fused_score=0.1,
+    )
+    result = retrieve.RetrievalResult(
+        corpus=retrieve.ScopedCorpus("c", None, "m", ()),
+        dense=(),
+        sparse=(),
+        fused=(fused,),
+        evidence=(evidence_row,),
+        dense_seconds=0.0,
+        sparse_seconds=0.0,
+        fusion_seconds=0.0,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        fused.fused_score = 0.2
+    with pytest.raises(FrozenInstanceError):
+        evidence_row.text_redacted = "changed"
+    with pytest.raises(FrozenInstanceError):
+        result.evidence = ()
+
+
+def test_retrieve_variants_is_scoped_auditable_cached_and_observable(
+    retrieval_fixture, fake_encoder, vectors, tmp_path
+):
+    """The full hybrid path exposes every stage without leaking top external matches."""
+    con, cluster_id, company_id = retrieval_fixture
+
+    first = retrieve.retrieve_variants(
+        con,
+        cluster_id,
+        company_id,
+        "escrow refund",
+        "embed-m",
+        encoder=fake_encoder,
+        vectors=vectors,
+        cache_dir=tmp_path,
+        top_k=10,
+    )
+    cache_path = next(tmp_path.glob("bm25.*.json"))
+    first_cache_identity = (cache_path.stat().st_ino, cache_path.stat().st_mtime_ns)
+    second = retrieve.retrieve_variants(
+        con,
+        cluster_id,
+        company_id,
+        "escrow refund",
+        "embed-m",
+        encoder=fake_encoder,
+        vectors=vectors,
+        cache_dir=tmp_path,
+        top_k=10,
+    )
+
+    assert [hit.complaint_id for hit in first.dense] == [10, 20]
+    assert [hit.complaint_id for hit in first.sparse] == [10, 20]
+    assert [hit.complaint_id for hit in first.fused] == [10, 20]
+    assert [row.complaint_id for row in first.evidence] == [10, 20]
+    assert {30, 40}.isdisjoint(hit.complaint_id for hit in first.dense)
+    assert {30, 40}.isdisjoint(hit.complaint_id for hit in first.sparse)
+    assert {30, 40}.isdisjoint(hit.complaint_id for hit in first.fused)
+    assert [(row.complaint_id, row.date_received) for row in first.evidence] == [
+        (10, date(2020, 1, 1)),
+        (20, date(2020, 1, 2)),
+    ]
+    assert all(row.text_redacted for row in first.evidence)
+    assert all(row.dense_rank is not None or row.sparse_rank is not None for row in first.evidence)
+    assert all(
+        math.isfinite(seconds) and seconds >= 0.0
+        for seconds in (first.dense_seconds, first.sparse_seconds, first.fusion_seconds)
+    )
+    assert second.dense == first.dense
+    assert second.sparse == first.sparse
+    assert second.fused == first.fused
+    assert second.evidence == first.evidence
+    assert (cache_path.stat().st_ino, cache_path.stat().st_mtime_ns) == first_cache_identity
+
+
+def test_retrieve_variants_uses_default_embedding_artifact_contract(
+    retrieval_fixture, fake_encoder, vectors, tmp_path, monkeypatch
+):
+    """Omitted heavy dependencies load one model and the model-tail vector artifact."""
+    con, cluster_id, company_id = retrieval_fixture
+    loaded_models: list[str] = []
+    loaded_vectors: list[tuple[Path, str | None]] = []
+    con.execute(
+        "INSERT INTO embedding_map "
+        "SELECT complaint_id, row_idx, 'provider/embed-m', dim "
+        "FROM embedding_map WHERE model = 'embed-m'"
+    )
+
+    def fake_load_model(model_name):
+        loaded_models.append(model_name)
+        return fake_encoder, "cpu"
+
+    def fake_load(path, mmap_mode=None):
+        loaded_vectors.append((Path(path), mmap_mode))
+        return vectors
+
+    from src.embed import encode
+
+    monkeypatch.setattr(encode, "load_model", fake_load_model)
+    monkeypatch.setattr(retrieve.np, "load", fake_load)
+
+    got = retrieve.retrieve_variants(
+        con,
+        cluster_id,
+        company_id,
+        "escrow refund",
+        "provider/embed-m",
+        cache_dir=tmp_path,
+        top_k=1,
+    )
+
+    assert len(got.evidence) == 1
+    assert loaded_models == ["provider/embed-m"]
+    assert loaded_vectors == [(retrieve.PATHS.artifacts / "embeddings.embed-m.npy", "r")]
+    assert fake_encoder.calls == [["escrow refund"]]
+
+
+def test_retrieve_variants_honors_configured_candidate_and_default_top_k(
+    retrieval_fixture, fake_encoder, vectors, tmp_path, monkeypatch
+):
+    """Candidate stages and default fusion output use their distinct config limits."""
+    con, cluster_id, company_id = retrieval_fixture
+    configured_llm = replace(
+        retrieve.CONFIG.llm,
+        rag_candidate_k=1,
+        rag_top_k=1,
+    )
+    monkeypatch.setattr(retrieve, "CONFIG", SimpleNamespace(llm=configured_llm))
+
+    got = retrieve.retrieve_variants(
+        con,
+        cluster_id,
+        company_id,
+        "escrow refund",
+        "embed-m",
+        encoder=fake_encoder,
+        vectors=vectors,
+        cache_dir=tmp_path,
+    )
+
+    assert len(got.dense) == 1
+    assert len(got.sparse) == 1
+    assert len(got.fused) == 1
+    assert len(got.evidence) == 1
+
+
+def test_retrieve_evidence_is_a_thin_list_wrapper(
+    retrieval_fixture, fake_encoder, vectors, tmp_path
+):
+    """Ordinary callers get a list without a second query encoding or generation call."""
+    con, cluster_id, company_id = retrieval_fixture
+
+    got = retrieve.retrieve_evidence(
+        con,
+        cluster_id,
+        company_id,
+        "escrow refund",
+        "embed-m",
+        encoder=fake_encoder,
+        vectors=vectors,
+        cache_dir=tmp_path,
+        top_k=1,
+    )
+
+    assert isinstance(got, list)
+    assert [row.complaint_id for row in got] == [10]
+    assert fake_encoder.calls == [["escrow refund"]]

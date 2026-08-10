@@ -15,6 +15,7 @@ can reach the package, deleting it cannot change their output.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import numpy as np
@@ -57,14 +58,27 @@ def _imports(path: Path) -> set[str]:
 def test_detection_path_never_imports_the_llm_layer():
     """§1 — deleting src/llm/ must leave `signals` byte-identical."""
     offenders = []
+    llm_only_tables = {"llm_usage", "rag_answers", "rag_eval_results"}
     for package in DETECTION:
         for source in (ROOT / "src" / package).rglob("*.py"):
+            tree = ast.parse(source.read_text())
             for name in _imports(source):
                 if name.startswith("src.llm") or name == "anthropic":
                     offenders.append(f"{source.relative_to(ROOT)} imports {name}")
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                    continue
+                queried = {
+                    table
+                    for table in llm_only_tables
+                    if re.search(rf"\b{re.escape(table)}\b", node.value, re.IGNORECASE)
+                }
+                offenders.extend(
+                    f"{source.relative_to(ROOT)} queries {table}" for table in sorted(queried)
+                )
     assert not offenders, (
-        "the detection path can reach the LLM layer, so deleting src/llm/ "
-        "could change `signals`:\n  " + "\n  ".join(offenders)
+        "the detection path can reach LLM code or result tables, so deleting "
+        "src/llm/ could change `signals`:\n  " + "\n  ".join(offenders)
     )
 
 
@@ -81,9 +95,7 @@ def test_pipeline_imports_the_llm_layer_lazily():
         if not isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
         names = (
-            [a.name for a in node.names]
-            if isinstance(node, ast.Import)
-            else [node.module or ""]
+            [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
         )
         if any(n.startswith("src.llm") for n in names):
             assert node.col_offset > 0, (
@@ -96,10 +108,12 @@ def test_pipeline_imports_the_llm_layer_lazily():
 def test_mmr_prefers_a_far_point_over_a_near_duplicate():
     """The reason §2.1 asks for diversity at all."""
     selected = np.array([[1.0, 0.0]])
-    candidates = np.array([
-        [0.9999, 0.0141],  # near-duplicate of what is already selected
-        [0.0, 1.0],        # orthogonal — the informative one
-    ])
+    candidates = np.array(
+        [
+            [0.9999, 0.0141],  # near-duplicate of what is already selected
+            [0.0, 1.0],  # orthogonal — the informative one
+        ]
+    )
     assert mmr_first(candidates, selected) == 1
 
 
@@ -123,8 +137,7 @@ def test_selection_is_stable_and_bounded():
 
 def test_selection_handles_a_cluster_smaller_than_k():
     X = np.eye(3, dtype=np.float32)
-    got = select_mod.select_for_label(X, np.arange(3), np.array([7, 8, 9]),
-                                      None, k=20, medoid_k=12)
+    got = select_mod.select_for_label(X, np.arange(3), np.array([7, 8, 9]), None, k=20, medoid_k=12)
     assert sorted(got) == [7, 8, 9]
 
 
@@ -178,9 +191,7 @@ def test_schema_is_enforceable():
     """§2.2 wants strict JSON. Structured outputs only guarantee that when the
     schema closes the object and requires every field."""
     assert label_mod.LABEL_SCHEMA["additionalProperties"] is False
-    assert set(label_mod.LABEL_SCHEMA["required"]) == set(
-        label_mod.LABEL_SCHEMA["properties"]
-    )
+    assert set(label_mod.LABEL_SCHEMA["required"]) == set(label_mod.LABEL_SCHEMA["properties"])
 
 
 def test_guardrails_are_in_the_system_prompt():
@@ -210,9 +221,13 @@ def test_refusal_is_recorded_rather_than_raised():
     class _Refusing:
         @staticmethod
         def call_json(**_):
-            return type("R", (), {
-                "payload": {"refused": True, "stop_reason": "refusal"},
-            })()
+            return type(
+                "R",
+                (),
+                {
+                    "payload": {"refused": True, "stop_reason": "refusal"},
+                },
+            )()
 
     got = label_mod.label_cluster(_Refusing(), "m", ["n"], [], 1200)
     assert got == {"refused": True, "stop_reason": "refusal"}

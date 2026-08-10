@@ -7,12 +7,15 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
 import duckdb
 import numpy as np
+
+from src.config import CONFIG, PATHS
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,44 @@ class RankedHit:
     complaint_id: int
     rank: int
     score: float
+
+
+@dataclass(frozen=True)
+class FusedHit:
+    complaint_id: int
+    fused_score: float
+    dense_rank: int | None
+    dense_score: float | None
+    sparse_rank: int | None
+    sparse_score: float | None
+
+
+@dataclass(frozen=True)
+class RetrievedEvidence:
+    complaint_id: int
+    date_received: date
+    company_id: str
+    company_name: str
+    product_family: str
+    text_redacted: str
+    company_public_response: str | None
+    dense_rank: int | None
+    dense_score: float | None
+    sparse_rank: int | None
+    sparse_score: float | None
+    fused_score: float
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    corpus: ScopedCorpus
+    dense: tuple[RankedHit, ...]
+    sparse: tuple[RankedHit, ...]
+    fused: tuple[FusedHit, ...]
+    evidence: tuple[RetrievedEvidence, ...]
+    dense_seconds: float
+    sparse_seconds: float
+    fusion_seconds: float
 
 
 @dataclass(frozen=True)
@@ -338,3 +379,160 @@ def dense_rank(
         for rank, (complaint_id, score) in enumerate(pairs, start=1)
     ]
     return ranked[:limit]
+
+
+def _validate_component_ranking(hits: list[RankedHit], component: str) -> None:
+    complaint_ids: set[int] = set()
+    ranks: set[int] = set()
+    for hit in hits:
+        if not isinstance(hit.complaint_id, int) or isinstance(hit.complaint_id, bool):
+            raise ValueError(f"{component} complaint IDs must be integers")
+        if not isinstance(hit.rank, int) or isinstance(hit.rank, bool) or hit.rank <= 0:
+            raise ValueError(f"{component} ranks must be positive integers")
+        if not np.isfinite(hit.score):
+            raise ValueError(f"{component} scores must be finite")
+        if hit.complaint_id in complaint_ids:
+            raise ValueError(f"{component} ranking contains a duplicate complaint ID")
+        if hit.rank in ranks:
+            raise ValueError(f"{component} ranking contains a duplicate rank")
+        complaint_ids.add(hit.complaint_id)
+        ranks.add(hit.rank)
+
+
+def reciprocal_rank_fusion(
+    dense: list[RankedHit],
+    sparse: list[RankedHit],
+    rrf_k: int,
+    top_k: int,
+) -> list[FusedHit]:
+    """Fuse dense and sparse component ranks with deterministic source-ID ties."""
+    if not isinstance(rrf_k, int) or isinstance(rrf_k, bool) or rrf_k <= 0:
+        raise ValueError("rrf_k must be a positive integer")
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    _validate_component_ranking(dense, "dense")
+    _validate_component_ranking(sparse, "sparse")
+
+    dense_by_id = {hit.complaint_id: hit for hit in dense}
+    sparse_by_id = {hit.complaint_id: hit for hit in sparse}
+    fused = []
+    for complaint_id in dense_by_id.keys() | sparse_by_id.keys():
+        dense_hit = dense_by_id.get(complaint_id)
+        sparse_hit = sparse_by_id.get(complaint_id)
+        score = 0.0
+        if dense_hit is not None:
+            score += 1.0 / (rrf_k + dense_hit.rank)
+        if sparse_hit is not None:
+            score += 1.0 / (rrf_k + sparse_hit.rank)
+        fused.append(
+            FusedHit(
+                complaint_id=complaint_id,
+                fused_score=score,
+                dense_rank=None if dense_hit is None else dense_hit.rank,
+                dense_score=None if dense_hit is None else dense_hit.score,
+                sparse_rank=None if sparse_hit is None else sparse_hit.rank,
+                sparse_score=None if sparse_hit is None else sparse_hit.score,
+            )
+        )
+    fused.sort(key=lambda hit: (-hit.fused_score, hit.complaint_id))
+    return fused[:top_k]
+
+
+def retrieve_variants(
+    con: duckdb.DuckDBPyConnection,
+    cluster_id: str,
+    company_id: str | None,
+    question: str,
+    embed_model: str,
+    encoder=None,
+    vectors=None,
+    cache_dir=None,
+    top_k=None,
+) -> RetrievalResult:
+    """Retrieve independently observable dense, sparse, and fused evidence ranks."""
+    corpus = load_corpus(con, cluster_id, company_id, embed_model)
+    if encoder is None:
+        from src.embed.encode import load_model
+
+        encoder, _device = load_model(embed_model)
+    if vectors is None:
+        artifact = PATHS.artifacts / f"embeddings.{embed_model.split('/')[-1]}.npy"
+        vectors = np.load(artifact, mmap_mode="r")
+
+    dense_started = time.perf_counter()
+    query_vector = encode_query(encoder, question)
+    dense = dense_rank(corpus, vectors, query_vector, CONFIG.llm.rag_candidate_k)
+    dense_seconds = time.perf_counter() - dense_started
+
+    sparse_started = time.perf_counter()
+    sparse_corpus, _cache_hit = load_sparse_corpus(
+        corpus,
+        PATHS.llm_cache if cache_dir is None else Path(cache_dir),
+        CONFIG.llm.bm25_tokenizer_version,
+    )
+    sparse = bm25_rank(sparse_corpus, question, CONFIG.llm.rag_candidate_k)
+    sparse_seconds = time.perf_counter() - sparse_started
+
+    fusion_started = time.perf_counter()
+    fused = reciprocal_rank_fusion(
+        dense,
+        sparse,
+        CONFIG.llm.rrf_k,
+        CONFIG.llm.rag_top_k if top_k is None else top_k,
+    )
+    rows_by_id = {row.complaint_id: row for row in corpus.rows}
+    evidence_rows = tuple(
+        RetrievedEvidence(
+            complaint_id=hit.complaint_id,
+            date_received=rows_by_id[hit.complaint_id].date_received,
+            company_id=rows_by_id[hit.complaint_id].company_id,
+            company_name=rows_by_id[hit.complaint_id].company_name,
+            product_family=rows_by_id[hit.complaint_id].product_family,
+            text_redacted=rows_by_id[hit.complaint_id].text_redacted,
+            company_public_response=rows_by_id[hit.complaint_id].company_public_response,
+            dense_rank=hit.dense_rank,
+            dense_score=hit.dense_score,
+            sparse_rank=hit.sparse_rank,
+            sparse_score=hit.sparse_score,
+            fused_score=hit.fused_score,
+        )
+        for hit in fused
+    )
+    fusion_seconds = time.perf_counter() - fusion_started
+    return RetrievalResult(
+        corpus=corpus,
+        dense=tuple(dense),
+        sparse=tuple(sparse),
+        fused=tuple(fused),
+        evidence=evidence_rows,
+        dense_seconds=dense_seconds,
+        sparse_seconds=sparse_seconds,
+        fusion_seconds=fusion_seconds,
+    )
+
+
+def retrieve_evidence(
+    con: duckdb.DuckDBPyConnection,
+    cluster_id: str,
+    company_id: str | None,
+    question: str,
+    embed_model: str,
+    encoder=None,
+    vectors=None,
+    cache_dir=None,
+    top_k=None,
+) -> list[RetrievedEvidence]:
+    """Return only final evidence for callers that do not need stage diagnostics."""
+    return list(
+        retrieve_variants(
+            con,
+            cluster_id,
+            company_id,
+            question,
+            embed_model,
+            encoder=encoder,
+            vectors=vectors,
+            cache_dir=cache_dir,
+            top_k=top_k,
+        ).evidence
+    )
