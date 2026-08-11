@@ -97,3 +97,6 @@ mixed-zero, membership, and scope selection 21 passed; evaluation 127 passed;
 compatibility slice 381 passed + 1 expected skip; full 619 passed + 6 expected
 skips; Ruff, scoped format, and diff check clean. Replay semantics remain as
 reviewer-adjudicated; no live provider call or schema/answer/client edit.
+Task 3 re-review: APPROVED at af2e4e7 — unavailable-vs-measured-zero semantics, complete Phase 8C evidence invariants, exact corpus membership preflight, replay, failure, usage, and transaction behavior all reproduced with no residual finding.
+
+Task 4: in progress.
