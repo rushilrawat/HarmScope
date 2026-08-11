@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 from collections import Counter
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from src.config import Paths
 from src.llm import answer, retrieve
 from src.llm import eval as llm_eval
 from src.llm.client import ModelCallError, TokenUsage
@@ -2105,3 +2107,665 @@ def test_answer_usage_aggregation_rejects_corrupt_values(con, field, value):
             "eval-corrupt",
             answerer=_Answerer({question.question: _answer_result(question)}),
         )
+
+
+@pytest.fixture
+def claim_review_fixture(con, tmp_path, monkeypatch):
+    """Synthetic private answers for the human-review workflow contract."""
+    data_dir = tmp_path / "data"
+    paths = Paths(root=Path(__file__).resolve().parents[1], data=data_dir)
+    paths.ensure()
+    monkeypatch.setattr(llm_eval, "PATHS", paths)
+
+    questions: list[llm_eval.EvalQuestion] = []
+    manifest_rows: list[dict[str, str]] = []
+    for index in range(30):
+        category = llm_eval.CATEGORY_ORDER[index // 5]
+        answerable = category != "unanswerable"
+        question = llm_eval.EvalQuestion(
+            question_id=f"rag-{index + 1:03d}",
+            question=f"Synthetic private review query {index + 1}?",
+            cluster_id="cluster-1",
+            company_id="company-1",
+            category=category,
+            relevant_complaint_ids=frozenset({10}) if answerable else frozenset(),
+            answerable=answerable,
+        )
+        questions.append(question)
+        manifest_rows.append(
+            {
+                "question_id": question.question_id,
+                "question": question.question,
+                "cluster_id": question.cluster_id,
+                "company_id": question.company_id or "",
+                "category": category,
+                "answerable": str(answerable).lower(),
+                "relevant_complaint_ids": "10" if answerable else "",
+            }
+        )
+    manifest_path = _write_csv(
+        paths.ground_truth / "rag_eval_questions.csv",
+        list(llm_eval.MANIFEST_HEADER),
+        manifest_rows,
+    )
+
+    eval_run_id = "eval-claim-review"
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, finished_at, status, output_rows) "
+        "VALUES (?, 'rag-eval', 'test', 'test', ?, now(), now(), 'ok', 90)",
+        [
+            eval_run_id,
+            json.dumps(
+                {
+                    "params": {
+                        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+                    }
+                }
+            ),
+        ],
+    )
+    _seed_retrieval_rows(con, eval_run_id, questions)
+    con.execute(
+        "UPDATE narratives SET text_redacted = ? WHERE complaint_id = 10",
+        ["=PRIVATE formula-shaped evidence \u001b with controls"],
+    )
+    for index, question in enumerate(questions):
+        evidence_rows = list(_structural_evidence(question, 2))
+        claims = (
+            answer.Claim(
+                "=PRIVATE formula-shaped claim" if index == 0 else f"Synthetic claim {index}-1.",
+                (10,),
+            ),
+            answer.Claim(f"Synthetic claim {index}-2.", (11,)),
+        )
+        grounded = _grounded_answer(claims=claims)
+        answer.write_cached_answer(
+            con,
+            question.question,
+            question.cluster_id,
+            question.company_id,
+            "model-private",
+            "prompt-private",
+            evidence_rows,
+            grounded,
+        )
+        con.execute(
+            "INSERT INTO llm_usage "
+            "(usage_id, run_id, operation, cluster_id, question_hash, model, "
+            "prompt_version, input_hash, cache_status, attempts, input_tokens, "
+            "output_tokens, cache_read_input_tokens, cache_creation_input_tokens, "
+            "latency_seconds, estimated_cost_usd, outcome, error_category, created_at) "
+            "VALUES (?, ?, 'answer', ?, ?, 'model-private', 'prompt-private', ?, "
+            "'miss', 1, 1, 1, 0, 0, 0.1, 0.01, 'ok', NULL, now())",
+            [
+                f"claim-usage-{index:03d}",
+                eval_run_id,
+                question.cluster_id,
+                answer.question_hash(question.question),
+                answer.answer_input_hash(
+                    question.question,
+                    question.cluster_id,
+                    question.company_id,
+                    "model-private",
+                    "prompt-private",
+                    evidence_rows,
+                ),
+            ],
+        )
+    con.execute(
+        "UPDATE rag_eval_results SET citation_valid = true, citation_coverage = 1.0, "
+        "abstention_correct = true WHERE eval_run_id = ? AND retrieval_method = 'fused'",
+        [eval_run_id],
+    )
+    return con, eval_run_id, paths
+
+
+def _fill_claim_review(
+    path: Path,
+    *,
+    reviewer_id: str = "reviewer-1",
+    grounded_count: int = 44,
+) -> Path:
+    header, rows = _read_rows(path)
+    for index, row in enumerate(rows):
+        is_grounded = index < grounded_count
+        row["grounded"] = "yes" if is_grounded else "no"
+        row["failure_category"] = "none" if is_grounded else "unsupported"
+        row["notes"] = "" if is_grounded else "Synthetic reviewer note"
+    completed = path.with_name(f"{path.stem}.{reviewer_id}{path.suffix}")
+    return _write_csv(completed, header, rows)
+
+
+def test_claim_review_exports_exact_blinded_deterministic_cited_only_sample(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    first = llm_eval.export_claim_review(
+        con,
+        eval_run_id,
+        50,
+        7,
+        paths.interim / "claims-first.csv",
+    )
+    second = llm_eval.export_claim_review(
+        con,
+        eval_run_id,
+        50,
+        7,
+        paths.interim / "claims-second.csv",
+    )
+
+    assert first.read_bytes() == second.read_bytes()
+    header, rows = _read_rows(first)
+    assert header == list(llm_eval.CLAIM_REVIEW_HEADER)
+    assert len(rows) == 50
+    assert len({row["review_id"] for row in rows}) == 50
+    sampled_categories = {
+        llm_eval.CATEGORY_ORDER[(int(row["question_id"].split("-")[1]) - 1) // 5] for row in rows
+    }
+    assert sampled_categories == set(llm_eval.CATEGORIES)
+    assert {row["claim_position"] for row in rows} == {"1", "2"}
+    forbidden = {
+        "confidence",
+        "answerable",
+        "retrieval_score",
+        "retrieval_rank",
+        "expected",
+        "model_outcome",
+    }
+    assert forbidden.isdisjoint(header)
+    assert all(row["question"] and row["claim_text"] for row in rows)
+    assert all(row["cited_complaint_ids"] for row in rows)
+    assert all(row["grounded"] == row["failure_category"] == row["notes"] == "" for row in rows)
+    for row in rows:
+        citations = [int(value) for value in row["cited_complaint_ids"].split(";")]
+        evidence = json.loads(row["cited_evidence_json"])
+        assert [item["complaint_id"] for item in evidence] == citations
+        assert all(set(item) == {"complaint_id", "text_redacted"} for item in evidence)
+        for value in (
+            row["question"],
+            row["claim_text"],
+            *[item["text_redacted"] for item in evidence],
+        ):
+            assert not value.startswith(("=", "+", "-", "@"))
+            assert "\x1b" not in value
+
+
+def test_claim_review_export_requires_private_path_and_enough_claims(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+
+    with pytest.raises(ValueError, match="at least 50"):
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            49,
+            7,
+            paths.interim / "too-small.csv",
+        )
+    with pytest.raises(ValueError, match="eligible.*requested"):
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            61,
+            7,
+            paths.interim / "too-many.csv",
+        )
+    with pytest.raises(ValueError, match="data/interim"):
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            50,
+            7,
+            paths.ground_truth / "private.csv",
+        )
+
+
+def test_claim_review_seed_changes_only_the_deterministic_sample(claim_review_fixture):
+    con, eval_run_id, paths = claim_review_fixture
+    first = llm_eval.export_claim_review(con, eval_run_id, 50, 7, paths.interim / "seed-7.csv")
+    second = llm_eval.export_claim_review(con, eval_run_id, 50, 8, paths.interim / "seed-8.csv")
+
+    first_ids = {row["review_id"] for row in _read_rows(first)[1]}
+    second_ids = {row["review_id"] for row in _read_rows(second)[1]}
+    assert len(first_ids) == len(second_ids) == 50
+    assert first_ids != second_ids
+
+
+def test_claim_review_export_failure_is_atomic_and_cleans_temporary_file(
+    claim_review_fixture,
+    monkeypatch,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    destination = paths.interim / "claims.csv"
+    original = b"existing private artifact\n"
+    destination.write_bytes(original)
+
+    def fail_mid_write(writer, rows):
+        writer.writerow(rows[0])
+        raise OSError("simulated claim export failure")
+
+    monkeypatch.setattr(csv.DictWriter, "writerows", fail_mid_write)
+    with pytest.raises(OSError, match="claim export failure"):
+        llm_eval.export_claim_review(con, eval_run_id, 50, 7, destination)
+
+    assert destination.read_bytes() == original
+    assert list(paths.interim.glob(".claims.csv.*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    ("grounded", "failure_category", "match"),
+    [
+        ("", "none", "yes.*no"),
+        ("mostly", "none", "yes.*no"),
+        ("YES", "none", "yes.*no"),
+        ("yes", "", "none"),
+        ("yes", "unsupported", "none"),
+        ("no", "", "required"),
+        ("no", "none", "required"),
+        ("no", "invented", "unsupported"),
+        ("no", "Unsupported", "unsupported"),
+    ],
+)
+def test_parse_claim_review_rejects_invalid_human_decisions(
+    claim_review_fixture,
+    grounded,
+    failure_category,
+    match,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    del con
+    exported = llm_eval.export_claim_review(
+        claim_review_fixture[0],
+        eval_run_id,
+        50,
+        7,
+        paths.interim / "claims.csv",
+    )
+    completed = _fill_claim_review(exported)
+    header, rows = _read_rows(completed)
+    rows[0]["grounded"] = grounded
+    rows[0]["failure_category"] = failure_category
+    _write_csv(completed, header, rows)
+
+    with pytest.raises(ValueError, match=match):
+        llm_eval.parse_claim_review(completed, "reviewer-1")
+
+
+def test_parse_claim_review_requires_safe_reviewer_filename_and_exact_rows(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(
+        con,
+        eval_run_id,
+        50,
+        7,
+        paths.interim / "claims.csv",
+    )
+    completed = _fill_claim_review(exported)
+
+    with pytest.raises(ValueError, match="reviewer_id"):
+        llm_eval.parse_claim_review(completed, "unsafe reviewer")
+    with pytest.raises(ValueError, match="filename"):
+        llm_eval.parse_claim_review(exported, "reviewer-1")
+
+    lines = completed.read_text(encoding="utf-8").splitlines()
+    lines[1] += ",extra"
+    completed.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="field count"):
+        llm_eval.parse_claim_review(completed, "reviewer-1")
+
+
+def test_record_claim_review_persists_fused_counts_report_and_replay(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(
+        con,
+        eval_run_id,
+        50,
+        7,
+        paths.interim / "claims.csv",
+    )
+    completed = _fill_claim_review(exported, grounded_count=44)
+    reviews = llm_eval.parse_claim_review(completed, "reviewer-1")
+    con.execute(
+        "UPDATE rag_eval_results SET grounded_claims = 9, reviewed_claims = 10 "
+        "WHERE eval_run_id = ? AND retrieval_method = 'fused'",
+        [eval_run_id],
+    )
+    nonhuman_before = con.execute(
+        "SELECT question_id, retrieval_method, recall_at_10, citation_valid, created_at "
+        "FROM rag_eval_results WHERE eval_run_id = ? ORDER BY 1, 2",
+        [eval_run_id],
+    ).fetchall()
+
+    report = llm_eval.record_claim_review(con, eval_run_id, reviews)
+    first_counts = con.execute(
+        "SELECT question_id, grounded_claims, reviewed_claims FROM rag_eval_results "
+        "WHERE eval_run_id = ? AND retrieval_method = 'fused' ORDER BY question_id",
+        [eval_run_id],
+    ).fetchall()
+    replay = llm_eval.record_claim_review(con, eval_run_id, reviews)
+
+    assert report == replay
+    assert report.grounded == 44
+    assert report.reviewed == 50
+    assert report.rate == pytest.approx(0.88)
+    assert report.ci_low < report.rate < report.ci_high
+    assert report.reviewer_id == "reviewer-1"
+    assert report.gate_complete is True
+    assert "44/50" in report.render()
+    assert "reviewer-1" in report.render()
+    assert sum(row[1] or 0 for row in first_counts) == 44
+    assert sum(row[2] or 0 for row in first_counts) == 50
+    assert (
+        con.execute(
+            "SELECT question_id, grounded_claims, reviewed_claims FROM rag_eval_results "
+            "WHERE eval_run_id = ? AND retrieval_method = 'fused' ORDER BY question_id",
+            [eval_run_id],
+        ).fetchall()
+        == first_counts
+    )
+    assert (
+        con.execute(
+            "SELECT question_id, retrieval_method, recall_at_10, citation_valid, created_at "
+            "FROM rag_eval_results WHERE eval_run_id = ? ORDER BY 1, 2",
+            [eval_run_id],
+        ).fetchall()
+        == nonhuman_before
+    )
+    assert con.execute(
+        "SELECT count(*) FROM rag_eval_results WHERE eval_run_id = ? "
+        "AND retrieval_method != 'fused' "
+        "AND (grounded_claims IS NOT NULL OR reviewed_claims IS NOT NULL)",
+        [eval_run_id],
+    ).fetchone() == (0,)
+
+
+def test_record_claim_review_rejects_tamper_cross_run_duplicates_and_short_batch(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(
+        con,
+        eval_run_id,
+        50,
+        7,
+        paths.interim / "claims.csv",
+    )
+    completed = _fill_claim_review(exported)
+    reviews = llm_eval.parse_claim_review(completed, "reviewer-1")
+
+    with pytest.raises(ValueError, match="at least 50"):
+        llm_eval.record_claim_review(con, eval_run_id, reviews[:49])
+    with pytest.raises(ValueError, match="duplicate"):
+        llm_eval.record_claim_review(con, eval_run_id, [*reviews[:-1], reviews[0]])
+    with pytest.raises(ValueError, match="eval_run_id"):
+        llm_eval.record_claim_review(con, "another-run", reviews)
+    with pytest.raises(ValueError, match="identity|tamper"):
+        llm_eval.record_claim_review(
+            con,
+            eval_run_id,
+            [replace(reviews[0], claim_text="Edited private claim"), *reviews[1:]],
+        )
+    with pytest.raises(ValueError, match="failure_category.*none"):
+        llm_eval.record_claim_review(
+            con,
+            eval_run_id,
+            [
+                replace(reviews[0], grounded=True, failure_category="unsupported"),
+                *reviews[1:],
+            ],
+        )
+    assert con.execute(
+        "SELECT count(*) FROM rag_eval_results WHERE eval_run_id = ? "
+        "AND grounded_claims IS NOT NULL",
+        [eval_run_id],
+    ).fetchone() == (0,)
+
+
+def test_groundedness_report_derives_pending_gate_below_human_minimum():
+    report = llm_eval.GroundednessReport(
+        grounded=49,
+        reviewed=49,
+        rate=1.0,
+        ci_low=0.9,
+        ci_high=1.0,
+        reviewer_id="reviewer-1",
+    )
+
+    assert report.gate_complete is False
+    assert "PENDING" in report.render()
+
+
+class _FailGroundednessUpdateConnection:
+    def __init__(self, con):
+        self._con = con
+        self._updates = 0
+
+    def execute(self, query, parameters=None):
+        if query.lstrip().startswith("UPDATE rag_eval_results"):
+            self._updates += 1
+            if self._updates == 2:
+                raise RuntimeError("simulated groundedness update failure")
+        return (
+            self._con.execute(query) if parameters is None else self._con.execute(query, parameters)
+        )
+
+
+def test_record_claim_review_rolls_back_all_question_counts(claim_review_fixture):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(
+        con,
+        eval_run_id,
+        50,
+        7,
+        paths.interim / "claims.csv",
+    )
+    completed = _fill_claim_review(exported)
+    reviews = llm_eval.parse_claim_review(completed, "reviewer-1")
+
+    with pytest.raises(RuntimeError, match="groundedness update"):
+        llm_eval.record_claim_review(
+            _FailGroundednessUpdateConnection(con),
+            eval_run_id,
+            reviews,
+        )
+
+    assert con.execute(
+        "SELECT count(*) FROM rag_eval_results WHERE eval_run_id = ? "
+        "AND (grounded_claims IS NOT NULL OR reviewed_claims IS NOT NULL)",
+        [eval_run_id],
+    ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("resolution", ["COMMIT", "ROLLBACK"])
+def test_record_claim_review_rejects_caller_transaction_without_altering_it(
+    claim_review_fixture,
+    resolution,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(con, eval_run_id, 50, 7, paths.interim / "claims.csv")
+    reviews = llm_eval.parse_claim_review(
+        _fill_claim_review(exported),
+        "reviewer-1",
+    )
+    con.execute("CREATE TABLE claim_caller_work (value INTEGER)")
+    con.execute("BEGIN TRANSACTION")
+    con.execute("INSERT INTO claim_caller_work VALUES (1)")
+
+    with pytest.raises(llm_eval.EvaluationTransactionError, match="autocommit"):
+        llm_eval.record_claim_review(con, eval_run_id, reviews)
+
+    assert con.execute("SELECT value FROM claim_caller_work").fetchall() == [(1,)]
+    con.execute(resolution)
+    expected = [(1,)] if resolution == "COMMIT" else []
+    assert con.execute("SELECT value FROM claim_caller_work").fetchall() == expected
+    assert con.execute(
+        "SELECT count(*) FROM rag_eval_results WHERE eval_run_id = ? "
+        "AND grounded_claims IS NOT NULL",
+        [eval_run_id],
+    ).fetchone() == (0,)
+
+
+def test_claim_review_rejects_missing_fused_question_before_writing(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    con.execute(
+        "DELETE FROM rag_eval_results WHERE eval_run_id = ? "
+        "AND question_id = 'rag-030' AND retrieval_method = 'fused'",
+        [eval_run_id],
+    )
+    destination = paths.interim / "claims.csv"
+
+    with pytest.raises(ValueError, match="fused.*manifest|manifest.*fused"):
+        llm_eval.export_claim_review(con, eval_run_id, 50, 7, destination)
+
+    assert not destination.exists()
+
+
+def test_claim_review_fails_id_only_for_missing_manifest_and_ambiguous_cache(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    manifest = paths.ground_truth / "rag_eval_questions.csv"
+    manifest.unlink()
+    with pytest.raises(ValueError, match="manifest") as missing:
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            50,
+            7,
+            paths.interim / "claims.csv",
+        )
+    assert "Synthetic private" not in str(missing.value)
+
+    _write_csv(
+        manifest,
+        list(llm_eval.MANIFEST_HEADER),
+        [
+            {
+                "question_id": f"rag-{index + 1:03d}",
+                "question": f"Synthetic private review query {index + 1}?",
+                "cluster_id": "cluster-1",
+                "company_id": "company-1",
+                "category": llm_eval.CATEGORY_ORDER[index // 5],
+                "answerable": str(index < 25).lower(),
+                "relevant_complaint_ids": "10" if index < 25 else "",
+            }
+            for index in range(30)
+        ],
+    )
+    con.execute(
+        "INSERT INTO llm_usage SELECT 'ambiguous-usage', run_id, operation, cluster_id, "
+        "question_hash, model, prompt_version, 'different-input-identity', cache_status, "
+        "attempts, input_tokens, output_tokens, cache_read_input_tokens, "
+        "cache_creation_input_tokens, latency_seconds, estimated_cost_usd, outcome, "
+        "error_category, created_at FROM llm_usage WHERE usage_id = 'claim-usage-000'"
+    )
+    with pytest.raises(ValueError, match="rag-001.*ambiguous|ambiguous.*rag-001") as ambiguous:
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            50,
+            7,
+            paths.interim / "claims.csv",
+        )
+    assert "Synthetic private" not in str(ambiguous.value)
+
+
+def test_claim_review_requires_exact_run_registry_manifest_identity(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    destination = paths.interim / "claims.csv"
+
+    con.execute("DELETE FROM runs WHERE run_id = ?", [eval_run_id])
+    with pytest.raises(ValueError, match="run.*manifest|manifest.*run"):
+        llm_eval.export_claim_review(con, eval_run_id, 50, 7, destination)
+
+
+def test_claim_review_rejects_post_run_manifest_tamper(claim_review_fixture):
+    con, eval_run_id, paths = claim_review_fixture
+    manifest = paths.ground_truth / "rag_eval_questions.csv"
+    header, rows = _read_rows(manifest)
+    rows[0]["category"], rows[5]["category"] = rows[5]["category"], rows[0]["category"]
+    _write_csv(manifest, header, rows)
+
+    with pytest.raises(ValueError, match="manifest.*identity|identity.*manifest"):
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            50,
+            7,
+            paths.interim / "claims.csv",
+        )
+
+
+def test_claim_review_rejects_questions_sharing_one_answer_usage_identity(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    manifest = paths.ground_truth / "rag_eval_questions.csv"
+    header, rows = _read_rows(manifest)
+    rows[1]["question"] = rows[0]["question"]
+    _write_csv(manifest, header, rows)
+    con.execute(
+        "UPDATE runs SET params_json = ? WHERE run_id = ?",
+        [
+            json.dumps(
+                {"params": {"manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}}
+            ),
+            eval_run_id,
+        ],
+    )
+
+    with pytest.raises(ValueError, match="rag-001.*rag-002|rag-002.*rag-001"):
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            50,
+            7,
+            paths.interim / "claims.csv",
+        )
+
+
+def test_claim_review_identity_binds_actual_cited_excerpt_content(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(
+        con,
+        eval_run_id,
+        50,
+        7,
+        paths.interim / "claims.csv",
+    )
+    completed = _fill_claim_review(exported)
+    replacement = "Changed synthetic cited evidence content"
+    con.execute(
+        "UPDATE narratives SET text_redacted = ? WHERE complaint_id = 10",
+        [replacement],
+    )
+    header, rows = _read_rows(completed)
+    for row in rows:
+        evidence = json.loads(row["cited_evidence_json"])
+        for item in evidence:
+            if item["complaint_id"] == 10:
+                item["text_redacted"] = replacement
+        row["cited_evidence_json"] = json.dumps(
+            evidence,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    _write_csv(completed, header, rows)
+    reviews = llm_eval.parse_claim_review(completed, "reviewer-1")
+
+    with pytest.raises(ValueError, match="identity|tamper"):
+        llm_eval.record_claim_review(con, eval_run_id, reviews)

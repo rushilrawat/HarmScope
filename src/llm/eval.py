@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import math
 import os
 import re
@@ -22,7 +23,7 @@ from pathlib import Path
 from statistics import median
 
 from src.config import CONFIG, PATHS
-from src.llm import answer, retrieve
+from src.llm import answer, retrieve, verify
 from src.population import EXPANDED_SELECT_SQL
 
 CATEGORY_ORDER = (
@@ -62,6 +63,25 @@ _SHINGLE_SIZE = 8
 _EXCERPTS_PER_ROW = 10
 _QUESTIONS_PER_CATEGORY = 5
 _RETRIEVAL_METHODS = ("dense", "bm25", "fused")
+_CLAIM_REVIEW_VERSION = 1
+_CLAIM_FAILURE_CATEGORIES = frozenset(
+    {"unsupported", "contradicted", "overgeneralized", "citation_mismatch", "other"}
+)
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_DISPLAY_CONTROLS = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+CLAIM_REVIEW_HEADER = (
+    "review_id",
+    "eval_run_id",
+    "question_id",
+    "question",
+    "claim_position",
+    "claim_text",
+    "cited_complaint_ids",
+    "cited_evidence_json",
+    "grounded",
+    "failure_category",
+    "notes",
+)
 
 
 class ManifestError(ValueError):
@@ -70,6 +90,71 @@ class ManifestError(ValueError):
 
 class EvaluationTransactionError(RuntimeError):
     """The evaluation runner requires an autocommit DuckDB connection."""
+
+
+@dataclass(frozen=True)
+class ClaimEvidence:
+    complaint_id: int
+    text_redacted: str
+
+
+@dataclass(frozen=True)
+class ClaimReview:
+    """One completed decision from a blinded, run-bound claim worklist."""
+
+    review_id: str
+    eval_run_id: str
+    question_id: str
+    question: str
+    claim_position: int
+    claim_text: str
+    cited_complaint_ids: tuple[int, ...]
+    cited_evidence: tuple[ClaimEvidence, ...]
+    grounded: bool
+    failure_category: str
+    notes: str | None
+    reviewer_id: str
+
+
+@dataclass(frozen=True)
+class GroundednessReport:
+    grounded: int
+    reviewed: int
+    rate: float
+    ci_low: float
+    ci_high: float
+    reviewer_id: str
+
+    @property
+    def gate_complete(self) -> bool:
+        """Only a real minimum-size denominator can complete the human gate."""
+        return self.reviewed >= CONFIG.llm.human_verify_n
+
+    def render(self) -> str:
+        status = "COMPLETE" if self.gate_complete else "PENDING"
+        return "\n".join(
+            [
+                f"human groundedness gate: {status}",
+                f"reviewer: {self.reviewer_id}",
+                f"grounded claims: {self.grounded}/{self.reviewed} ({self.rate:.1%})",
+                f"Wilson 95% interval: {self.ci_low:.1%}..{self.ci_high:.1%}",
+            ]
+        )
+
+
+@dataclass(frozen=True)
+class _ClaimCandidate:
+    review_id: str
+    eval_run_id: str
+    question_id: str
+    category: str
+    answerable: bool
+    company_id: str
+    question: str
+    claim_position: int
+    claim_text: str
+    cited_complaint_ids: tuple[int, ...]
+    cited_evidence: tuple[ClaimEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -923,6 +1008,617 @@ def run_answer_eval(
         evaluated,
         failures,
         _answer_usage(con, eval_run_id),
+    )
+
+
+def _review_text(value: object, label: str) -> str:
+    """Render untrusted prose inertly without changing its identity digest."""
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{label} must be nonblank text")
+    safe = "".join(
+        " "
+        if ord(character) <= 0x1F
+        or 0x7F <= ord(character) <= 0x9F
+        or character in _DISPLAY_CONTROLS
+        else character
+        for character in value
+    )
+    safe = " ".join(safe.split())
+    if safe.startswith(_FORMULA_PREFIXES):
+        safe = "'" + safe
+    if not safe:
+        raise ValueError(f"{label} becomes blank after display sanitization")
+    return safe
+
+
+def _cache_input_hash(
+    *,
+    question_hash: str,
+    evidence_hash: str,
+    cluster_id: str,
+    company_id: str,
+    model: str,
+    prompt_version: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "cluster_id": cluster_id,
+            "company_id": company_id,
+            "evidence_hash": evidence_hash,
+            "model": model,
+            "prompt_version": prompt_version,
+            "question_hash": question_hash,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _stored_json(value: object, label: str, question_id: str) -> object:
+    if type(value) is not str:
+        raise ValueError(f"question {question_id!r} has invalid cached {label}")
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        raise ValueError(f"question {question_id!r} has invalid cached {label}") from None
+
+
+def _cached_evidence_ids(
+    value: object,
+    evidence_hash: object,
+    question_id: str,
+) -> tuple[int, ...]:
+    parsed = _stored_json(value, "evidence identity", question_id)
+    if (
+        type(parsed) is not list
+        or not parsed
+        or any(type(complaint_id) is not int or complaint_id <= 0 for complaint_id in parsed)
+        or len(parsed) != len(set(parsed))
+    ):
+        raise ValueError(f"question {question_id!r} has invalid cached evidence identity")
+    canonical = json.dumps(parsed, separators=(",", ":"))
+    expected = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if evidence_hash != expected:
+        raise ValueError(f"question {question_id!r} has invalid cached evidence identity")
+    return tuple(parsed)
+
+
+def _claim_evidence(
+    con,
+    question: EvalQuestion,
+    complaint_ids: tuple[int, ...],
+) -> tuple[tuple[ClaimEvidence, ...], tuple[tuple[int, str, str], ...]]:
+    visible: list[ClaimEvidence] = []
+    identity: list[tuple[int, str, str]] = []
+    for complaint_id in complaint_ids:
+        row = con.execute(
+            "SELECT n.text_redacted, n.text_hash FROM narratives n "
+            "JOIN complaints c USING (complaint_id) "
+            "JOIN cluster_members m USING (complaint_id) "
+            "WHERE n.complaint_id = ? AND m.cluster_id = ? AND c.company_id = ?",
+            [complaint_id, question.cluster_id, question.company_id],
+        ).fetchone()
+        if row is None or type(row[0]) is not str or type(row[1]) is not str:
+            raise ValueError(
+                f"question {question.question_id!r} has unavailable cited evidence "
+                f"for complaint_id {complaint_id}"
+            )
+        visible.append(ClaimEvidence(complaint_id, _review_text(row[0], "evidence excerpt")))
+        identity.append(
+            (
+                complaint_id,
+                row[1],
+                hashlib.sha256(row[0].encode("utf-8")).hexdigest(),
+            )
+        )
+    return tuple(visible), tuple(identity)
+
+
+def _review_identity(
+    *,
+    eval_run_id: str,
+    question_id: str,
+    question_hash: str,
+    claim_position: int,
+    claim_text: str,
+    complaint_ids: tuple[int, ...],
+    evidence_hash: str,
+    cited_evidence_identity: tuple[tuple[int, str, str], ...],
+    input_hash: str,
+) -> str:
+    material = json.dumps(
+        {
+            "version": _CLAIM_REVIEW_VERSION,
+            "eval_run_id": eval_run_id,
+            "question_id": question_id,
+            "question_hash": question_hash,
+            "claim_position": claim_position,
+            "claim_text_hash": hashlib.sha256(claim_text.encode("utf-8")).hexdigest(),
+            "cited_complaint_ids": list(complaint_ids),
+            "evidence_hash": evidence_hash,
+            "cited_evidence_identity": [list(value) for value in cited_evidence_identity],
+            "input_hash": input_hash,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _claim_candidates(con, eval_run_id: str) -> list[_ClaimCandidate]:
+    manifest_path = PATHS.ground_truth / "rag_eval_questions.csv"
+    try:
+        manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        questions = load_manifest(manifest_path)
+    except FileNotFoundError:
+        raise ValueError("RAG evaluation manifest is unavailable") from None
+    run_identity = con.execute(
+        "SELECT phase, status, "
+        "json_extract_string(params_json, '$.params.manifest_sha256') "
+        "FROM runs WHERE run_id = ?",
+        [eval_run_id],
+    ).fetchone()
+    if run_identity != ("rag-eval", "ok", manifest_sha256):
+        raise ValueError("evaluation run manifest identity is unavailable or does not match")
+    questions_by_id = {question.question_id: question for question in questions}
+    source_questions: dict[tuple[str, str, str | None], str] = {}
+    for question in questions:
+        source_key = (
+            answer.question_hash(question.question),
+            question.cluster_id,
+            question.company_id,
+        )
+        previous = source_questions.get(source_key)
+        if previous is not None:
+            raise ValueError(
+                f"questions {previous!r} and {question.question_id!r} share one "
+                "answer usage identity"
+            )
+        source_questions[source_key] = question.question_id
+    fused_rows = con.execute(
+        "SELECT question_id FROM rag_eval_results WHERE eval_run_id = ? "
+        "AND retrieval_method = 'fused' ORDER BY question_id",
+        [eval_run_id],
+    ).fetchall()
+    fused_ids = [row[0] for row in fused_rows]
+    expected_ids = sorted(questions_by_id)
+    if fused_ids != expected_ids:
+        raise ValueError("evaluation run fused rows do not match the frozen manifest question IDs")
+
+    usage_rows = con.execute(
+        "SELECT question_hash, cluster_id, model, prompt_version, input_hash, "
+        "cache_status, outcome FROM llm_usage WHERE run_id = ? AND operation = 'answer' "
+        "ORDER BY usage_id",
+        [eval_run_id],
+    ).fetchall()
+    candidates: list[_ClaimCandidate] = []
+    for question in questions:
+        question_hash = answer.question_hash(question.question)
+        matching_usage = [
+            row for row in usage_rows if row[0] == question_hash and row[1] == question.cluster_id
+        ]
+        if not matching_usage:
+            raise ValueError(
+                f"question {question.question_id!r} has no answer usage for this evaluation run"
+            )
+        cache_identities = {
+            (row[2], row[3], row[4])
+            for row in matching_usage
+            if row[5] in {"hit", "miss"} and row[6] == "ok"
+        }
+        if len(cache_identities) > 1:
+            raise ValueError(
+                f"question {question.question_id!r} has ambiguous answer cache identities"
+            )
+        if not cache_identities:
+            continue
+        if question.company_id is None:
+            raise ValueError(
+                f"question {question.question_id!r} has no concrete company cache scope"
+            )
+        model, prompt_version, input_hash = next(iter(cache_identities))
+        cache_rows = con.execute(
+            "SELECT evidence_hash, evidence_ids_json, answer_json, citation_valid "
+            "FROM rag_answers WHERE question_hash = ? AND cluster_id = ? "
+            "AND company_id = ? AND model = ? AND prompt_version = ? "
+            "ORDER BY evidence_hash",
+            [
+                question_hash,
+                question.cluster_id,
+                question.company_id,
+                model,
+                prompt_version,
+            ],
+        ).fetchall()
+        linked: list[tuple[str, tuple[int, ...], answer.GroundedAnswer]] = []
+        for evidence_hash, evidence_ids_json, answer_json, citation_valid in cache_rows:
+            evidence_ids = _cached_evidence_ids(
+                evidence_ids_json,
+                evidence_hash,
+                question.question_id,
+            )
+            candidate_input_hash = _cache_input_hash(
+                question_hash=question_hash,
+                evidence_hash=evidence_hash,
+                cluster_id=question.cluster_id,
+                company_id=question.company_id,
+                model=model,
+                prompt_version=prompt_version,
+            )
+            if candidate_input_hash != input_hash:
+                continue
+            if citation_valid is not True:
+                raise ValueError(f"question {question.question_id!r} has an invalid cached answer")
+            payload = _stored_json(answer_json, "answer", question.question_id)
+            try:
+                grounded = answer.validate_answer(payload, set(evidence_ids))
+            except (answer.AnswerSchemaError, TypeError, ValueError):
+                raise ValueError(
+                    f"question {question.question_id!r} has an invalid cached answer"
+                ) from None
+            linked.append((evidence_hash, evidence_ids, grounded))
+        if len(linked) != 1:
+            raise ValueError(
+                f"question {question.question_id!r} cannot be linked unambiguously "
+                "to its cached answer"
+            )
+        evidence_hash, _, grounded = linked[0]
+        for claim_position, claim in enumerate(grounded.claims, start=1):
+            cited_evidence, cited_identity = _claim_evidence(
+                con,
+                question,
+                claim.complaint_ids,
+            )
+            review_id = _review_identity(
+                eval_run_id=eval_run_id,
+                question_id=question.question_id,
+                question_hash=question_hash,
+                claim_position=claim_position,
+                claim_text=claim.text,
+                complaint_ids=claim.complaint_ids,
+                evidence_hash=evidence_hash,
+                cited_evidence_identity=cited_identity,
+                input_hash=input_hash,
+            )
+            candidates.append(
+                _ClaimCandidate(
+                    review_id=review_id,
+                    eval_run_id=eval_run_id,
+                    question_id=question.question_id,
+                    category=question.category,
+                    answerable=question.answerable,
+                    company_id=question.company_id,
+                    question=_review_text(question.question, "question"),
+                    claim_position=claim_position,
+                    claim_text=_review_text(claim.text, "claim text"),
+                    cited_complaint_ids=claim.complaint_ids,
+                    cited_evidence=cited_evidence,
+                )
+            )
+    if len({candidate.review_id for candidate in candidates}) != len(candidates):
+        raise ValueError("evaluation run produced duplicate claim review identities")
+    return candidates
+
+
+def _claim_tie_break(seed: int, candidate: _ClaimCandidate) -> str:
+    material = f"{seed}\0{candidate.review_id}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _sample_claims(
+    candidates: list[_ClaimCandidate],
+    n: int,
+    seed: int,
+) -> list[_ClaimCandidate]:
+    remaining = list(candidates)
+    selected: list[_ClaimCandidate] = []
+    category_counts: Counter[str] = Counter()
+    answerable_counts: Counter[bool] = Counter()
+    company_counts: Counter[str] = Counter()
+    position_counts: Counter[int] = Counter()
+    while len(selected) < n:
+        chosen = min(
+            remaining,
+            key=lambda candidate: (
+                category_counts[candidate.category],
+                answerable_counts[candidate.answerable],
+                company_counts[candidate.company_id],
+                position_counts[candidate.claim_position],
+                _claim_tie_break(seed, candidate),
+            ),
+        )
+        selected.append(chosen)
+        remaining.remove(chosen)
+        category_counts[chosen.category] += 1
+        answerable_counts[chosen.answerable] += 1
+        company_counts[chosen.company_id] += 1
+        position_counts[chosen.claim_position] += 1
+    return sorted(selected, key=lambda candidate: (candidate.question_id, candidate.claim_position))
+
+
+def _ensure_claim_review_destination(path: Path) -> None:
+    if not _inside(path.resolve(), PATHS.interim.resolve()):
+        raise ValueError("claim review worklists must stay under configured data/interim")
+
+
+def _claim_review_row(candidate: _ClaimCandidate) -> dict[str, str]:
+    evidence_json = json.dumps(
+        [
+            {
+                "complaint_id": evidence.complaint_id,
+                "text_redacted": evidence.text_redacted,
+            }
+            for evidence in candidate.cited_evidence
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return {
+        "review_id": candidate.review_id,
+        "eval_run_id": candidate.eval_run_id,
+        "question_id": candidate.question_id,
+        "question": candidate.question,
+        "claim_position": str(candidate.claim_position),
+        "claim_text": candidate.claim_text,
+        "cited_complaint_ids": ";".join(map(str, candidate.cited_complaint_ids)),
+        "cited_evidence_json": evidence_json,
+        "grounded": "",
+        "failure_category": "",
+        "notes": "",
+    }
+
+
+def export_claim_review(
+    con,
+    eval_run_id: str,
+    n: int,
+    seed: int,
+    path: Path,
+) -> Path:
+    """Export an exact, blinded, run-bound sample of cached answer claims."""
+    if type(eval_run_id) is not str or not _SAFE_ID.fullmatch(eval_run_id):
+        raise ValueError("eval_run_id must be a safe non-blank identifier")
+    if type(n) is not int or isinstance(n, bool) or n < CONFIG.llm.human_verify_n:
+        raise ValueError(f"human groundedness requires at least {CONFIG.llm.human_verify_n} claims")
+    if type(seed) is not int or isinstance(seed, bool):
+        raise ValueError("seed must be an integer")
+    _ensure_claim_review_destination(path)
+    candidates = _claim_candidates(con, eval_run_id)
+    if len(candidates) < n:
+        raise ValueError(
+            f"eligible claim population {len(candidates)} is smaller than requested {n}"
+        )
+    selected = _sample_claims(candidates, n, seed)
+    return _write_rows(
+        path,
+        CLAIM_REVIEW_HEADER,
+        [_claim_review_row(candidate) for candidate in selected],
+    )
+
+
+def _parse_review_citations(value: str, line_number: int) -> tuple[int, ...]:
+    if not value:
+        raise ValueError(f"line {line_number}: cited_complaint_ids is required")
+    pieces = value.split(";")
+    try:
+        complaint_ids = tuple(int(piece) for piece in pieces)
+    except ValueError:
+        raise ValueError(
+            f"line {line_number}: cited_complaint_ids must be canonical integers"
+        ) from None
+    if (
+        any(complaint_id <= 0 for complaint_id in complaint_ids)
+        or any(
+            str(complaint_id) != piece
+            for complaint_id, piece in zip(complaint_ids, pieces, strict=True)
+        )
+        or len(complaint_ids) != len(set(complaint_ids))
+    ):
+        raise ValueError(
+            f"line {line_number}: cited_complaint_ids must be unique canonical integers"
+        )
+    return complaint_ids
+
+
+def _parse_review_evidence(
+    value: str,
+    complaint_ids: tuple[int, ...],
+    line_number: int,
+) -> tuple[ClaimEvidence, ...]:
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        raise ValueError(f"line {line_number}: cited_evidence_json is invalid") from None
+    if type(payload) is not list or len(payload) != len(complaint_ids):
+        raise ValueError(f"line {line_number}: cited evidence does not match citations")
+    evidence: list[ClaimEvidence] = []
+    for expected_id, item in zip(complaint_ids, payload, strict=True):
+        if type(item) is not dict or set(item) != {"complaint_id", "text_redacted"}:
+            raise ValueError(f"line {line_number}: cited evidence fields are invalid")
+        text = item["text_redacted"]
+        if item["complaint_id"] != expected_id or type(text) is not str or not text.strip():
+            raise ValueError(f"line {line_number}: cited evidence does not match citations")
+        if _review_text(text, "evidence excerpt") != text:
+            raise ValueError(f"line {line_number}: cited evidence contains unsafe text")
+        evidence.append(ClaimEvidence(expected_id, text))
+    return tuple(evidence)
+
+
+def parse_claim_review(path: Path, reviewer_id: str) -> list[ClaimReview]:
+    """Parse completed human judgments without trusting artifact identities."""
+    if type(reviewer_id) is not str or not _SAFE_ID.fullmatch(reviewer_id):
+        raise ValueError("reviewer_id must be a safe non-blank identifier")
+    if not path.stem.endswith(f".{reviewer_id}"):
+        raise ValueError("claim review filename must end with the reviewer_id")
+    rows = _read_strict_csv(path, CLAIM_REVIEW_HEADER, "claim review")
+    parsed: list[ClaimReview] = []
+    seen_ids: set[str] = set()
+    seen_claims: set[tuple[str, int]] = set()
+    for line_number, row in enumerate(rows, start=2):
+        review_id = row["review_id"]
+        if not _HEX_DIGEST.fullmatch(review_id):
+            raise ValueError(f"line {line_number}: review_id is invalid")
+        if review_id in seen_ids:
+            raise ValueError(f"line {line_number}: duplicate review_id")
+        seen_ids.add(review_id)
+        eval_run_id = _safe_identifier(row["eval_run_id"], "eval_run_id", line_number)
+        question_id = _safe_identifier(row["question_id"], "question_id", line_number)
+        try:
+            claim_position = int(row["claim_position"])
+        except ValueError:
+            raise ValueError(f"line {line_number}: claim_position must be positive") from None
+        if claim_position <= 0 or row["claim_position"] != str(claim_position):
+            raise ValueError(f"line {line_number}: claim_position must be canonical and positive")
+        claim_key = (question_id, claim_position)
+        if claim_key in seen_claims:
+            raise ValueError(f"line {line_number}: duplicate question claim position")
+        seen_claims.add(claim_key)
+        question = _required(row["question"], "question", line_number)
+        claim_text = _required(row["claim_text"], "claim_text", line_number)
+        if _review_text(question, "question") != question:
+            raise ValueError(f"line {line_number}: question contains unsafe text")
+        if _review_text(claim_text, "claim text") != claim_text:
+            raise ValueError(f"line {line_number}: claim text contains unsafe text")
+        complaint_ids = _parse_review_citations(row["cited_complaint_ids"], line_number)
+        cited_evidence = _parse_review_evidence(
+            row["cited_evidence_json"],
+            complaint_ids,
+            line_number,
+        )
+        grounded_value = row["grounded"]
+        if grounded_value not in {"yes", "no"}:
+            raise ValueError(f"line {line_number}: grounded must be yes or no")
+        failure_category = row["failure_category"]
+        if grounded_value == "yes":
+            if failure_category != "none":
+                raise ValueError(
+                    f"line {line_number}: failure_category must be none when grounded=yes"
+                )
+        elif failure_category in {"", "none"}:
+            raise ValueError(f"line {line_number}: failure_category is required when grounded=no")
+        elif failure_category not in _CLAIM_FAILURE_CATEGORIES:
+            choices = ", ".join(sorted(_CLAIM_FAILURE_CATEGORIES))
+            raise ValueError(f"line {line_number}: failure_category must be one of {choices}")
+        raw_notes = row["notes"].strip()
+        if raw_notes and _review_text(raw_notes, "notes") != raw_notes:
+            raise ValueError(f"line {line_number}: notes contain unsafe text")
+        parsed.append(
+            ClaimReview(
+                review_id=review_id,
+                eval_run_id=eval_run_id,
+                question_id=question_id,
+                question=question,
+                claim_position=claim_position,
+                claim_text=claim_text,
+                cited_complaint_ids=complaint_ids,
+                cited_evidence=cited_evidence,
+                grounded=grounded_value == "yes",
+                failure_category=failure_category,
+                notes=raw_notes or None,
+                reviewer_id=reviewer_id,
+            )
+        )
+    return parsed
+
+
+def _validate_review_batch(eval_run_id: str, reviews: list[ClaimReview]) -> str:
+    if type(eval_run_id) is not str or not _SAFE_ID.fullmatch(eval_run_id):
+        raise ValueError("eval_run_id must be a safe non-blank identifier")
+    if type(reviews) is not list or any(type(review) is not ClaimReview for review in reviews):
+        raise TypeError("reviews must be a list of ClaimReview values")
+    if len(reviews) < CONFIG.llm.human_verify_n:
+        raise ValueError(
+            f"human groundedness requires at least {CONFIG.llm.human_verify_n} reviews"
+        )
+    review_ids = [review.review_id for review in reviews]
+    claim_keys = [(review.question_id, review.claim_position) for review in reviews]
+    if len(review_ids) != len(set(review_ids)) or len(claim_keys) != len(set(claim_keys)):
+        raise ValueError("duplicate claim reviews are forbidden")
+    if any(review.eval_run_id != eval_run_id for review in reviews):
+        raise ValueError("review eval_run_id does not match the requested eval_run_id")
+    for review in reviews:
+        if review.grounded and review.failure_category != "none":
+            raise ValueError("failure_category must be none when grounded=yes")
+        if not review.grounded and review.failure_category not in _CLAIM_FAILURE_CATEGORIES:
+            raise ValueError("failure_category is required and must be valid when grounded=no")
+        if review.notes is not None and _review_text(review.notes, "notes") != review.notes:
+            raise ValueError("review notes contain unsafe text")
+    reviewer_ids = {review.reviewer_id for review in reviews}
+    if len(reviewer_ids) != 1:
+        raise ValueError("claim reviews must contain exactly one reviewer_id")
+    reviewer_id = next(iter(reviewer_ids))
+    if not _SAFE_ID.fullmatch(reviewer_id):
+        raise ValueError("reviewer_id must be a safe non-blank identifier")
+    return reviewer_id
+
+
+def record_claim_review(
+    con,
+    eval_run_id: str,
+    reviews: list[ClaimReview],
+) -> GroundednessReport:
+    """Verify and atomically persist one complete human-review artifact."""
+    reviewer_id = _validate_review_batch(eval_run_id, reviews)
+    _require_autocommit(con)
+    candidates = {
+        candidate.review_id: candidate for candidate in _claim_candidates(con, eval_run_id)
+    }
+    for review in reviews:
+        candidate = candidates.get(review.review_id)
+        if candidate is None or (
+            review.eval_run_id,
+            review.question_id,
+            review.question,
+            review.claim_position,
+            review.claim_text,
+            review.cited_complaint_ids,
+            review.cited_evidence,
+        ) != (
+            candidate.eval_run_id,
+            candidate.question_id,
+            candidate.question,
+            candidate.claim_position,
+            candidate.claim_text,
+            candidate.cited_complaint_ids,
+            candidate.cited_evidence,
+        ):
+            raise ValueError("claim review identity failed closed after artifact tampering")
+
+    counts: dict[str, list[int]] = {}
+    for review in reviews:
+        values = counts.setdefault(review.question_id, [0, 0])
+        values[0] += int(review.grounded)
+        values[1] += 1
+    con.execute("BEGIN TRANSACTION")
+    try:
+        con.execute(
+            "UPDATE rag_eval_results SET grounded_claims = NULL, reviewed_claims = NULL "
+            "WHERE eval_run_id = ? AND retrieval_method = 'fused'",
+            [eval_run_id],
+        )
+        for question_id, (grounded, reviewed) in sorted(counts.items()):
+            con.execute(
+                "UPDATE rag_eval_results SET grounded_claims = ?, reviewed_claims = ? "
+                "WHERE eval_run_id = ? AND question_id = ? AND retrieval_method = 'fused'",
+                [grounded, reviewed, eval_run_id, question_id],
+            )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+
+    grounded = sum(review.grounded for review in reviews)
+    reviewed = len(reviews)
+    ci_low, ci_high = verify.wilson(grounded, reviewed)
+    return GroundednessReport(
+        grounded=grounded,
+        reviewed=reviewed,
+        rate=grounded / reviewed,
+        ci_low=ci_low,
+        ci_high=ci_high,
+        reviewer_id=reviewer_id,
     )
 
 

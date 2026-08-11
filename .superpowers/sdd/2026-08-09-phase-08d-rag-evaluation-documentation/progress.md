@@ -99,4 +99,17 @@ skips; Ruff, scoped format, and diff check clean. Replay semantics remain as
 reviewer-adjudicated; no live provider call or schema/answer/client edit.
 Task 3 re-review: APPROVED at af2e4e7 — unavailable-vs-measured-zero semantics, complete Phase 8C evidence invariants, exact corpus membership preflight, replay, failure, usage, and transaction behavior all reproduced with no residual finding.
 
-Task 4: in progress.
+Task 4 implementer: DONE_WITH_CONCERNS — exact run/manifest/usage/cache-linked
+claim recovery; deterministic 50-claim stratified sampling; cited-only blinded
+and spreadsheet-safe private atomic CSV; unforgeable run/question/claim/
+evidence identities; strict reviewer decisions and filename provenance; shared
+Wilson reporting; fused-only atomic stale-count replacement, replay, and
+rollback implemented with synthetic fixtures. TDD included six RED→GREEN waves
+for missing interfaces, direct decision/gate validation, manifest-run binding,
+question/source aliasing, actual excerpt-content binding, and exact lowercase
+tokens. Verification: Task 4 selection 26 passed; evaluation 153 passed;
+compatibility slice 321 passed; full 645 passed + 6 expected skips; Ruff,
+format, and diff clean. No live provider or human review; actual groundedness
+remains an external gate. Task 5 must write `params.manifest_sha256` and enforce
+the completed filename suffix `.<reviewer_id>.csv`. Implementation commit
+pending review gate.
