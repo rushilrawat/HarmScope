@@ -1652,6 +1652,99 @@ def test_successful_answer_and_usage_rollback_together_on_database_failure(
     assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (1,)
 
 
+@pytest.mark.parametrize(
+    ("resolution", "expected_rows"),
+    [("COMMIT", [(1,)]), ("ROLLBACK", [])],
+    ids=["caller-commits", "caller-rolls-back"],
+)
+def test_usage_outbox_drain_rejects_caller_transaction_before_mutation(
+    answer_fixture,
+    monkeypatch,
+    resolution,
+    expected_rows,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+    original_record_usage = answer._record_usage
+
+    def fail_usage(*_args, **_kwargs):
+        raise RuntimeError("usage insert failed")
+
+    monkeypatch.setattr(answer, "_record_usage", fail_usage)
+    with pytest.raises(RuntimeError, match="usage insert failed"):
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            model_client=FakeModelClient([model_result()]),
+            retriever=FakeRetriever(evidence_rows),
+        )
+    monkeypatch.setattr(answer, "_record_usage", original_record_usage)
+    staged = list((answer.PATHS.llm_cache / "usage_outbox").glob("*.json"))
+    assert len(staged) == 1
+
+    con.execute("CREATE TABLE caller_outbox_work (value INTEGER)")
+    con.execute("BEGIN TRANSACTION")
+    con.execute("INSERT INTO caller_outbox_work VALUES (1)")
+
+    with pytest.raises(answer.AnswerTransactionError, match="autocommit"):
+        answer.drain_usage_outbox(con, staged[0].parent)
+
+    assert con.execute("SELECT value FROM caller_outbox_work").fetchall() == [(1,)]
+    assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (0,)
+    assert staged[0].exists()
+    con.execute(resolution)
+    assert con.execute("SELECT value FROM caller_outbox_work").fetchall() == expected_rows
+    assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (0,)
+    assert staged[0].exists()
+
+
+def test_usage_outbox_drain_rejects_caller_transaction_before_reading(tmp_path, con):
+    outbox = tmp_path / "usage_outbox"
+    outbox.mkdir()
+    malformed = outbox / "malformed.json"
+    malformed.write_text("{", encoding="utf-8")
+    con.execute("BEGIN TRANSACTION")
+
+    with pytest.raises(answer.AnswerTransactionError, match="autocommit"):
+        answer.drain_usage_outbox(con, outbox)
+
+    assert con.execute("SELECT 1").fetchone() == (1,)
+    con.execute("ROLLBACK")
+    assert malformed.exists()
+
+
+def test_usage_outbox_replay_database_failure_retains_event(
+    answer_fixture,
+    monkeypatch,
+):
+    con, cluster_id, evidence_rows = answer_fixture
+
+    def fail_usage(*_args, **_kwargs):
+        raise RuntimeError("usage insert failed")
+
+    monkeypatch.setattr(answer, "_record_usage", fail_usage)
+    with pytest.raises(RuntimeError, match="usage insert failed"):
+        answer.answer_question(
+            con,
+            cluster_id,
+            "company-1",
+            "Question",
+            "embed-model",
+            model_client=FakeModelClient([model_result()]),
+            retriever=FakeRetriever(evidence_rows),
+        )
+    staged = list((answer.PATHS.llm_cache / "usage_outbox").glob("*.json"))
+    assert len(staged) == 1
+
+    with pytest.raises(RuntimeError, match="usage insert failed"):
+        answer.drain_usage_outbox(con, staged[0].parent)
+
+    assert con.execute("SELECT count(*) FROM llm_usage").fetchone() == (0,)
+    assert staged[0].exists()
+
+
 @pytest.mark.parametrize("case", ["provider", "refusal", "schema"])
 def test_paid_failure_preserves_original_error_when_usage_database_insert_fails(
     answer_fixture,
@@ -1728,13 +1821,23 @@ def test_paid_usage_outbox_is_fsynced_atomic_and_privacy_safe(
             }
         ],
     )
-    fsync_calls = []
+    opened_paths = {}
+    fsynced_paths = []
+    real_open = os.open
     real_fsync = os.fsync
 
+    def recording_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        opened_paths[descriptor] = Path(path)
+        return descriptor
+
     def recording_fsync(fd):
-        fsync_calls.append(fd)
+        path = opened_paths.get(fd)
+        if path is not None:
+            fsynced_paths.append(path)
         real_fsync(fd)
 
+    monkeypatch.setattr(os, "open", recording_open)
     monkeypatch.setattr(os, "fsync", recording_fsync)
 
     def fail_usage(*_args, **_kwargs):
@@ -1757,7 +1860,8 @@ def test_paid_usage_outbox_is_fsynced_atomic_and_privacy_safe(
     staged = list(outbox.glob("*.json"))
     assert len(staged) == 1
     assert list(outbox.glob("*.tmp")) == []
-    assert len(fsync_calls) >= 2
+    assert outbox.parent in fsynced_paths
+    assert outbox in fsynced_paths
     stored = staged[0].read_text(encoding="utf-8")
     for sentinel in (
         "PRIVATE QUESTION SENTINEL",

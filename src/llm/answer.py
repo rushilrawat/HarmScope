@@ -783,7 +783,13 @@ def _stage_usage_record(
 ) -> Path:
     """Atomically stage one paid usage event before attempting database storage."""
     directory = _usage_outbox_dir(outbox_dir)
-    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(parents=True)
+    except FileExistsError:
+        if not directory.is_dir():
+            raise
+    else:
+        _fsync_directory(directory.parent)
     target = directory / f"{record.usage_id}.json"
     temporary_path: Path | None = None
     try:
@@ -897,6 +903,7 @@ def _usage_record_from_outbox(payload: object) -> _AnswerUsageRecord:
 
 def drain_usage_outbox(con, outbox_dir: Path | None = None) -> int:
     """Idempotently reconcile staged paid usage into llm_usage."""
+    _require_autocommit(con)
     directory = _usage_outbox_dir(outbox_dir)
     if not directory.exists():
         return 0
