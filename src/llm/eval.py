@@ -456,8 +456,8 @@ def run_retrieval_eval(
     retriever=retrieve.retrieve_variants,
 ) -> EvaluationSummary:
     """Evaluate and persist all retrieval variants with one call per question."""
-    _require_autocommit(con)
     _validate_retrieval_batch(questions, embed_model, eval_run_id)
+    _require_autocommit(con)
     evaluated: list[QuestionRetrievalEvaluation] = []
     for question in questions:
         result = retriever(

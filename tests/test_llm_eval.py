@@ -722,6 +722,16 @@ class _VariantRetriever:
         return self.results[question]
 
 
+class _NoDatabaseConnection:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def execute(self, query, parameters=None):
+        del parameters
+        self.calls.append(query)
+        raise AssertionError("invalid evaluation input touched the database")
+
+
 def test_score_ranking_uses_all_relevant_ids_as_denominator_and_unique_hits():
     got = llm_eval.score_ranking([9, 2, 2, 4, 6], {2, 4, 6, 8}, k=4)
 
@@ -1066,6 +1076,39 @@ def test_retrieval_eval_validates_batch_before_retrieval(
             retriever=retriever,
         )
 
+    assert retriever.calls == []
+
+
+@pytest.mark.parametrize(
+    ("questions", "eval_run_id", "match"),
+    [
+        ([], "eval-1", "non-empty"),
+        ([_retrieval_question("rag-001")], "unsafe run id", "eval_run_id"),
+        (
+            [_retrieval_question("rag-001"), _retrieval_question("rag-001")],
+            "eval-1",
+            "duplicate question_id",
+        ),
+    ],
+)
+def test_invalid_retrieval_batch_touches_neither_database_nor_retriever(
+    questions, eval_run_id, match
+):
+    con = _NoDatabaseConnection()
+    retriever = _VariantRetriever(
+        {question.question: _retrieval_result() for question in questions}
+    )
+
+    with pytest.raises(ValueError, match=match):
+        llm_eval.run_retrieval_eval(
+            con,
+            questions,
+            "embed-m",
+            eval_run_id,
+            retriever=retriever,
+        )
+
+    assert con.calls == []
     assert retriever.calls == []
 
 

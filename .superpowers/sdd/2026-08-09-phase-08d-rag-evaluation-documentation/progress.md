@@ -51,3 +51,17 @@ real fusion function, and the report demonstrates valid fusion losses. GREEN:
 new regressions 19 passed; final Task 2 selection 32 passed; compatibility
 slice 163 passed; full 562 passed + 6 expected skips; Ruff, scoped format, and
 diff check clean. Fix commit pending scoped re-review.
+
+Task 2 scoped re-review after bf342fc: Important fused-provenance finding
+ADDRESSED; Minor run-ID shape finding functionally addressed, but residual
+Minor sequencing issue remained because invalid input executed two read-only
+autocommit-probe queries before validation.
+
+Task 2: fix round 2/5 — reproduced empty-batch, unsafe-run-ID, and duplicate-
+question inputs against a zero-database spy; all three RED cases touched SQL
+before their validation error. Pure batch validation now precedes the
+autocommit probe. Valid explicit caller transactions still reject before
+retrieval/persistence without altering caller state. GREEN: targeted 5 passed;
+evaluation 73 passed; compatibility slice 166 passed; full 565 passed + 6
+expected skips; Ruff, scoped format, and diff check clean. Fix commit pending
+scoped re-review.
