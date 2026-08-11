@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import math
 import os
 import re
 import tempfile
 from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
+from numbers import Real
 from pathlib import Path
+from statistics import median
 
 from src.config import CONFIG, PATHS
 from src.llm import retrieve
@@ -57,10 +61,15 @@ _FORMULA_PREFIXES = ("=", "+", "-", "@")
 _SHINGLE_SIZE = 8
 _EXCERPTS_PER_ROW = 10
 _QUESTIONS_PER_CATEGORY = 5
+_RETRIEVAL_METHODS = ("dense", "bm25", "fused")
 
 
 class ManifestError(ValueError):
     """The evaluation manifest or private authoring artifact is invalid."""
+
+
+class EvaluationTransactionError(RuntimeError):
+    """The evaluation runner requires an autocommit DuckDB connection."""
 
 
 @dataclass(frozen=True)
@@ -75,11 +84,412 @@ class EvalQuestion:
 
 
 @dataclass(frozen=True)
+class RetrievalMetrics:
+    rank_first_relevant: int | None
+    relevant_retrieved_count: int
+    recall_at_10: float
+    reciprocal_rank: float
+
+
+@dataclass(frozen=True)
+class RetrievalMethodSummary:
+    recall_at_10: float
+    reciprocal_rank: float
+    median_latency_seconds: float
+    p95_latency_seconds: float
+
+
+@dataclass(frozen=True)
+class WinTieLoss:
+    wins: int
+    ties: int
+    losses: int
+
+
+@dataclass(frozen=True)
+class QuestionRetrievalEvaluation:
+    question_id: str
+    answerable: bool
+    dense: RetrievalMetrics
+    bm25: RetrievalMetrics
+    fused: RetrievalMetrics
+    dense_seconds: float
+    bm25_seconds: float
+    fused_seconds: float
+
+    @property
+    def methods(self) -> dict[str, RetrievalMetrics]:
+        return {"dense": self.dense, "bm25": self.bm25, "fused": self.fused}
+
+    @property
+    def latencies(self) -> dict[str, float]:
+        return {
+            "dense": self.dense_seconds,
+            "bm25": self.bm25_seconds,
+            "fused": self.fused_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class EvaluationSummary:
+    answerable_count: int
+    unanswerable_count: int
+    dense: RetrievalMethodSummary
+    bm25: RetrievalMethodSummary
+    fused: RetrievalMethodSummary
+    fused_vs_dense: WinTieLoss
+    fused_vs_bm25: WinTieLoss
+    questions: tuple[QuestionRetrievalEvaluation, ...]
+
+    @property
+    def methods(self) -> dict[str, RetrievalMethodSummary]:
+        return {"dense": self.dense, "bm25": self.bm25, "fused": self.fused}
+
+    def render(self) -> str:
+        """Render stable aggregate and per-question metrics without narrative text."""
+        lines = [
+            "RAG retrieval evaluation",
+            f"answerable: {self.answerable_count}",
+            f"unanswerable: {self.unanswerable_count}",
+            "method | Recall@10 | MRR | median latency (s) | p95 latency (s)",
+        ]
+        for method in _RETRIEVAL_METHODS:
+            aggregate = self.methods[method]
+            lines.append(
+                f"{method} | {aggregate.recall_at_10:.6f} | "
+                f"{aggregate.reciprocal_rank:.6f} | "
+                f"{aggregate.median_latency_seconds:.6f} | "
+                f"{aggregate.p95_latency_seconds:.6f}"
+            )
+        dense_comparison = self.fused_vs_dense
+        bm25_comparison = self.fused_vs_bm25
+        lines.extend(
+            [
+                "fused vs dense win/tie/loss: "
+                f"{dense_comparison.wins}/{dense_comparison.ties}/{dense_comparison.losses}",
+                "fused vs BM25 win/tie/loss: "
+                f"{bm25_comparison.wins}/{bm25_comparison.ties}/{bm25_comparison.losses}",
+                "question_id | answerable | dense R@10/MRR | BM25 R@10/MRR | "
+                "fused R@10/MRR | fused-vs-dense | fused-vs-BM25",
+            ]
+        )
+        for question in sorted(self.questions, key=lambda row: row.question_id):
+            dense_relation = _relation(question.fused, question.dense)
+            bm25_relation = _relation(question.fused, question.bm25)
+            lines.append(
+                f"{question.question_id} | {'yes' if question.answerable else 'no'} | "
+                f"{question.dense.recall_at_10:.6f}/{question.dense.reciprocal_rank:.6f} | "
+                f"{question.bm25.recall_at_10:.6f}/{question.bm25.reciprocal_rank:.6f} | "
+                f"{question.fused.recall_at_10:.6f}/{question.fused.reciprocal_rank:.6f} | "
+                f"{dense_relation} | {bm25_relation}"
+            )
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class _AuthoringCandidate:
     cluster_id: str
     company_id: str | None
     product_family: str
     did_fire: bool
+
+
+def _positive_complaint_ids(values, label: str) -> None:
+    if any(type(value) is not int or value <= 0 for value in values):
+        raise ValueError(f"{label} must contain positive integers")
+
+
+def score_ranking(
+    ranked_ids: list[int], relevant_ids: set[int] | frozenset[int], k: int = 10
+) -> RetrievalMetrics:
+    """Compute top-k recall and reciprocal rank from hand-marked relevance IDs."""
+    if type(ranked_ids) is not list:
+        raise TypeError("ranked_ids must be a list")
+    if not isinstance(relevant_ids, (set, frozenset)):
+        raise TypeError("relevant_ids must be a set")
+    if type(k) is not int or k <= 0:
+        raise ValueError("k must be a positive integer")
+    _positive_complaint_ids(ranked_ids, "ranked_ids")
+    _positive_complaint_ids(relevant_ids, "relevant_ids")
+    if not relevant_ids:
+        return RetrievalMetrics(None, 0, 0.0, 0.0)
+
+    top_k = ranked_ids[:k]
+    first_rank = next(
+        (rank for rank, complaint_id in enumerate(top_k, start=1) if complaint_id in relevant_ids),
+        None,
+    )
+    retrieved = len(set(top_k) & relevant_ids)
+    return RetrievalMetrics(
+        rank_first_relevant=first_rank,
+        relevant_retrieved_count=retrieved,
+        recall_at_10=retrieved / len(relevant_ids),
+        reciprocal_rank=0.0 if first_rank is None else 1.0 / first_rank,
+    )
+
+
+def _validate_component_ranking(hits: tuple[retrieve.RankedHit, ...], label: str) -> list[int]:
+    if type(hits) is not tuple:
+        raise ValueError(f"{label} ranking must be a tuple")
+    complaint_ids: list[int] = []
+    for expected_rank, hit in enumerate(hits, start=1):
+        if not isinstance(hit, retrieve.RankedHit):
+            raise ValueError(f"{label} ranking contains an invalid hit")
+        if hit.rank != expected_rank:
+            raise ValueError(f"{label} rank sequence must be one-based and contiguous")
+        if type(hit.complaint_id) is not int or hit.complaint_id <= 0:
+            raise ValueError(f"{label} complaint IDs must be positive integers")
+        if (
+            not isinstance(hit.score, Real)
+            or isinstance(hit.score, bool)
+            or not math.isfinite(hit.score)
+        ):
+            raise ValueError(f"{label} scores must be finite numbers")
+        complaint_ids.append(hit.complaint_id)
+    if len(complaint_ids) != len(set(complaint_ids)):
+        raise ValueError(f"{label} ranking contains duplicate complaint IDs")
+    return complaint_ids
+
+
+def _validate_fused_ranking(hits: tuple[retrieve.FusedHit, ...]) -> list[int]:
+    if type(hits) is not tuple:
+        raise ValueError("fused ranking must be a tuple")
+    complaint_ids: list[int] = []
+    for hit in hits:
+        if not isinstance(hit, retrieve.FusedHit):
+            raise ValueError("fused ranking contains an invalid hit")
+        if type(hit.complaint_id) is not int or hit.complaint_id <= 0:
+            raise ValueError("fused complaint IDs must be positive integers")
+        if (
+            not isinstance(hit.fused_score, Real)
+            or isinstance(hit.fused_score, bool)
+            or not math.isfinite(hit.fused_score)
+        ):
+            raise ValueError("fused scores must be finite numbers")
+        complaint_ids.append(hit.complaint_id)
+    if len(complaint_ids) != len(set(complaint_ids)):
+        raise ValueError("fused ranking contains duplicate complaint IDs")
+    return complaint_ids
+
+
+def evaluate_retrieval_question(
+    question: EvalQuestion, result: retrieve.RetrievalResult
+) -> dict[str, RetrievalMetrics]:
+    """Score dense, BM25, and fused orderings from one retrieval result."""
+    if not isinstance(question, EvalQuestion):
+        raise TypeError("question must be an EvalQuestion")
+    if not isinstance(result, retrieve.RetrievalResult):
+        raise TypeError("result must be a RetrievalResult")
+    if (
+        result.corpus.cluster_id != question.cluster_id
+        or result.corpus.company_id != question.company_id
+    ):
+        raise ValueError("retrieval result scope does not match the evaluation question")
+    dense_ids = _validate_component_ranking(result.dense, "dense")
+    bm25_ids = _validate_component_ranking(result.sparse, "bm25")
+    fused_ids = _validate_fused_ranking(result.fused)
+    relevant = set(question.relevant_complaint_ids)
+    return {
+        "dense": score_ranking(dense_ids, relevant),
+        "bm25": score_ranking(bm25_ids, relevant),
+        "fused": score_ranking(fused_ids, relevant),
+    }
+
+
+def _latency(value: object, label: str) -> float:
+    if (
+        not isinstance(value, Real)
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"{label} latency must be a finite non-negative number")
+    return float(value)
+
+
+def _require_autocommit(con) -> None:
+    first_id = con.execute("SELECT current_transaction_id()").fetchone()[0]
+    second_id = con.execute("SELECT current_transaction_id()").fetchone()[0]
+    if first_id == second_id:
+        raise EvaluationTransactionError("run_retrieval_eval requires an autocommit connection")
+
+
+def _validate_retrieval_batch(
+    questions: list[EvalQuestion], embed_model: str, eval_run_id: str
+) -> None:
+    if type(questions) is not list or not questions:
+        raise ValueError("questions must be a non-empty list")
+    if type(embed_model) is not str or not embed_model.strip():
+        raise ValueError("embed_model is required")
+    if type(eval_run_id) is not str or not eval_run_id.strip():
+        raise ValueError("eval_run_id is required")
+    seen: set[str] = set()
+    for question in questions:
+        if not isinstance(question, EvalQuestion):
+            raise TypeError("questions must contain EvalQuestion values")
+        if not _SAFE_ID.fullmatch(question.question_id):
+            raise ValueError("question_id must be a safe non-blank identifier")
+        if question.question_id in seen:
+            raise ValueError(f"duplicate question_id {question.question_id!r}")
+        seen.add(question.question_id)
+        if question.answerable and not question.relevant_complaint_ids:
+            raise ValueError("answerable questions require relevant complaint IDs")
+        if not question.answerable and question.relevant_complaint_ids:
+            raise ValueError("unanswerable questions cannot have relevant complaint IDs")
+
+
+def _write_retrieval_rows(
+    con,
+    eval_run_id: str,
+    question: EvalQuestion,
+    metrics: dict[str, RetrievalMetrics],
+    latencies: dict[str, float],
+) -> None:
+    if tuple(metrics) != _RETRIEVAL_METHODS or tuple(latencies) != _RETRIEVAL_METHODS:
+        raise ValueError("retrieval rows require exactly dense, bm25, and fused methods")
+    con.execute("BEGIN TRANSACTION")
+    try:
+        for method in _RETRIEVAL_METHODS:
+            metric = metrics[method]
+            con.execute(
+                "INSERT INTO rag_eval_results "
+                "(eval_run_id, question_id, retrieval_method, rank_first_relevant, "
+                "relevant_retrieved_count, recall_at_10, reciprocal_rank, "
+                "latency_seconds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (eval_run_id, question_id, retrieval_method) DO UPDATE SET "
+                "rank_first_relevant = excluded.rank_first_relevant, "
+                "relevant_retrieved_count = excluded.relevant_retrieved_count, "
+                "recall_at_10 = excluded.recall_at_10, "
+                "reciprocal_rank = excluded.reciprocal_rank, "
+                "latency_seconds = excluded.latency_seconds",
+                [
+                    eval_run_id,
+                    question.question_id,
+                    method,
+                    metric.rank_first_relevant,
+                    metric.relevant_retrieved_count,
+                    metric.recall_at_10,
+                    metric.reciprocal_rank,
+                    latencies[method],
+                    datetime.now(),
+                ],
+            )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+
+
+def _relation(left: RetrievalMetrics, right: RetrievalMetrics) -> str:
+    left_pair = (left.recall_at_10, left.reciprocal_rank)
+    right_pair = (right.recall_at_10, right.reciprocal_rank)
+    if left_pair > right_pair:
+        return "win"
+    if left_pair < right_pair:
+        return "loss"
+    return "tie"
+
+
+def _comparison(questions: list[QuestionRetrievalEvaluation], component: str) -> WinTieLoss:
+    counts = Counter(
+        _relation(question.fused, getattr(question, component)) for question in questions
+    )
+    return WinTieLoss(counts["win"], counts["tie"], counts["loss"])
+
+
+def _percentile(values: list[float], proportion: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * proportion
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _aggregate_method(
+    questions: list[QuestionRetrievalEvaluation], method: str
+) -> RetrievalMethodSummary:
+    answerable = [question for question in questions if question.answerable]
+    recall = (
+        sum(getattr(question, method).recall_at_10 for question in answerable) / len(answerable)
+        if answerable
+        else 0.0
+    )
+    reciprocal_rank = (
+        sum(getattr(question, method).reciprocal_rank for question in answerable) / len(answerable)
+        if answerable
+        else 0.0
+    )
+    latencies = [question.latencies[method] for question in questions]
+    return RetrievalMethodSummary(
+        recall_at_10=recall,
+        reciprocal_rank=reciprocal_rank,
+        median_latency_seconds=float(median(latencies)) if latencies else 0.0,
+        p95_latency_seconds=_percentile(latencies, 0.95),
+    )
+
+
+def _summarize_retrieval(
+    questions: list[QuestionRetrievalEvaluation],
+) -> EvaluationSummary:
+    answerable_count = sum(question.answerable for question in questions)
+    return EvaluationSummary(
+        answerable_count=answerable_count,
+        unanswerable_count=len(questions) - answerable_count,
+        dense=_aggregate_method(questions, "dense"),
+        bm25=_aggregate_method(questions, "bm25"),
+        fused=_aggregate_method(questions, "fused"),
+        fused_vs_dense=_comparison(questions, "dense"),
+        fused_vs_bm25=_comparison(questions, "bm25"),
+        questions=tuple(questions),
+    )
+
+
+def run_retrieval_eval(
+    con,
+    questions: list[EvalQuestion],
+    embed_model: str,
+    eval_run_id: str,
+    retriever=retrieve.retrieve_variants,
+) -> EvaluationSummary:
+    """Evaluate and persist all retrieval variants with one call per question."""
+    _require_autocommit(con)
+    _validate_retrieval_batch(questions, embed_model, eval_run_id)
+    evaluated: list[QuestionRetrievalEvaluation] = []
+    for question in questions:
+        result = retriever(
+            con,
+            question.cluster_id,
+            question.company_id,
+            question.question,
+            embed_model,
+        )
+        if result.corpus.embed_model != embed_model:
+            raise ValueError("retrieval result embedding model does not match embed_model")
+        metrics = evaluate_retrieval_question(question, result)
+        latencies = {
+            "dense": _latency(result.dense_seconds, "dense"),
+            "bm25": _latency(result.sparse_seconds, "bm25"),
+            "fused": _latency(result.fusion_seconds, "fused"),
+        }
+        _write_retrieval_rows(con, eval_run_id, question, metrics, latencies)
+        evaluated.append(
+            QuestionRetrievalEvaluation(
+                question_id=question.question_id,
+                answerable=question.answerable,
+                dense=metrics["dense"],
+                bm25=metrics["bm25"],
+                fused=metrics["fused"],
+                dense_seconds=latencies["dense"],
+                bm25_seconds=latencies["bm25"],
+                fused_seconds=latencies["fused"],
+            )
+        )
+    return _summarize_retrieval(evaluated)
 
 
 def _required(value: str | None, field: str, line_number: int) -> str:

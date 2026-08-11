@@ -28,4 +28,12 @@ expected skips; Ruff, scoped format, and diff check clean. The Task 1 fix commit
 contains this ledger update.
 Task 1 re-review: APPROVED at 4614378 — all four counterexamples fixed; 16 targeted tests and the complete suite pass; private draft independently confirms 15 canonical fired / 15 controls, 300/300 shown IDs retrievable, zero status mismatches, and blank human fields. Engineering implementation accepted. Human manifest freeze and the `company_response` plan contradiction remain open external/design gates.
 
-Task 2: in progress.
+Task 2 implementer: DONE — exact dense/BM25/fused scoring from one retrieval
+call; per-question atomic three-row upserts; caller-autocommit rejection;
+prior-question survival; replay preservation of answer/human columns and
+created-at identity; answerable-only macros; all-question lexicographic
+win/tie/loss; stable ID-only loss-visible rendering with linear p95. Strict TDD:
+20 expected missing-interface RED failures, then 25 GREEN; 2 relevance-invariant
+RED failures, then final 27 GREEN. Verification: focused 27 passed; retrieval/
+schema/isolation slice 149 passed; full 548 passed + 6 expected skips; Ruff,
+scoped format, and diff check clean. Implementation commit pending review gate.

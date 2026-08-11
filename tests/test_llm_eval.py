@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -647,3 +648,378 @@ def test_authoring_export_refuses_a_tracked_repository_destination(
             23,
             Path("data/ground_truth/private-authoring.csv"),
         )
+
+
+def _retrieval_question(
+    question_id: str,
+    *,
+    relevant_ids: frozenset[int] = frozenset({10}),
+    answerable: bool = True,
+    question_text: str | None = None,
+) -> llm_eval.EvalQuestion:
+    return llm_eval.EvalQuestion(
+        question_id=question_id,
+        question=question_text or f"Synthetic retrieval query {question_id}?",
+        cluster_id="cluster-1",
+        company_id="company-1",
+        category="mechanism" if answerable else "unanswerable",
+        relevant_complaint_ids=relevant_ids,
+        answerable=answerable,
+    )
+
+
+def _retrieval_result(
+    *,
+    dense_ids: tuple[int, ...] = (10, 20, 30),
+    bm25_ids: tuple[int, ...] = (20, 10, 30),
+    fused_ids: tuple[int, ...] = (30, 10, 20),
+    latencies: tuple[float, float, float] = (0.01, 0.02, 0.003),
+) -> retrieve.RetrievalResult:
+    dense = tuple(
+        retrieve.RankedHit(complaint_id, rank, 1.0 / rank)
+        for rank, complaint_id in enumerate(dense_ids, start=1)
+    )
+    sparse = tuple(
+        retrieve.RankedHit(complaint_id, rank, 1.0 / rank)
+        for rank, complaint_id in enumerate(bm25_ids, start=1)
+    )
+    fused = tuple(
+        retrieve.FusedHit(
+            complaint_id,
+            1.0 / (60 + rank),
+            next((hit.rank for hit in dense if hit.complaint_id == complaint_id), None),
+            next((hit.score for hit in dense if hit.complaint_id == complaint_id), None),
+            next((hit.rank for hit in sparse if hit.complaint_id == complaint_id), None),
+            next((hit.score for hit in sparse if hit.complaint_id == complaint_id), None),
+        )
+        for rank, complaint_id in enumerate(fused_ids, start=1)
+    )
+    return retrieve.RetrievalResult(
+        corpus=retrieve.ScopedCorpus("cluster-1", "company-1", "embed-m", ()),
+        dense=dense,
+        sparse=sparse,
+        fused=fused,
+        evidence=(),
+        dense_seconds=latencies[0],
+        sparse_seconds=latencies[1],
+        fusion_seconds=latencies[2],
+    )
+
+
+class _VariantRetriever:
+    def __init__(self, results: dict[str, retrieve.RetrievalResult]):
+        self.results = results
+        self.calls: list[tuple[str, str | None, str, str]] = []
+
+    def __call__(self, con, cluster_id, company_id, question, embed_model):
+        del con
+        self.calls.append((cluster_id, company_id, question, embed_model))
+        return self.results[question]
+
+
+def test_score_ranking_uses_all_relevant_ids_as_denominator_and_unique_hits():
+    got = llm_eval.score_ranking([9, 2, 2, 4, 6], {2, 4, 6, 8}, k=4)
+
+    assert got == llm_eval.RetrievalMetrics(
+        rank_first_relevant=2,
+        relevant_retrieved_count=2,
+        recall_at_10=pytest.approx(0.5),
+        reciprocal_rank=pytest.approx(0.5),
+    )
+
+
+def test_score_ranking_returns_zero_metrics_when_nothing_is_relevant():
+    assert llm_eval.score_ranking([1, 2, 3], set()) == llm_eval.RetrievalMetrics(None, 0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("ranked_ids", "relevant_ids", "k", "match"),
+    [
+        ((1, 2), {1}, 10, "list"),
+        ([1, True], {1}, 10, "positive integers"),
+        ([1, 0], {1}, 10, "positive integers"),
+        ([1, 2], [1], 10, "set"),
+        ([1, 2], {True}, 10, "positive integers"),
+        ([1, 2], {1}, True, "positive integer"),
+        ([1, 2], {1}, 0, "positive integer"),
+    ],
+)
+def test_score_ranking_rejects_invalid_boundary_values(ranked_ids, relevant_ids, k, match):
+    with pytest.raises((TypeError, ValueError), match=match):
+        llm_eval.score_ranking(ranked_ids, relevant_ids, k=k)
+
+
+def test_evaluate_retrieval_question_scores_exactly_three_orderings():
+    got = llm_eval.evaluate_retrieval_question(
+        _retrieval_question("rag-001"),
+        _retrieval_result(),
+    )
+
+    assert set(got) == {"dense", "bm25", "fused"}
+    assert got["dense"].rank_first_relevant == 1
+    assert got["bm25"].rank_first_relevant == 2
+    assert got["fused"].rank_first_relevant == 2
+
+
+def test_evaluate_retrieval_question_rejects_wrong_scope_and_rank_shapes():
+    question = _retrieval_question("rag-001")
+    wrong_scope = _retrieval_result()
+    object.__setattr__(
+        wrong_scope,
+        "corpus",
+        retrieve.ScopedCorpus("other-cluster", "company-1", "embed-m", ()),
+    )
+    with pytest.raises(ValueError, match="scope"):
+        llm_eval.evaluate_retrieval_question(question, wrong_scope)
+
+    malformed = _retrieval_result()
+    object.__setattr__(
+        malformed,
+        "dense",
+        (
+            retrieve.RankedHit(10, 2, 1.0),
+            retrieve.RankedHit(10, 1, 0.5),
+        ),
+    )
+    with pytest.raises(ValueError, match="dense.*rank|dense.*duplicate"):
+        llm_eval.evaluate_retrieval_question(question, malformed)
+
+
+def test_retrieval_eval_persists_three_variants_once_and_aggregates_answerable_only(con):
+    questions = [
+        _retrieval_question("rag-001"),
+        _retrieval_question(
+            "rag-002",
+            relevant_ids=frozenset(),
+            answerable=False,
+        ),
+    ]
+    results = {question.question: _retrieval_result() for question in questions}
+    retriever = _VariantRetriever(results)
+
+    summary = llm_eval.run_retrieval_eval(
+        con,
+        questions,
+        "embed-m",
+        "eval-1",
+        retriever=retriever,
+    )
+
+    rows = con.execute(
+        "SELECT question_id, retrieval_method, rank_first_relevant, "
+        "recall_at_10, reciprocal_rank, latency_seconds "
+        "FROM rag_eval_results ORDER BY question_id, retrieval_method"
+    ).fetchall()
+    assert len(rows) == 6
+    assert {method for _, method, *_ in rows} == {"dense", "bm25", "fused"}
+    first_latencies = {method: latency for qid, method, *_, latency in rows if qid == "rag-001"}
+    assert first_latencies == {"dense": 0.01, "bm25": 0.02, "fused": 0.003}
+    assert len(retriever.calls) == 2
+    assert all(call[-1] == "embed-m" for call in retriever.calls)
+    assert summary.answerable_count == 1
+    assert summary.unanswerable_count == 1
+    assert summary.methods["dense"].recall_at_10 == pytest.approx(1.0)
+    assert summary.methods["dense"].reciprocal_rank == pytest.approx(1.0)
+    assert summary.methods["bm25"].reciprocal_rank == pytest.approx(0.5)
+    assert summary.methods["fused"].reciprocal_rank == pytest.approx(0.5)
+    assert summary.fused_vs_dense == llm_eval.WinTieLoss(wins=0, ties=1, losses=1)
+    assert summary.fused_vs_bm25 == llm_eval.WinTieLoss(wins=0, ties=2, losses=0)
+
+
+class _FailingInsertConnection:
+    def __init__(self, con, fail_on_insert: int):
+        self._con = con
+        self._fail_on_insert = fail_on_insert
+        self._inserts = 0
+
+    def execute(self, query, parameters=None):
+        if query.lstrip().startswith("INSERT INTO rag_eval_results"):
+            self._inserts += 1
+            if self._inserts == self._fail_on_insert:
+                raise RuntimeError("simulated second-method insert failure")
+        return (
+            self._con.execute(query) if parameters is None else self._con.execute(query, parameters)
+        )
+
+
+def test_retrieval_eval_rolls_back_one_question_but_preserves_prior_question(con):
+    questions = [_retrieval_question("rag-001"), _retrieval_question("rag-002")]
+    retriever = _VariantRetriever(
+        {question.question: _retrieval_result() for question in questions}
+    )
+    wrapped = _FailingInsertConnection(con, fail_on_insert=5)
+
+    with pytest.raises(RuntimeError, match="second-method"):
+        llm_eval.run_retrieval_eval(
+            wrapped,
+            questions,
+            "embed-m",
+            "eval-atomic",
+            retriever=retriever,
+        )
+
+    assert con.execute(
+        "SELECT question_id, retrieval_method FROM rag_eval_results ORDER BY 1, 2"
+    ).fetchall() == [
+        ("rag-001", "bm25"),
+        ("rag-001", "dense"),
+        ("rag-001", "fused"),
+    ]
+
+
+def test_retrieval_eval_replay_updates_metrics_without_erasing_answer_review_fields(con):
+    question = _retrieval_question("rag-001")
+    first = _VariantRetriever({question.question: _retrieval_result()})
+    llm_eval.run_retrieval_eval(con, [question], "embed-m", "eval-replay", retriever=first)
+    con.execute(
+        "UPDATE rag_eval_results SET citation_valid = true, citation_coverage = 0.75, "
+        "abstention_correct = true, grounded_claims = 7, reviewed_claims = 8 "
+        "WHERE eval_run_id = 'eval-replay' AND retrieval_method = 'fused'"
+    )
+    created_at = con.execute(
+        "SELECT created_at FROM rag_eval_results WHERE eval_run_id = 'eval-replay' "
+        "AND retrieval_method = 'fused'"
+    ).fetchone()[0]
+    changed = _VariantRetriever(
+        {
+            question.question: _retrieval_result(
+                dense_ids=(20, 10),
+                bm25_ids=(10, 20),
+                fused_ids=(10, 20),
+                latencies=(0.5, 0.6, 0.7),
+            )
+        }
+    )
+
+    llm_eval.run_retrieval_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-replay",
+        retriever=changed,
+    )
+
+    assert con.execute(
+        "SELECT count(*) FROM rag_eval_results WHERE eval_run_id = 'eval-replay'"
+    ).fetchone() == (3,)
+    assert con.execute(
+        "SELECT rank_first_relevant, latency_seconds, citation_valid, citation_coverage, "
+        "abstention_correct, grounded_claims, reviewed_claims, created_at "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-replay' "
+        "AND retrieval_method = 'fused'"
+    ).fetchone() == (1, 0.7, True, 0.75, True, 7, 8, created_at)
+
+
+@pytest.mark.parametrize("resolution", ["COMMIT", "ROLLBACK"])
+def test_retrieval_eval_rejects_caller_transaction_before_retrieval(con, resolution):
+    con.execute("CREATE TABLE caller_eval_work (value INTEGER)")
+    con.execute("BEGIN TRANSACTION")
+    con.execute("INSERT INTO caller_eval_work VALUES (1)")
+    question = _retrieval_question("rag-001")
+    retriever = _VariantRetriever({question.question: _retrieval_result()})
+
+    with pytest.raises(llm_eval.EvaluationTransactionError, match="autocommit"):
+        llm_eval.run_retrieval_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-caller-tx",
+            retriever=retriever,
+        )
+
+    assert retriever.calls == []
+    assert con.execute("SELECT value FROM caller_eval_work").fetchall() == [(1,)]
+    assert con.execute("SELECT count(*) FROM rag_eval_results").fetchone() == (0,)
+    con.execute(resolution)
+    expected = [(1,)] if resolution == "COMMIT" else []
+    assert con.execute("SELECT value FROM caller_eval_work").fetchall() == expected
+
+
+@pytest.mark.parametrize(
+    ("questions", "embed_model", "eval_run_id", "match"),
+    [
+        (
+            [_retrieval_question("rag-001"), _retrieval_question("rag-001")],
+            "embed-m",
+            "eval-1",
+            "duplicate question_id",
+        ),
+        ([_retrieval_question("rag-001")], "", "eval-1", "embed_model"),
+        ([_retrieval_question("rag-001")], "embed-m", "", "eval_run_id"),
+        (
+            [_retrieval_question("rag-001", relevant_ids=frozenset())],
+            "embed-m",
+            "eval-1",
+            "answerable",
+        ),
+        (
+            [
+                _retrieval_question(
+                    "rag-001",
+                    relevant_ids=frozenset({10}),
+                    answerable=False,
+                )
+            ],
+            "embed-m",
+            "eval-1",
+            "unanswerable",
+        ),
+    ],
+)
+def test_retrieval_eval_validates_batch_before_retrieval(
+    con, questions, embed_model, eval_run_id, match
+):
+    retriever = _VariantRetriever(
+        {question.question: _retrieval_result() for question in questions}
+    )
+
+    with pytest.raises(ValueError, match=match):
+        llm_eval.run_retrieval_eval(
+            con,
+            questions,
+            embed_model,
+            eval_run_id,
+            retriever=retriever,
+        )
+
+    assert retriever.calls == []
+
+
+def test_retrieval_summary_reports_linear_p95_and_every_fusion_loss_without_narratives(con):
+    questions: list[llm_eval.EvalQuestion] = []
+    results: dict[str, retrieve.RetrievalResult] = {}
+    for index in range(1, 21):
+        question = _retrieval_question(
+            f"rag-{index:03d}",
+            question_text=f"private narrative phrase {index}",
+        )
+        questions.append(question)
+        fused_ids = (20, 10) if index == 20 else (10, 20)
+        results[question.question] = _retrieval_result(
+            dense_ids=(10, 20),
+            bm25_ids=(10, 20),
+            fused_ids=fused_ids,
+            latencies=(index / 1000, index / 500, index / 2000),
+        )
+    summary = llm_eval.run_retrieval_eval(
+        con,
+        questions,
+        "embed-m",
+        "eval-report",
+        retriever=_VariantRetriever(results),
+    )
+
+    assert summary.methods["dense"].median_latency_seconds == pytest.approx(0.0105)
+    assert summary.methods["dense"].p95_latency_seconds == pytest.approx(0.01905)
+    assert summary.fused_vs_dense == llm_eval.WinTieLoss(wins=0, ties=19, losses=1)
+    report = summary.render()
+    assert report == summary.render()
+    assert "answerable: 20" in report
+    assert "unanswerable: 0" in report
+    assert "Recall@10" in report
+    assert "MRR" in report
+    assert "fused vs dense win/tie/loss: 0/19/1" in report
+    assert "fused vs BM25 win/tie/loss: 0/19/1" in report
+    assert "rag-020" in report and "loss" in report
+    assert "private narrative phrase" not in report
+    assert all(math.isfinite(method.p95_latency_seconds) for method in summary.methods.values())
