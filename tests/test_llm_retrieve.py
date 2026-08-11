@@ -784,6 +784,7 @@ def test_retrieval_result_types_are_immutable():
     fused = retrieve.FusedHit(10, 0.1, 1, 0.9, None, None)
     evidence_row = retrieve.RetrievedEvidence(
         complaint_id=10,
+        cluster_id="scope-cluster",
         date_received=date(2020, 1, 1),
         company_id="acme-bank",
         company_name="Acme Bank",
@@ -850,6 +851,7 @@ def test_retrieve_variants_is_scoped_auditable_cached_and_observable(
     assert [hit.complaint_id for hit in first.sparse] == [10, 20]
     assert [hit.complaint_id for hit in first.fused] == [10, 20]
     assert [row.complaint_id for row in first.evidence] == [10, 20]
+    assert {row.cluster_id for row in first.evidence} == {cluster_id}
     assert {30, 40}.isdisjoint(hit.complaint_id for hit in first.dense)
     assert {30, 40}.isdisjoint(hit.complaint_id for hit in first.sparse)
     assert {30, 40}.isdisjoint(hit.complaint_id for hit in first.fused)

@@ -46,8 +46,14 @@ def pricing() -> ModelPricing:
 
 
 def response(
-    *, payload: dict | None = None, raw_text: str | None = None,
-    input_tokens: int, output_tokens: int, stop_reason: str = "end_turn",
+    *,
+    payload: dict | None = None,
+    raw_text: str | None = None,
+    input_tokens: int,
+    output_tokens: int,
+    stop_reason: str = "end_turn",
+    cache_read_input_tokens: int | None = 0,
+    cache_creation_input_tokens: int | None = 0,
 ):
     text = raw_text if raw_text is not None else json.dumps(payload)
     return SimpleNamespace(
@@ -56,8 +62,8 @@ def response(
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cache_read_input_tokens=0,
-            cache_creation_input_tokens=0,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
         ),
     )
 
@@ -95,18 +101,28 @@ class SequenceClock:
 
 def test_retries_rate_limit_then_returns_usage():
     """Removing retry behavior must surface the first transient failure."""
-    transport = SequenceTransport([
-        FakeRateLimit(),
-        response(payload={"ok": True}, input_tokens=100, output_tokens=20),
-    ])
+    transport = SequenceTransport(
+        [
+            FakeRateLimit(),
+            response(payload={"ok": True}, input_tokens=100, output_tokens=20),
+        ]
+    )
     sleeps = []
     client = AnthropicModelClient(
-        transport, pricing(), max_retries=3, sleeper=sleeps.append,
-        clock=SequenceClock([0.0, 0.4]), jitter=lambda _lo, _hi: 0.0,
+        transport,
+        pricing(),
+        max_retries=3,
+        sleeper=sleeps.append,
+        clock=SequenceClock([0.0, 0.4]),
+        jitter=lambda _lo, _hi: 0.0,
     )
 
     got = client.call_json(
-        model="m", system="s", prompt="p", schema={"type": "object"}, max_tokens=50,
+        model="m",
+        system="s",
+        prompt="p",
+        schema={"type": "object"},
+        max_tokens=50,
     )
 
     assert got.attempts == 2
@@ -116,22 +132,31 @@ def test_retries_rate_limit_then_returns_usage():
     assert transport.requests[0]["output_config"] == {
         "format": {"type": "json_schema", "schema": {"type": "object"}},
     }
-    assert transport.requests[0]["system"] == [{
-        "type": "text", "text": "s", "cache_control": {"type": "ephemeral"},
-    }]
+    assert transport.requests[0]["system"] == [
+        {
+            "type": "text",
+            "text": "s",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
 
 
 def test_billing_error_is_terminal_without_retry():
     """Treating exhausted credit as retryable would waste paid-run time."""
     client = AnthropicModelClient(
-        SequenceTransport([FakeBillingError("credit balance depleted")]), pricing(),
-        max_retries=3, sleeper=lambda _: None,
+        SequenceTransport([FakeBillingError("credit balance depleted")]),
+        pricing(),
+        max_retries=3,
+        sleeper=lambda _: None,
     )
 
     with pytest.raises(ModelCallError) as caught:
         client.call_json(
-            model="m", system="s", prompt="p",
-            schema={"type": "object"}, max_tokens=50,
+            model="m",
+            system="s",
+            prompt="p",
+            schema={"type": "object"},
+            max_tokens=50,
         )
 
     assert caught.value.category == "billing"
@@ -146,6 +171,64 @@ def test_cost_uses_all_anthropic_token_categories():
     assert estimate_cost(usage, pricing()) == pytest.approx(36.75)
 
 
+def test_optional_cache_usage_counters_coalesce_none_to_zero():
+    """Anthropic omits optional cache counters with None on uncached responses."""
+    client = AnthropicModelClient(
+        SequenceTransport(
+            [
+                response(
+                    payload={"ok": True},
+                    input_tokens=100,
+                    output_tokens=20,
+                    cache_read_input_tokens=None,
+                    cache_creation_input_tokens=None,
+                )
+            ]
+        ),
+        pricing(),
+    )
+
+    got = client.call_json(
+        model="m", system="s", prompt="p", schema={"type": "object"}, max_tokens=50
+    )
+
+    assert got.usage == TokenUsage(100, 20, 0, 0)
+    assert got.estimated_cost_usd == pytest.approx(0.001)
+
+
+def test_post_response_metadata_failure_is_a_usage_bearing_model_error():
+    """Every extraction failure after a paid response retains available accounting."""
+
+    class BrokenResponse:
+        content = []
+        usage = SimpleNamespace(
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_input_tokens=3,
+            cache_creation_input_tokens=2,
+        )
+
+        @property
+        def stop_reason(self):
+            raise RuntimeError("broken stop reason")
+
+    client = AnthropicModelClient(
+        SequenceTransport([BrokenResponse()]),
+        pricing(),
+        clock=SequenceClock([0.0, 0.4]),
+    )
+
+    with pytest.raises(ModelCallError) as caught:
+        client.call_json(
+            model="m", system="s", prompt="p", schema={"type": "object"}, max_tokens=50
+        )
+
+    assert caught.value.category == "malformed_response"
+    assert caught.value.response_received is True
+    assert caught.value.usage == TokenUsage(100, 20, 3, 2)
+    assert caught.value.estimated_cost_usd == pytest.approx(0.001014)
+
+
 def test_preflight_retrieves_the_configured_model():
     """Skipping retrieval would allow a bad model name into a labeling run."""
     transport = RecordingTransport()
@@ -158,17 +241,22 @@ def test_preflight_retrieves_the_configured_model():
 def test_malformed_response_preserves_usage_latency_and_estimated_cost():
     """JSON extraction failure after a response must retain paid usage evidence."""
     client = AnthropicModelClient(
-        SequenceTransport([
-            response(raw_text="{", input_tokens=100, output_tokens=20),
-        ]),
+        SequenceTransport(
+            [
+                response(raw_text="{", input_tokens=100, output_tokens=20),
+            ]
+        ),
         pricing(),
         clock=SequenceClock([0.0, 0.4]),
     )
 
     with pytest.raises(ModelCallError) as caught:
         client.call_json(
-            model="m", system="s", prompt="p",
-            schema={"type": "object"}, max_tokens=50,
+            model="m",
+            system="s",
+            prompt="p",
+            schema={"type": "object"},
+            max_tokens=50,
         )
 
     error = caught.value
@@ -190,14 +278,20 @@ def test_exhausted_transient_errors_report_all_attempts_without_usage(error_type
     errors = [error_type("offline") for _ in range(4)]
     sleeps = []
     client = AnthropicModelClient(
-        SequenceTransport(errors), pricing(), max_retries=3,
-        sleeper=sleeps.append, jitter=lambda _lo, _hi: 0.0,
+        SequenceTransport(errors),
+        pricing(),
+        max_retries=3,
+        sleeper=sleeps.append,
+        jitter=lambda _lo, _hi: 0.0,
     )
 
     with pytest.raises(ModelCallError) as caught:
         client.call_json(
-            model="m", system="s", prompt="p",
-            schema={"type": "object"}, max_tokens=50,
+            model="m",
+            system="s",
+            prompt="p",
+            schema={"type": "object"},
+            max_tokens=50,
         )
 
     assert caught.value.category == "transient"
@@ -211,17 +305,25 @@ def test_exhausted_transient_errors_report_all_attempts_without_usage(error_type
 def test_refusal_returns_a_typed_result_with_paid_usage():
     """A provider refusal is a normal per-cluster outcome with usage attached."""
     client = AnthropicModelClient(
-        SequenceTransport([
-            response(
-                input_tokens=7, output_tokens=1, stop_reason="refusal",
-            ),
-        ]),
+        SequenceTransport(
+            [
+                response(
+                    input_tokens=7,
+                    output_tokens=1,
+                    stop_reason="refusal",
+                ),
+            ]
+        ),
         pricing(),
         clock=SequenceClock([0.0, 0.2]),
     )
 
     got = client.call_json(
-        model="m", system="s", prompt="p", schema={"type": "object"}, max_tokens=50,
+        model="m",
+        system="s",
+        prompt="p",
+        schema={"type": "object"},
+        max_tokens=50,
     )
 
     assert got.payload == {"refused": True, "stop_reason": "refusal"}

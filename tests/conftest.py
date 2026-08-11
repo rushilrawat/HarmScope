@@ -23,8 +23,8 @@ def seeded(con):
     run_id = "0000000000001-abcdef01"
     con.execute(
         "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
-        "started_at, status) VALUES (?, 'test', 'deadbeef', 'cafe', '{}', now(), 'ok')",
-        [run_id],
+        "started_at, status) VALUES (?, 'test', 'deadbeef', 'cafe', ?, now(), 'ok')",
+        [run_id, '{"params":{"model":"embed-model"}}'],
     )
     cid = cluster_id(run_id, "mortgage", 3)
     con.execute(

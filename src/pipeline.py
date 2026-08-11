@@ -84,9 +84,7 @@ def phase_load(args: argparse.Namespace) -> int:
         n = c.execute("SELECT count(*) FROM complaints_raw").fetchone()[0]
         dropped = n_csv - n
         if dropped < 0:
-            raise checks.CheckFailed(
-                f"loaded more rows than the CSV has: {n:,} vs {n_csv:,}"
-            )
+            raise checks.CheckFailed(f"loaded more rows than the CSV has: {n:,} vs {n_csv:,}")
         frac = dropped / n_csv if n_csv else 0.0
         if frac > CONFIG.expect.max_dropped_fraction:
             raise checks.CheckFailed(
@@ -100,7 +98,8 @@ def phase_load(args: argparse.Namespace) -> int:
         # still applies.
         if not args.csv:
             checks.expect_rows(
-                c, "complaints_raw",
+                c,
+                "complaints_raw",
                 min=CONFIG.expect.complaints_raw_min,
                 max=CONFIG.expect.complaints_raw_max,
             )
@@ -167,16 +166,14 @@ def phase_normalize(args: argparse.Namespace) -> int:
         checks.expect_scalar(
             con,
             "SELECT count(*) FROM complaints WHERE company_id IS NULL",
-            hi=0, label="complaints with unresolved company",
+            hi=0,
+            label="complaints with unresolved company",
         )
         # narratives must line up exactly with the has_narrative flag
-        expected = con.execute(
-            "SELECT count(*) FROM complaints WHERE has_narrative"
-        ).fetchone()[0]
+        expected = con.execute("SELECT count(*) FROM complaints WHERE has_narrative").fetchone()[0]
         if n_narr != expected:
             raise checks.CheckFailed(
-                f"narratives: {n_narr:,} rows but {expected:,} complaints are "
-                f"flagged has_narrative"
+                f"narratives: {n_narr:,} rows but {expected:,} complaints are flagged has_narrative"
             )
         checks.expect_no_nulls(con, "narratives", ["text_redacted", "text_hash"])
         checks.expect_scalar(
@@ -188,8 +185,7 @@ def phase_normalize(args: argparse.Namespace) -> int:
         )
         checks.expect_scalar(
             con,
-            "SELECT avg(CASE WHEN redaction_count > 0 THEN 1.0 ELSE 0 END) "
-            "FROM narratives",
+            "SELECT avg(CASE WHEN redaction_count > 0 THEN 1.0 ELSE 0 END) FROM narratives",
             lo=CONFIG.expect.redacted_doc_fraction_min,
             hi=CONFIG.expect.redacted_doc_fraction_max,
             label="fraction of narratives with a redaction",
@@ -261,14 +257,20 @@ def phase_dedup(args: argparse.Namespace) -> int:
             evalset.write_near_misses(
                 ids, pairs[~keep], sims[~keep], CONFIG.dedup.jaccard_threshold
             )
-            print(f"verified >= {CONFIG.dedup.jaccard_threshold}: {len(good):,} "
-                  f"({len(good) / max(len(pairs), 1):.1%} of candidates)", flush=True)
+            print(
+                f"verified >= {CONFIG.dedup.jaccard_threshold}: {len(good):,} "
+                f"({len(good) / max(len(pairs), 1):.1%} of candidates)",
+                flush=True,
+            )
             if len(good):
                 a = np.minimum(ids[good[:, 0]], ids[good[:, 1]])
                 b = np.maximum(ids[good[:, 0]], ids[good[:, 1]])
-                frame = {"complaint_id_a": a, "complaint_id_b": b,  # noqa: F841
-                         "similarity": sims[keep].astype(float),
-                         "method": np.array(["minhash"] * len(good), dtype=object)}
+                frame = {  # noqa: F841
+                    "complaint_id_a": a,
+                    "complaint_id_b": b,
+                    "similarity": sims[keep].astype(float),
+                    "method": np.array(["minhash"] * len(good), dtype=object),
+                }
                 con.execute(
                     "INSERT INTO dup_pairs SELECT * FROM frame "
                     "WHERE (complaint_id_a, complaint_id_b) NOT IN "
@@ -283,8 +285,10 @@ def phase_dedup(args: argparse.Namespace) -> int:
     print(f"campaigns     : {n_cand:,} candidates, {n_flagged:,} flagged")
     print(f"corpus boilerplate baseline: {campaign.boilerplate_share(con):.4f}")
 
-    print("\ncampaign-flagged share by product family "
-          "(METHODOLOGY §2.4: credit reporting must be clearly highest):")
+    print(
+        "\ncampaign-flagged share by product family "
+        "(METHODOLOGY §2.4: credit reporting must be clearly highest):"
+    )
     for fam, tot, flagged in con.execute(
         f"""
         SELECT c.product_family, count(*) AS tot,
@@ -320,13 +324,15 @@ def phase_embed(args: argparse.Namespace) -> int:
     params = {"model": model_name, "limit": args.limit}
     with db.run(con, "embed", CONFIG, params=params) as r:
         stats = encode.encode_all(
-            con, model_name, memmap, batch_size=args.batch or CONFIG.embed.batch_size,
-            device=args.device, limit=args.limit,
+            con,
+            model_name,
+            memmap,
+            batch_size=args.batch or CONFIG.embed.batch_size,
+            device=args.device,
+            limit=args.limit,
             checkpoint_every=CONFIG.embed.checkpoint_every,
         )
-        n_mapped, n_unmapped = encode.build_map(
-            con, model_name, stats["dim"], stats["n_total"]
-        )
+        n_mapped, n_unmapped = encode.build_map(con, model_name, stats["dim"], stats["n_total"])
         if n_unmapped and not args.limit:
             raise checks.CheckFailed(
                 f"{n_unmapped:,} narratives have no embedding row after a full "
@@ -354,15 +360,18 @@ def phase_embed(args: argparse.Namespace) -> int:
 
     print(f"model      : {model_name} ({stats['dim']}-d) on {stats['device']}")
     print(f"texts      : {stats['n_total']:,} distinct narratives")
-    print(f"encoded    : {stats['encoded']:,} this run "
-          f"(resumed at {stats['resumed_at']:,})")
+    print(f"encoded    : {stats['encoded']:,} this run (resumed at {stats['resumed_at']:,})")
     if stats["encoded"]:
-        print(f"throughput : {stats.get('rate', 0):,.0f} texts/s, "
-              f"{stats['seconds'] / 60:.1f} min wall")
+        print(
+            f"throughput : {stats.get('rate', 0):,.0f} texts/s, "
+            f"{stats['seconds'] / 60:.1f} min wall"
+        )
     print(f"memmap     : {memmap} ({memmap.stat().st_size / 1e9:.2f} GB)")
     print(f"index      : {index_path} ({n_indexed:,} vectors)")
-    print(f"map rows   : {n_mapped:,} complaint_ids -> {stats['n_total']:,} rows"
-          + (f"  ({n_unmapped:,} unmapped, --limit run)" if n_unmapped else ""))
+    print(
+        f"map rows   : {n_mapped:,} complaint_ids -> {stats['n_total']:,} rows"
+        + (f"  ({n_unmapped:,} unmapped, --limit run)" if n_unmapped else "")
+    )
     return 0
 
 
@@ -466,23 +475,30 @@ def phase_cluster(args: argparse.Namespace) -> int:
     by_family, ids_by_family = _representatives(
         con, dedup_run, model, getattr(args, "cutoff", None)
     )
-    families = [f for f in sorted(by_family, key=lambda f: -len(by_family[f]))
-                if not args.family or f == args.family]
+    families = [
+        f
+        for f in sorted(by_family, key=lambda f: -len(by_family[f]))
+        if not args.family or f == args.family
+    ]
 
     # B3 reuses this whole stage with BERTopic's default hyperparameters and an
     # identity dedup run; `system` is what keeps its clusters, signals and
     # backtest rows separable from HarmScope's.
     cfg = getattr(args, "cluster_cfg", None) or CONFIG.cluster
     system = getattr(args, "system", None)
-    params = {"model": model, "dedup_run": dedup_run, "limit": args.limit,
-              "family": args.family, "system": system,
-              "cutoff": str(getattr(args, "cutoff", None) or "")}
+    params = {
+        "model": model,
+        "dedup_run": dedup_run,
+        "limit": args.limit,
+        "family": args.family,
+        "system": system,
+        "cutoff": str(getattr(args, "cutoff", None) or ""),
+    }
     totals = {"clusters": 0, "assigned": 0, "reps": 0}
     with db.run(con, "cluster", CONFIG, params=params) as r:
         con.execute(f"DELETE FROM cluster_novelty WHERE cluster_id LIKE '{r.run_id}:%'")
         con.execute(f"DELETE FROM cluster_members WHERE cluster_id LIKE '{r.run_id}:%'")
-        con.execute("DELETE FROM related_clusters WHERE cluster_id_a LIKE ?",
-                    [f"{r.run_id}:%"])
+        con.execute("DELETE FROM related_clusters WHERE cluster_id_a LIKE ?", [f"{r.run_id}:%"])
         con.execute("DELETE FROM clusters WHERE run_id = ?", [r.run_id])
 
         print(f"dedup run  : {dedup_run}")
@@ -494,7 +510,11 @@ def phase_cluster(args: argparse.Namespace) -> int:
             rows, complaint_ids = by_family[family], ids_by_family[family]
             totals["reps"] += len(rows)
             result = fit_mod.fit_family(
-                vectors, rows, family, cfg, CONFIG.seed,
+                vectors,
+                rows,
+                family,
+                cfg,
+                CONFIG.seed,
                 sample_size=args.limit or None,
             )
             if result is None or result.n_clusters == 0:
@@ -520,16 +540,27 @@ def phase_cluster(args: argparse.Namespace) -> int:
                     continue
                 cid = make_cluster_id(r.run_id, family, c)
                 local_ids.append(cid)
-                cluster_rows.append((
-                    cid, r.run_id, family, n_members,
-                    float(result.persistence[c]) if c < len(result.persistence) else 0.0,
-                    float(coherence[c]), int(medoid[c]), as_of,
-                ))
+                cluster_rows.append(
+                    (
+                        cid,
+                        r.run_id,
+                        family,
+                        n_members,
+                        float(result.persistence[c]) if c < len(result.persistence) else 0.0,
+                        float(coherence[c]),
+                        int(medoid[c]),
+                        as_of,
+                    )
+                )
                 for pos in np.flatnonzero(member):
-                    member_rows.append((
-                        cid, int(complaint_ids[pos]), float(sims[pos]),
-                        bool(rows[pos] == medoid[c]),
-                    ))
+                    member_rows.append(
+                        (
+                            cid,
+                            int(complaint_ids[pos]),
+                            float(sims[pos]),
+                            bool(rows[pos] == medoid[c]),
+                        )
+                    )
             con.executemany(
                 "INSERT INTO clusters (cluster_id, run_id, product_family, n_members,"
                 " persistence, coherence, centroid_idx, as_of) VALUES (?,?,?,?,?,?,?,?)",
@@ -543,9 +574,11 @@ def phase_cluster(args: argparse.Namespace) -> int:
             totals["clusters"] += len(cluster_rows)
             centroids_by_family[family] = result.centroids
             cluster_ids[family] = local_ids
-            print(f"  {'':<18} {len(cluster_rows):>5} kept  "
-                  f"assigned {assigned.mean():5.1%}  "
-                  f"mean coherence {coherence[coherence > 0].mean():.3f}")
+            print(
+                f"  {'':<18} {len(cluster_rows):>5} kept  "
+                f"assigned {assigned.mean():5.1%}  "
+                f"mean coherence {coherence[coherence > 0].mean():.3f}"
+            )
 
         # `cluster_novelty` and `related_clusters` are the descriptive layer:
         # the panel, the signals and the backtest never join either, only
@@ -561,14 +594,17 @@ def phase_cluster(args: argparse.Namespace) -> int:
         checks.expect_rows(con, "clusters", min=1)
         r.finish(output_rows=totals["clusters"], input_rows=totals["reps"])
 
-    print(f"\nclusters   : {totals['clusters']:,} over {totals['reps']:,} "
-          f"representatives")
-    print(f"assigned   : {totals['assigned']:,} "
-          f"({totals['assigned'] / max(totals['reps'], 1):.1%}); the rest are noise")
+    print(f"\nclusters   : {totals['clusters']:,} over {totals['reps']:,} representatives")
+    print(
+        f"assigned   : {totals['assigned']:,} "
+        f"({totals['assigned'] / max(totals['reps'], 1):.1%}); the rest are noise"
+    )
     print(f"novel      : {n_novel:,} pass novelty + coherence + persistence")
     print(f"related    : {n_related:,} cross-family links")
-    print("\nGATE: `pipeline stability` and `pipeline ablation` are the two "
-          "numbers ROADMAP Phase 4 turns on.")
+    print(
+        "\nGATE: `pipeline stability` and `pipeline ablation` are the two "
+        "numbers ROADMAP Phase 4 turns on."
+    )
     return 0
 
 
@@ -577,28 +613,39 @@ def _write_novelty(con, run_id: str) -> int:
     from src.cluster import novelty as novelty_mod
 
     members = _cluster_label_members(con, run_id)
-    space = dict(con.execute(
-        "SELECT product_family, count(DISTINCT (issue_std, sub_issue_std)) "
-        "FROM complaints GROUP BY 1"
-    ).fetchall())
-    meta = dict(con.execute(
-        "SELECT cluster_id, (product_family, coherence, persistence) FROM clusters "
-        "WHERE run_id = ?", [run_id],
-    ).fetchall())
+    space = dict(
+        con.execute(
+            "SELECT product_family, count(DISTINCT (issue_std, sub_issue_std)) "
+            "FROM complaints GROUP BY 1"
+        ).fetchall()
+    )
+    meta = dict(
+        con.execute(
+            "SELECT cluster_id, (product_family, coherence, persistence) FROM clusters "
+            "WHERE run_id = ?",
+            [run_id],
+        ).fetchall()
+    )
 
     rows = []
     for cluster_id, pairs in members.items():
         family, coherence, persistence = meta[cluster_id]
         nov = novelty_mod.score_cluster(
             [novelty_mod.label_of(i, s) for i, s in pairs],
-            space.get(family, 2), CONFIG.novelty,
+            space.get(family, 2),
+            CONFIG.novelty,
         )
-        rows.append((
-            cluster_id, nov.dominant_label, nov.dominant_share, nov.entropy,
-            _family_nmi(con, run_id, family), nov.score,
-            novelty_mod.is_novel(nov, coherence or 0.0, persistence or 0.0,
-                                 CONFIG.novelty),
-        ))
+        rows.append(
+            (
+                cluster_id,
+                nov.dominant_label,
+                nov.dominant_share,
+                nov.entropy,
+                _family_nmi(con, run_id, family),
+                nov.score,
+                novelty_mod.is_novel(nov, coherence or 0.0, persistence or 0.0, CONFIG.novelty),
+            )
+        )
     con.executemany(
         "INSERT INTO cluster_novelty (cluster_id, dominant_label, "
         "dominant_label_share, label_entropy, normalized_mutual_info, "
@@ -636,8 +683,7 @@ def _family_nmi(con, run_id: str, family: str) -> float:
     ).fetchall()
     value = 0.0
     if len(pairs) > 1:
-        value = float(normalized_mutual_info_score([a for a, _ in pairs],
-                                                   [b for _, b in pairs]))
+        value = float(normalized_mutual_info_score([a for a, _ in pairs], [b for _, b in pairs]))
     _NMI_CACHE[key] = value
     return value
 
@@ -673,7 +719,8 @@ def _write_related(con, centroids: dict, cluster_ids: dict) -> int:
     if rows:
         con.executemany(
             "INSERT INTO related_clusters (cluster_id_a, cluster_id_b, similarity) "
-            "VALUES (?, ?, ?) ON CONFLICT DO NOTHING", rows,
+            "VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+            rows,
         )
     return len(rows)
 
@@ -729,8 +776,9 @@ def cmd_gate(args: argparse.Namespace) -> int:
     print(f"pairs scored  : {m['tp'] + m['fp'] + m['fn'] + m['tn']}")
     print(f"tp/fp/fn/tn   : {m['tp']} / {m['fp']} / {m['fn']} / {m['tn']}")
     verdict = "PASS" if m["precision"] >= CONFIG.dedup.min_precision else "FAIL"
-    print(f"precision     : {m['precision']:.4f}  "
-          f"(gate >= {CONFIG.dedup.min_precision})  {verdict}")
+    print(
+        f"precision     : {m['precision']:.4f}  (gate >= {CONFIG.dedup.min_precision})  {verdict}"
+    )
     print(f"recall        : {m['recall']:.4f}   (reported, not gated)")
     print(f"f1            : {m['f1']:.4f}")
 
@@ -743,49 +791,54 @@ def cmd_gate(args: argparse.Namespace) -> int:
     # positive, not a definitional miss. Only `recall` is meaningful here —
     # every label in the subset is `dup`, so precision is 1.0 by construction.
     thr = CONFIG.dedup.jaccard_threshold
-    label_bar = max(
-        (r["true_jaccard"] for r in rows if r["label"] == "not_dup"), default=0.0
-    )
+    label_bar = max((r["true_jaccard"] for r in rows if r["label"] == "not_dup"), default=0.0)
     at_thr = [r for r in rows if r["true_jaccard"] >= thr]
     below = [r for r in rows if r["label"] == "dup" and r["true_jaccard"] < thr]
     if below:
-        print(f"  labels frozen at ~{label_bar:.2f}, detector runs at {thr}: "
-              f"{len(below)} dup-labelled pairs sit below the detector's own "
-              f"threshold and are not its errors.")
+        print(
+            f"  labels frozen at ~{label_bar:.2f}, detector runs at {thr}: "
+            f"{len(below)} dup-labelled pairs sit below the detector's own "
+            f"threshold and are not its errors."
+        )
         try:
             r_at = evalset.score(con, at_thr, run_id)["recall"]
-            print(f"  recall over the {len(at_thr)} pairs at or above {thr}: "
-                  f"{r_at:.4f}")
+            print(f"  recall over the {len(at_thr)} pairs at or above {thr}: {r_at:.4f}")
         except ValueError:
-            print(f"  recall over the {len(at_thr)} pairs at or above {thr}: "
-                  f"n/a — no true positives in the subset, which is itself the "
-                  f"finding")
+            print(
+                f"  recall over the {len(at_thr)} pairs at or above {thr}: "
+                f"n/a — no true positives in the subset, which is itself the "
+                f"finding"
+            )
 
     # d9ead66's diagnosis: MinHash overestimates near the bar. These merges are
     # only not false positives because the label bar sits at 0.85.
     over = sum(
-        1 for r in rows
-        if r["true_jaccard"] < thr and con.execute(
+        1
+        for r in rows
+        if r["true_jaccard"] < thr
+        and con.execute(
             "SELECT count(*) = 2 AND count(DISTINCT group_id) = 1 FROM dup_groups "
             "WHERE run_id = ? AND complaint_id IN (?, ?)",
             [run_id, r["complaint_id_a"], r["complaint_id_b"]],
         ).fetchone()[0]
     )
-    print(f"  merged despite true Jaccard < {thr}: {over}  "
-          f"(MinHash overestimate near the bar)")
+    print(f"  merged despite true Jaccard < {thr}: {over}  (MinHash overestimate near the bar)")
 
     for stratum in ("obvious", "hard", "unrelated"):
         sub = [r for r in rows if r["stratum"] == stratum]
         if sub:
-            s = evalset.score(con, sub, run_id) if any(
-                r["label"] == "dup" for r in sub) else None
+            s = evalset.score(con, sub, run_id) if any(r["label"] == "dup" for r in sub) else None
             wrong = sum(
-                1 for r in sub
-                if (con.execute(
-                    "SELECT count(*) = 2 AND count(DISTINCT group_id) = 1 "
-                    "FROM dup_groups WHERE run_id = ? AND complaint_id IN (?, ?)",
-                    [run_id, r["complaint_id_a"], r["complaint_id_b"]],
-                ).fetchone()[0]) != (r["label"] == "dup")
+                1
+                for r in sub
+                if (
+                    con.execute(
+                        "SELECT count(*) = 2 AND count(DISTINCT group_id) = 1 "
+                        "FROM dup_groups WHERE run_id = ? AND complaint_id IN (?, ?)",
+                        [run_id, r["complaint_id_a"], r["complaint_id_b"]],
+                    ).fetchone()[0]
+                )
+                != (r["label"] == "dup")
             )
             note = f"P={s['precision']:.3f} R={s['recall']:.3f}" if s else "negatives"
             print(f"  {stratum:<10} n={len(sub):<4} errors={wrong:<3} {note}")
@@ -799,18 +852,22 @@ def cmd_gate(args: argparse.Namespace) -> int:
             sample = list(_csv.DictReader(fh))
         missed = 0
         for r in sample:
-            texts = dict(con.execute(
-                "SELECT complaint_id, text_redacted FROM narratives "
-                "WHERE complaint_id IN (?, ?)",
-                [int(r["complaint_id_a"]), int(r["complaint_id_b"])],
-            ).fetchall())
+            texts = dict(
+                con.execute(
+                    "SELECT complaint_id, text_redacted FROM narratives "
+                    "WHERE complaint_id IN (?, ?)",
+                    [int(r["complaint_id_a"]), int(r["complaint_id_b"])],
+                ).fetchall()
+            )
             if len(texts) < 2:
                 continue
             tj = evalset.true_jaccard(*texts.values(), CONFIG.dedup.shingle_size)
             r["true_jaccard"] = tj
             missed += tj >= CONFIG.dedup.jaccard_threshold
-        print(f"  {len(sample)} sampled, {missed} were true duplicates by exact "
-              f"Jaccard ({missed / max(len(sample), 1):.1%} of near misses)")
+        print(
+            f"  {len(sample)} sampled, {missed} were true duplicates by exact "
+            f"Jaccard ({missed / max(len(sample), 1):.1%} of near misses)"
+        )
 
     print("\ngroup sizes (chaining check — one hop from the seed, by construction):")
     for bucket, n_groups, n_rows in con.execute(
@@ -827,14 +884,20 @@ def cmd_gate(args: argparse.Namespace) -> int:
         [run_id],
     ).fetchall():
         print(f"  {bucket:<10} {n_groups:>9,} groups  {n_rows:>10,} narratives")
-    print(f"  largest    {con.execute('SELECT max(group_size) FROM dup_groups '
-                                      'WHERE run_id = ?', [run_id]).fetchone()[0]:,}"
-          " members")
+    print(
+        f"  largest    {
+            con.execute(
+                'SELECT max(group_size) FROM dup_groups WHERE run_id = ?', [run_id]
+            ).fetchone()[0]:,}"
+        " members"
+    )
 
     _merge_audit(con, run_id, args.merge_audit, show=args.read)
 
-    print("\ncampaign-flagged share by product family "
-          "(METHODOLOGY §2.4: credit reporting must be clearly highest):")
+    print(
+        "\ncampaign-flagged share by product family "
+        "(METHODOLOGY §2.4: credit reporting must be clearly highest):"
+    )
     for fam, tot, flagged in con.execute(
         """
         SELECT c.product_family, count(*) AS tot,
@@ -884,9 +947,11 @@ def _merge_audit(con, run_id: str, n: int, show: int = 0) -> None:
     two_hop: list[tuple] = []
     for gid, size in picked:
         members = [
-            r[0] for r in con.execute(
+            r[0]
+            for r in con.execute(
                 "SELECT complaint_id FROM dup_groups WHERE run_id = ? AND group_id = ? "
-                "ORDER BY complaint_id", [run_id, gid],
+                "ORDER BY complaint_id",
+                [run_id, gid],
             ).fetchall()
         ]
         a, b = sorted(rng.sample(members, 2))
@@ -900,8 +965,10 @@ def _merge_audit(con, run_id: str, n: int, show: int = 0) -> None:
 
     print(f"\nmerge audit — {len(picked)} random same-group pairs from groups of 100+:")
     print(f"  {direct} have a verified edge, {len(two_hop)} are seed-mediated (2 hops).")
-    print(f"  The eval set can only ever sample the first kind, i.e. "
-          f"{direct / len(picked):.0%} of merges as the corpus actually holds them.")
+    print(
+        f"  The eval set can only ever sample the first kind, i.e. "
+        f"{direct / len(picked):.0%} of merges as the corpus actually holds them."
+    )
     for gid, size, a, b in two_hop[:show]:
         print(f"\n  === {gid} ({size:,} members), no edge between these two")
         for cid in (a, b):
@@ -928,8 +995,11 @@ def _print_disputed(con, run_id: str, rows: list[dict]) -> None:
         ).fetchone()[0]
         if merged == (row["label"] == "dup"):
             continue
-        kind = "FALSE POSITIVE (merged, labelled not_dup)" if merged else \
-               "false negative (not merged, labelled dup)"
+        kind = (
+            "FALSE POSITIVE (merged, labelled not_dup)"
+            if merged
+            else "false negative (not merged, labelled dup)"
+        )
         print(f"\n--- {kind}  tj={row['true_jaccard']:.4f}  {row['stratum']}")
         for key in ("complaint_id_a", "complaint_id_b"):
             text = con.execute(
@@ -959,8 +1029,10 @@ def _print_reading_material(con, run_id: str, n: int) -> None:
             "WHERE m.campaign_id = ? ORDER BY n.complaint_id LIMIT 1",
             [cid],
         ).fetchone()
-        print(f"\n[{nc:,} complaints] {fam}  signals={sigs} "
-              f"boiler={boiler:.2f} cv={cv:.2f} burst={burst:.1f}")
+        print(
+            f"\n[{nc:,} complaints] {fam}  signals={sigs} "
+            f"boiler={boiler:.2f} cv={cv:.2f} burst={burst:.1f}"
+        )
         print("  " + " ".join((text[0] if text else "").split())[:400])
 
     print(f"\n{'=' * 72}\nREAD: {n} unflagged groups, largest first\n{'=' * 72}")
@@ -1006,8 +1078,10 @@ def cmd_adjudicate(args: argparse.Namespace) -> int:
     random.Random(CONFIG.seed).shuffle(rows)  # noqa: S311 - ordering, not cryptography
     rows = rows[args.offset : args.offset + args.limit]
 
-    print(f"# {len(rows)} pairs from stratum '{args.stratum}', "
-          f"offset {args.offset}, seed {CONFIG.seed}")
+    print(
+        f"# {len(rows)} pairs from stratum '{args.stratum}', "
+        f"offset {args.offset}, seed {CONFIG.seed}"
+    )
     print("# blind: detector decision, proxy label and true_jaccard withheld")
     print("# rule: METHODOLOGY §2.4.1\n")
     for row in rows:
@@ -1019,8 +1093,10 @@ def cmd_adjudicate(args: argparse.Namespace) -> int:
             ).fetchone()
             body = " ".join((text[0] if text else "").split())
             clipped = body[: args.chars]
-            print(f"  [{row[key]}] {clipped}"
-                  + (f" …(+{len(body) - args.chars} chars)" if len(body) > args.chars else ""))
+            print(
+                f"  [{row[key]}] {clipped}"
+                + (f" …(+{len(body) - args.chars} chars)" if len(body) > args.chars else "")
+            )
         print()
     return 0
 
@@ -1069,35 +1145,65 @@ def cmd_alerts(args: argparse.Namespace) -> int:
     con = db.connect(read_only=True)
     run_id = args.run_id or latest_run(con, "signals")
     track = args.track
-    rows = con.execute(ALERT_SQL, [
-        run_id, CONFIG.novelty.min_coherence, CONFIG.signals.min_supporting_groups,
-        CONFIG.signals.fdr_alpha, track, track, CONFIG.novelty.threshold,
-        track, CONFIG.novelty.threshold, args.n,
-    ]).fetchall()
+    rows = con.execute(
+        ALERT_SQL,
+        [
+            run_id,
+            CONFIG.novelty.min_coherence,
+            CONFIG.signals.min_supporting_groups,
+            CONFIG.signals.fdr_alpha,
+            track,
+            track,
+            CONFIG.novelty.threshold,
+            track,
+            CONFIG.novelty.threshold,
+            args.n,
+        ],
+    ).fetchall()
 
     print(f"run    : {run_id}")
-    print(f"track  : {track}   (coherence >= {CONFIG.novelty.min_coherence}, "
-          f"groups >= {CONFIG.signals.min_supporting_groups}, "
-          f"q <= {CONFIG.signals.fdr_alpha} or changepoint)")
+    print(
+        f"track  : {track}   (coherence >= {CONFIG.novelty.min_coherence}, "
+        f"groups >= {CONFIG.signals.min_supporting_groups}, "
+        f"q <= {CONFIG.signals.fdr_alpha} or changepoint)"
+    )
     print(f"alerts : {len(rows)} shown\n")
     if not rows:
         print("none — which is a finding, not an error")
         return 0
 
-    for (family, company, cluster, eb05, q, changed, change_month,
-         n_sup, n_groups, coh, _pers, novelty, is_novel, dominant) in rows:
+    for (
+        family,
+        company,
+        cluster,
+        eb05,
+        q,
+        changed,
+        change_month,
+        n_sup,
+        n_groups,
+        coh,
+        _pers,
+        novelty,
+        is_novel,
+        dominant,
+    ) in rows:
         name = con.execute(
             "SELECT canonical_name FROM company_canonical WHERE company_id = ?",
             [company],
         ).fetchone()
         label = (name[0] if name else company)[:38]
         print(f"[{family}] {label}")
-        print(f"  EB05 {eb05 if eb05 is None else round(eb05, 2)}  "
-              f"q={'—' if q is None else f'{q:.2e}'}  "
-              f"{'changepoint ' + str(change_month) if changed else 'no changepoint'}")
-        print(f"  {n_groups:,} groups / {n_sup:,} complaints   "
-              f"coherence {coh:.2f}  novelty {novelty:.2f}"
-              f"{'  NOVEL' if is_novel else ''}")
+        print(
+            f"  EB05 {eb05 if eb05 is None else round(eb05, 2)}  "
+            f"q={'—' if q is None else f'{q:.2e}'}  "
+            f"{'changepoint ' + str(change_month) if changed else 'no changepoint'}"
+        )
+        print(
+            f"  {n_groups:,} groups / {n_sup:,} complaints   "
+            f"coherence {coh:.2f}  novelty {novelty:.2f}"
+            f"{'  NOVEL' if is_novel else ''}"
+        )
         print(f"  nearest existing label: {dominant}")
         if args.evidence:
             for (text,) in con.execute(
@@ -1105,7 +1211,8 @@ def cmd_alerts(args: argparse.Namespace) -> int:
                 SELECT n.text_redacted FROM cluster_members m
                 JOIN narratives n USING (complaint_id)
                 WHERE m.cluster_id = ? ORDER BY m.is_exemplar DESC LIMIT 2
-                """, [cluster],
+                """,
+                [cluster],
             ).fetchall():
                 print("    • " + " ".join(text.split())[:200])
         print()
@@ -1160,13 +1267,18 @@ def cmd_refit(args: argparse.Namespace) -> int:
         n_cand, n_flag = detect.build_campaigns(con, dedup_run, CONFIG, as_of)
         r.finish(output_rows=n_rows, input_rows=n_before)
     timings.append(("grouping + campaigns", time.time() - t0))
-    print(f"  groups    : {n_groups:,} over {n_rows:,}; campaigns {n_cand:,} "
-          f"({n_flag:,} flagged)   [{timings[-1][1] / 60:.1f} min]")
+    print(
+        f"  groups    : {n_groups:,} over {n_rows:,}; campaigns {n_cand:,} "
+        f"({n_flag:,} flagged)   [{timings[-1][1] / 60:.1f} min]"
+    )
 
     # --- clustering + novelty ------------------------------------------------
     t0 = time.time()
     cluster_args = argparse.Namespace(
-        model=args.model, dedup_run=dedup_run, family=None, limit=None,
+        model=args.model,
+        dedup_run=dedup_run,
+        family=None,
+        limit=None,
         cutoff=cutoff,
     )
     phase_cluster(cluster_args)
@@ -1176,7 +1288,10 @@ def cmd_refit(args: argparse.Namespace) -> int:
     t0 = time.time()
     cluster_run = latest_run(con, "cluster")
     signal_args = argparse.Namespace(
-        run_id=cluster_run, dedup_run=dedup_run, shuffle=0, cutoff=cutoff,
+        run_id=cluster_run,
+        dedup_run=dedup_run,
+        shuffle=0,
+        cutoff=cutoff,
     )
     phase_signals(signal_args)
     timings.append(("panel + signals", time.time() - t0))
@@ -1222,8 +1337,12 @@ def cmd_worklist(args: argparse.Namespace) -> int:
             skipped += 1
             continue
         candidates, _truth = wl.select(
-            con, signals_run, cluster_run, company_id,
-            CONFIG.eval.adjudication_top_k, CONFIG.eval.adjudication_decoys,
+            con,
+            signals_run,
+            cluster_run,
+            company_id,
+            CONFIG.eval.adjudication_top_k,
+            CONFIG.eval.adjudication_decoys,
             CONFIG.seed,
         )
         if not candidates:
@@ -1261,13 +1380,15 @@ def cmd_verdicts(args: argparse.Namespace) -> int:
         verdicts = adj.parse(rows)
         if verdicts:
             total += adj.record(con, verdicts, args.adjudicator)
-    counts = dict(con.execute(
-        "SELECT match_quality, count(*) FROM backtest_links GROUP BY 1"
-    ).fetchall())
+    counts = dict(
+        con.execute("SELECT match_quality, count(*) FROM backtest_links GROUP BY 1").fetchall()
+    )
     print(f"recorded : {total} verdicts by {args.adjudicator!r}")
     print(f"in table : {counts}")
-    print("\nOnly 'strong' counts as a detection (§1.3 step 5). Re-run the "
-          "backtest with --strong-only.")
+    print(
+        "\nOnly 'strong' counts as a detection (§1.3 step 5). Re-run the "
+        "backtest with --strong-only."
+    )
     return 0
 
 
@@ -1286,11 +1407,16 @@ def phase_label(args: argparse.Namespace) -> int:
     signals_run = args.signals_run or latest_run(con, "signals")
     model = args.model or CONFIG.embed.dev_model
 
-    params = {"cluster_run": cluster_run, "signals_run": signals_run,
-              "limit": args.limit, "control_n": args.control_n}
+    params = {
+        "cluster_run": cluster_run,
+        "signals_run": signals_run,
+        "limit": args.limit,
+        "control_n": args.control_n,
+    }
     with db.run(con, "label", CONFIG, params=params) as r:
-        stats = llm_run.run(con, cluster_run, signals_run, args.control_n,
-                            args.limit, model, run_id=r.run_id)
+        stats = llm_run.run(
+            con, cluster_run, signals_run, args.control_n, args.limit, model, run_id=r.run_id
+        )
         r.finish(output_rows=stats.labelled)
 
     print(f"\nlabelled       : {stats.labelled:,}")
@@ -1301,10 +1427,8 @@ def phase_label(args: argparse.Namespace) -> int:
     print(f"input tokens   : {stats.input_tokens:,}")
     print(f"output tokens  : {stats.output_tokens:,}")
     print(f"latency        : {stats.latency_seconds:.2f} s")
-    print(f"estimated cost : ${stats.estimated_cost_usd:.6f} "
-          "(estimated, not invoice)")
-    print("  next: `label-verify export --n 50 --output PATH` for the "
-          "LLM_LAYER §2.5 human read")
+    print(f"estimated cost : ${stats.estimated_cost_usd:.6f} (estimated, not invoice)")
+    print("  next: `label-verify export --n 50 --output PATH` for the LLM_LAYER §2.5 human read")
     return 0
 
 
@@ -1318,9 +1442,7 @@ def phase_baselines(args: argparse.Namespace) -> int:
 
     system = args.system
     if system != "B3" and system not in baselines.BUILDERS:
-        raise SystemExit(
-            f"no builder for {system}; have {[*baselines.BUILDERS, 'B3']}"
-        )
+        raise SystemExit(f"no builder for {system}; have {[*baselines.BUILDERS, 'B3']}")
 
     con = db.bootstrap()
     cutoff = getattr(args, "cutoff", None)
@@ -1332,19 +1454,18 @@ def phase_baselines(args: argparse.Namespace) -> int:
         backtest_run_for(con, cutoff) if cutoff else latest_run(con, "dedup")
     )
 
-    params = {"system": system, "dedup_run": dedup_run, "limit": None,
-              "cutoff": str(cutoff or "")}
+    params = {"system": system, "dedup_run": dedup_run, "limit": None, "cutoff": str(cutoff or "")}
     with db.run(con, "cluster", CONFIG, params=params) as r:
-        n_clusters, n_members = baselines.BUILDERS[system](
-            con, r.run_id, dedup_run, as_of, cutoff
-        )
+        n_clusters, n_members = baselines.BUILDERS[system](con, r.run_id, dedup_run, as_of, cutoff)
         checks.expect_rows(con, "clusters", min=1)
         r.finish(output_rows=n_clusters, input_rows=n_members)
 
     print(f"{system}: {n_clusters:,} units over {n_members:,} representatives")
     print(f"  cluster run: {r.run_id}")
-    print(f"  next: `run --phase signals --run-id {r.run_id} "
-          f"--dedup-run {dedup_run}` puts it through the identical detection path")
+    print(
+        f"  next: `run --phase signals --run-id {r.run_id} "
+        f"--dedup-run {dedup_run}` puts it through the identical detection path"
+    )
     return 0
 
 
@@ -1359,22 +1480,34 @@ def _baseline_b3(con, args, cutoff, as_of) -> int:
     """
     from src.evaluation import baselines
 
-    with db.run(con, "dedup_identity", CONFIG,
-                params={"system": "B3", "limit": None,
-                        "cutoff": str(cutoff or "")}) as r:
+    with db.run(
+        con,
+        "dedup_identity",
+        CONFIG,
+        params={"system": "B3", "limit": None, "cutoff": str(cutoff or "")},
+    ) as r:
         n_rows = baselines.identity_groups(con, r.run_id, as_of, cutoff)
         r.finish(output_rows=n_rows, input_rows=n_rows)
     identity_run = r.run_id
     print(f"identity dedup: {n_rows:,} singleton groups  ({identity_run})\n")
 
-    rc = phase_cluster(argparse.Namespace(
-        model=args.model, dedup_run=identity_run, family=None, limit=None,
-        cutoff=cutoff, system="B3", cluster_cfg=baselines.bertopic_cluster_config(),
-        no_descriptive=True,
-    ))
+    rc = phase_cluster(
+        argparse.Namespace(
+            model=args.model,
+            dedup_run=identity_run,
+            family=None,
+            limit=None,
+            cutoff=cutoff,
+            system="B3",
+            cluster_cfg=baselines.bertopic_cluster_config(),
+            no_descriptive=True,
+        )
+    )
     cluster_run = latest_run(con, "cluster")
-    print(f"  next: `run --phase signals --run-id {cluster_run} "
-          f"--dedup-run {identity_run}` puts it through the identical detection path")
+    print(
+        f"  next: `run --phase signals --run-id {cluster_run} "
+        f"--dedup-run {identity_run}` puts it through the identical detection path"
+    )
     return rc
 
 
@@ -1396,24 +1529,33 @@ def phase_backtest(args: argparse.Namespace) -> int:
     params = {"system": args.system, "strong_only": args.strong_only, "limit": None}
     with db.run(con, "backtest", CONFIG, params=params) as r:
         outcomes, missing = backtest.evaluate(
-            con, CONFIG.signals.min_supporting_groups, CONFIG.signals.fdr_alpha,
-            strong_only=args.strong_only, system=args.system,
+            con,
+            CONFIG.signals.min_supporting_groups,
+            CONFIG.signals.fdr_alpha,
+            strong_only=args.strong_only,
+            system=args.system,
         )
         n = backtest.write(con, r.run_id, args.system, outcomes)
         r.finish(output_rows=n)
 
     stats = backtest.summarise(outcomes)
     print(f"system      : {args.system}")
-    print(f"adjudicated : {'strong links only' if args.strong_only else 'unadjudicated (company-level)'}")
+    print(
+        f"adjudicated : {'strong links only' if args.strong_only else 'unadjudicated (company-level)'}"
+    )
     print(f"actions     : {stats['n_actions']}")
     print(f"detected    : {stats['n_detected']}  ({stats['detect_rate']:.1%})")
     if stats["median_lead_days"] is not None:
-        print(f"lead time   : median {stats['median_lead_days']:.0f} d  "
-              f"(p25 {stats['lead_p25']} / p75 {stats['lead_p75']})")
+        print(
+            f"lead time   : median {stats['median_lead_days']:.0f} d  "
+            f"(p25 {stats['lead_p25']} / p75 {stats['lead_p75']})"
+        )
     if missing:
         n_skipped = sum(len(v) for v in missing.values())
-        print(f"\nCOVERAGE GAP: {n_skipped} actions not evaluated — no refit at "
-              f"{', '.join(str(c) for c in sorted(missing))}")
+        print(
+            f"\nCOVERAGE GAP: {n_skipped} actions not evaluated — no refit at "
+            f"{', '.join(str(c) for c in sorted(missing))}"
+        )
         print("  These are excluded from the denominator, not counted as misses.")
     print("\nby cutoff:")
     by: dict = {}
@@ -1455,11 +1597,14 @@ def _as_of(con, cutoff=None):
 
 
 def _months(con, cutoff=None) -> list:
-    return [r[0] for r in con.execute(
-        "SELECT DISTINCT period_month FROM complaints "
-        "WHERE (? IS NULL OR period_month < ?) ORDER BY 1",
-        [cutoff, cutoff],
-    ).fetchall()]
+    return [
+        r[0]
+        for r in con.execute(
+            "SELECT DISTINCT period_month FROM complaints "
+            "WHERE (? IS NULL OR period_month < ?) ORDER BY 1",
+            [cutoff, cutoff],
+        ).fetchall()
+    ]
 
 
 def phase_signals(args: argparse.Namespace) -> int:
@@ -1479,29 +1624,38 @@ def phase_signals(args: argparse.Namespace) -> int:
     # silently reports HarmScope's numbers.
     system = con.execute(
         "SELECT coalesce(json_extract_string(params_json, '$.params.system'), "
-        "'harmscope') FROM runs WHERE run_id = ?", [cluster_run],
+        "'harmscope') FROM runs WHERE run_id = ?",
+        [cluster_run],
     ).fetchone()[0]
-    params = {"cluster_run": cluster_run, "dedup_run": dedup_run,
-              "shuffle": args.shuffle, "limit": None, "system": system,
-              "cutoff": str(getattr(args, "cutoff", None) or "")}
+    params = {
+        "cluster_run": cluster_run,
+        "dedup_run": dedup_run,
+        "shuffle": args.shuffle,
+        "limit": None,
+        "system": system,
+        "cutoff": str(getattr(args, "cutoff", None) or ""),
+    }
     with db.run(con, "signals", CONFIG, params=params) as r:
         n_expanded = timeseries.build_expanded(
-            con, cluster_run, dedup_run, getattr(args, 'cutoff', None)
+            con, cluster_run, dedup_run, getattr(args, "cutoff", None)
         )
         if args.shuffle:
             n_shuffled = _shuffle_clusters(con, CONFIG.seed + args.shuffle)
-            print(f"NEGATIVE CONTROL: cluster labels permuted within family "
-                  f"({n_shuffled:,} rows, seed offset {args.shuffle})")
+            print(
+                f"NEGATIVE CONTROL: cluster labels permuted within family "
+                f"({n_shuffled:,} rows, seed offset {args.shuffle})"
+            )
         print(f"expanded   : {n_expanded:,} non-campaign complaints")
 
         n_total, n_company = timeseries.build_panel(con, r.run_id, cluster_run, as_of)
-        print(f"panel      : {n_total:,} cluster-level rows, "
-              f"{n_company:,} company-level")
+        print(f"panel      : {n_total:,} cluster-level rows, {n_company:,} company-level")
 
         cells = timeseries.contingency(con)
         scored = disproportionality.analyse(cells, CONFIG.signals.min_a)
-        print(f"2x2 tests  : {len(scored):,} pairs with a >= {CONFIG.signals.min_a} "
-              f"(of {len(cells):,} company x cluster pairs)")
+        print(
+            f"2x2 tests  : {len(scored):,} pairs with a >= {CONFIG.signals.min_a} "
+            f"(of {len(cells):,} company x cluster pairs)"
+        )
 
         series = timeseries.series(con, r.run_id)
         changes = changepoint.detect(
@@ -1509,15 +1663,17 @@ def phase_signals(args: argparse.Namespace) -> int:
         )
         print(f"changepoint: {len(changes):,} series fired of {len(series):,}")
 
-        rows = _build_signals(con, r.run_id, cluster_run, scored, changes,
-                              as_of, make_signal_id, months)
+        rows = _build_signals(
+            con, r.run_id, cluster_run, scored, changes, as_of, make_signal_id, months
+        )
         con.execute("DELETE FROM signals WHERE run_id = ?", [r.run_id])
         if rows:
             con.executemany(
                 "INSERT INTO signals (signal_id, run_id, cluster_id, company_id, "
                 "period_month, method, statistic, ci_low, ci_high, p_value, "
                 "q_value, n_supporting, n_supporting_groups, as_of) "
-                "VALUES (" + ",".join("?" * 14) + ")", rows,
+                "VALUES (" + ",".join("?" * 14) + ")",
+                rows,
             )
         checks.expect_no_nulls(con, "signals", ["as_of", "company_id"])
         r.finish(output_rows=len(rows), input_rows=n_expanded)
@@ -1547,8 +1703,10 @@ def phase_signals(args: argparse.Namespace) -> int:
         verdict = "PASS" if rate <= CONFIG.signals.fdr_alpha * 2 else "FAIL"
         print(f"  verdict               : {verdict}")
         if verdict == "FAIL":
-            print("\n  A random assignment is producing real alerts. Per ROADMAP "
-                  "Phase 5 the statistics are wrong — fix before Phase 6.")
+            print(
+                "\n  A random assignment is producing real alerts. Per ROADMAP "
+                "Phase 5 the statistics are wrong — fix before Phase 6."
+            )
     return 0
 
 
@@ -1608,19 +1766,23 @@ def _build_signals(con, run_id, cluster_run, scored, changes, as_of, make_id, mo
     24 supporting groups and sailed past the `min_supporting_groups` gate that
     exists precisely to stop one filing from looking like many.
     """
-    support = dict(con.execute("""
+    support = dict(
+        con.execute("""
         SELECT (cluster_id, coalesce(company_id, '__ALL__')), n FROM (
           SELECT cluster_id, company_id, count(DISTINCT group_id) AS n
           FROM _expanded WHERE cluster_id IS NOT NULL
           GROUP BY GROUPING SETS ((cluster_id, company_id), (cluster_id))
         )
-    """).fetchall())
-    raw = dict(con.execute("""
+    """).fetchall()
+    )
+    raw = dict(
+        con.execute("""
         SELECT (cluster_id, coalesce(company_id, '__ALL__')), n FROM (
           SELECT cluster_id, company_id, count(*) AS n FROM _expanded
           WHERE cluster_id IS NOT NULL GROUP BY GROUPING SETS ((cluster_id, company_id), (cluster_id))
         )
-    """).fetchall())
+    """).fetchall()
+    )
 
     rows, i = [], 0
     # The period a disproportionality signal is dated at is the newest month IN
@@ -1631,21 +1793,47 @@ def _build_signals(con, run_id, cluster_run, scored, changes, as_of, make_id, mo
     for s in scored:
         key = (s.cluster_id, s.company_id)
         groups = support.get(key, 0)
-        rows.append((
-            make_id(run_id, i), run_id, s.cluster_id, s.company_id, latest,
-            "ebgm", s.eb05, s.prr_low, s.prr_high, s.p_value, s.q_value,
-            int(raw.get(key, 0)), int(groups), as_of,
-        ))
+        rows.append(
+            (
+                make_id(run_id, i),
+                run_id,
+                s.cluster_id,
+                s.company_id,
+                latest,
+                "ebgm",
+                s.eb05,
+                s.prr_low,
+                s.prr_high,
+                s.p_value,
+                s.q_value,
+                int(raw.get(key, 0)),
+                int(groups),
+                as_of,
+            )
+        )
         i += 1
     for (cluster_id, company_id), fired in changes.items():
         for change in fired:
             key = (cluster_id, company_id)
             groups = support.get(key, 0)
-            rows.append((
-                make_id(run_id, i), run_id, cluster_id, company_id, change.period,
-                change.method, change.statistic, None, None, None, None,
-                int(raw.get(key, 0)), int(groups), as_of,
-            ))
+            rows.append(
+                (
+                    make_id(run_id, i),
+                    run_id,
+                    cluster_id,
+                    company_id,
+                    change.period,
+                    change.method,
+                    change.statistic,
+                    None,
+                    None,
+                    None,
+                    None,
+                    int(raw.get(key, 0)),
+                    int(groups),
+                    as_of,
+                )
+            )
             i += 1
     return rows
 
@@ -1690,41 +1878,60 @@ def cmd_stability(args: argparse.Namespace) -> int:
 
         print("\ndisjoint halves (the gate's headline number):")
         halves = stability.disjoint_halves(
-            vectors, rows, family, CONFIG.cluster, CONFIG.seed,
+            vectors,
+            rows,
+            family,
+            CONFIG.cluster,
+            CONFIG.seed,
             eval_size=args.eval_size,
         )
         if halves.get("ari") is None:
             print("  not computable — a half produced no clusters")
         else:
-            print(f"  half sizes      {halves['half_sizes'][0]:,} / "
-                  f"{halves['half_sizes'][1]:,}, evaluated on {halves['eval_size']:,} "
-                  f"held-out points neither half saw")
+            print(
+                f"  half sizes      {halves['half_sizes'][0]:,} / "
+                f"{halves['half_sizes'][1]:,}, evaluated on {halves['eval_size']:,} "
+                f"held-out points neither half saw"
+            )
             print(f"  clusters        {halves['n_clusters'][0]} / {halves['n_clusters'][1]}")
-            print(f"  fit noise       {halves['fit_noise'][0]:.1%} / "
-                  f"{halves['fit_noise'][1]:.1%}")
-            print(f"  assigned        {halves['assigned_fraction'][0]:.1%} / "
-                  f"{halves['assigned_fraction'][1]:.1%}")
-            print(f"  ARI             {halves['ari']:.4f}  "
-                  f"over {halves['n_compared']:,} points both assigned")
+            print(f"  fit noise       {halves['fit_noise'][0]:.1%} / {halves['fit_noise'][1]:.1%}")
+            print(
+                f"  assigned        {halves['assigned_fraction'][0]:.1%} / "
+                f"{halves['assigned_fraction'][1]:.1%}"
+            )
+            print(
+                f"  ARI             {halves['ari']:.4f}  "
+                f"over {halves['n_compared']:,} points both assigned"
+            )
 
-        sizes = tuple(s for s in CONFIG.cluster.stability_sample_sizes
-                      if s <= len(rows))
+        sizes = tuple(s for s in CONFIG.cluster.stability_sample_sizes if s <= len(rows))
         if len(sizes) < 2:
-            print(f"\nsample-size sweep: needs two of "
-                  f"{CONFIG.cluster.stability_sample_sizes}, family has "
-                  f"{len(rows):,} — skipped")
+            print(
+                f"\nsample-size sweep: needs two of "
+                f"{CONFIG.cluster.stability_sample_sizes}, family has "
+                f"{len(rows):,} — skipped"
+            )
             continue
         print(f"\nsample-size sweep {sizes}:")
         sweep = stability.sample_size_sweep(
-            vectors, rows, family, CONFIG.cluster, CONFIG.seed, sizes,
+            vectors,
+            rows,
+            family,
+            CONFIG.cluster,
+            CONFIG.seed,
+            sizes,
             eval_size=args.eval_size,
         )
-        print(f"  {'size':>9} {'clusters':>9} {'fit noise':>10} {'assigned':>9} "
-              f"{'ARI vs largest':>15}")
+        print(
+            f"  {'size':>9} {'clusters':>9} {'fit noise':>10} {'assigned':>9} "
+            f"{'ARI vs largest':>15}"
+        )
         for run in sweep["runs"]:
-            print(f"  {run['size']:>9,} {run['n_clusters']:>9} "
-                  f"{run['fit_noise']:>9.1%} {run['assigned_fraction']:>9.1%} "
-                  f"{run['ari_vs_largest']:>15.4f}")
+            print(
+                f"  {run['size']:>9,} {run['n_clusters']:>9} "
+                f"{run['fit_noise']:>9.1%} {run['assigned_fraction']:>9.1%} "
+                f"{run['ari_vs_largest']:>15.4f}"
+            )
     return 0
 
 
@@ -1738,39 +1945,48 @@ def cmd_ablation(args: argparse.Namespace) -> int:
 
     con = db.connect(read_only=True)
     run_id = args.run_id or latest_run(con, "cluster")
-    space = dict(con.execute(
-        "SELECT product_family, count(DISTINCT (issue_std, sub_issue_std)) "
-        "FROM complaints GROUP BY 1"
-    ).fetchall())
+    space = dict(
+        con.execute(
+            "SELECT product_family, count(DISTINCT (issue_std, sub_issue_std)) "
+            "FROM complaints GROUP BY 1"
+        ).fetchall()
+    )
     families = con.execute(
-        "SELECT product_family, count(*) FROM clusters WHERE run_id = ? "
-        "GROUP BY 1 ORDER BY 2 DESC", [run_id],
+        "SELECT product_family, count(*) FROM clusters WHERE run_id = ? GROUP BY 1 ORDER BY 2 DESC",
+        [run_id],
     ).fetchall()
 
     print(f"run   : {run_id}")
-    print(f"bound : AUC >= {CONFIG.novelty.ablation_min_auc} "
-          f"over {CONFIG.novelty.ablation_n_issues} hidden issues\n")
-    print(f"{'family':<18} {'clusters':>9} {'issues':>7} {'mean AUC':>9} "
-          f"{'pooled':>8}  verdict")
+    print(
+        f"bound : AUC >= {CONFIG.novelty.ablation_min_auc} "
+        f"over {CONFIG.novelty.ablation_n_issues} hidden issues\n"
+    )
+    print(f"{'family':<18} {'clusters':>9} {'issues':>7} {'mean AUC':>9} {'pooled':>8}  verdict")
     overall = []
     for family, n_clusters in families:
         members = _cluster_label_members(con, run_id, family)
         report = novelty_mod.ablation_auc(members, space.get(family, 2), CONFIG.novelty)
         if report["mean_auc"] is None:
-            print(f"{family:<18} {n_clusters:>9} {'—':>7} {'—':>9} {'—':>8}  "
-                  f"no issue dominates a cluster")
+            print(
+                f"{family:<18} {n_clusters:>9} {'—':>7} {'—':>9} {'—':>8}  "
+                f"no issue dominates a cluster"
+            )
             continue
         overall.append(report["mean_auc"])
         verdict = "PASS" if report["passes"] else "FAIL"
-        print(f"{family:<18} {n_clusters:>9} {report['n_issues']:>7} "
-              f"{report['mean_auc']:>9.4f} {report['pooled_auc']:>8.4f}  {verdict}")
+        print(
+            f"{family:<18} {n_clusters:>9} {report['n_issues']:>7} "
+            f"{report['mean_auc']:>9.4f} {report['pooled_auc']:>8.4f}  {verdict}"
+        )
         if args.verbose:
             for row in sorted(report["per_issue"], key=lambda r: r["auc"]):
                 print(f"    {row['auc']:.4f}  n={row['n_positive']:<4} {row['issue'][:64]}")
     if overall:
         mean = sum(overall) / len(overall)
-        print(f"\nacross {len(overall)} families: mean AUC {mean:.4f} — "
-              f"{'PASS' if mean >= CONFIG.novelty.ablation_min_auc else 'FAIL'}")
+        print(
+            f"\nacross {len(overall)} families: mean AUC {mean:.4f} — "
+            f"{'PASS' if mean >= CONFIG.novelty.ablation_min_auc else 'FAIL'}"
+        )
     return 0
 
 
@@ -1801,13 +2017,13 @@ def cmd_clusters(args: argparse.Namespace) -> int:
         picked = [r for r in rows if r[7]]
         picked = rng.sample(picked, min(args.n, len(picked)))
 
-    for (cid, family, n_members, coh, pers, score, dominant, novel,
-         share) in picked:
+    for cid, family, n_members, coh, pers, score, dominant, novel, share in picked:
         print(f"\n{'=' * 72}")
-        print(f"[{family}] {n_members:,} members  coherence {coh:.3f}  "
-              f"persistence {pers:.3f}")
-        print(f"novelty {score:.3f}{'  NOVEL' if novel else ''}   "
-              f"dominant label ({share:.0%}): {dominant}")
+        print(f"[{family}] {n_members:,} members  coherence {coh:.3f}  persistence {pers:.3f}")
+        print(
+            f"novelty {score:.3f}{'  NOVEL' if novel else ''}   "
+            f"dominant label ({share:.0%}): {dominant}"
+        )
         print("-" * 72)
         for (text,) in con.execute(
             """
@@ -1851,16 +2067,19 @@ def cmd_ask(args: argparse.Namespace) -> int:
     from src.llm import answer
 
     con = db.bootstrap()
-    result = answer.answer_question(
-        con,
-        args.cluster_id,
-        args.company_id,
-        args.question,
-        args.model or CONFIG.embed.dev_model,
-        include_enforcement_context=args.include_enforcement_context,
-    )
-    print(answer.render_cli(result, disclaimer=DISCLAIMER))
-    return 0
+    try:
+        result = answer.answer_question(
+            con,
+            args.cluster_id,
+            args.company_id,
+            args.question,
+            args.model,
+            include_enforcement_context=args.include_enforcement_context,
+        )
+        print(answer.render_cli(result, disclaimer=DISCLAIMER))
+        return 0
+    finally:
+        con.close()
 
 
 # Implemented phases only. Everything else is named here so that asking for it
@@ -1922,8 +2141,7 @@ def cmd_runs(args: argparse.Namespace) -> int:
     if not rows:
         print("no runs recorded")
         return 0
-    print(f"{'phase':<13} {'status':<8} {'rows':>10}  {'started':<20} "
-          f"{'git':<13} {'cfg':<9} error")
+    print(f"{'phase':<13} {'status':<8} {'rows':>10}  {'started':<20} {'git':<13} {'cfg':<9} error")
     partial = False
     for _run_id, phase, status, out_rows, started, sha, cfg, err, limit in rows:
         # A run over a deliberately truncated input is not a run of the phase.
@@ -1934,8 +2152,10 @@ def cmd_runs(args: argparse.Namespace) -> int:
         capped = limit not in (None, "null")
         partial |= capped
         label = f"{phase}{'*' if capped else ''}"
-        print(f"{label:<13} {status:<8} {out_rows if out_rows is not None else '-':>10}"
-              f"  {str(started)[:19]:<20} {sha:<13} {cfg:<9} {err or ''}")
+        print(
+            f"{label:<13} {status:<8} {out_rows if out_rows is not None else '-':>10}"
+            f"  {str(started)[:19]:<20} {sha:<13} {cfg:<9} {err or ''}"
+        )
     if partial:
         print("\n* ran over a truncated input (--limit); not a full run of the phase")
     return 0
@@ -1949,7 +2169,11 @@ def cmd_label_verify(args: argparse.Namespace) -> int:
     if args.verify_action == "export":
         signals_run = args.signals_run or latest_run(con, "signals")
         path = verify.export_worklist(
-            con, signals_run, args.n, CONFIG.llm.verification_seed, Path(args.output),
+            con,
+            signals_run,
+            args.n,
+            CONFIG.llm.verification_seed,
+            Path(args.output),
         )
         metadata = verify.load_worklist_metadata(con, path)
         print(f"worklist  : {path}")
@@ -1960,7 +2184,9 @@ def cmd_label_verify(args: argparse.Namespace) -> int:
         # This CLI is the human-review ingestion path. Model-origin reviews
         # remain available to callers of src.llm.verify, never as CLI input.
         count, metadata = verify.record_worklist(
-            con, Path(args.input), args.reviewer,
+            con,
+            Path(args.input),
+            args.reviewer,
         )
         print(f"recorded  : {count}")
         print(f"version   : {metadata.worklist_version}")
@@ -1975,46 +2201,71 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="execute a pipeline phase")
     p_run.add_argument("--phase", required=True)
-    p_run.add_argument("--force", action="store_true",
-                       help="replace an existing raw snapshot (download only)")
-    p_run.add_argument("--extract", action="store_true",
-                       help="extract the CSV after download")
-    p_run.add_argument("--gzip", action="store_true",
-                       help="restream the snapshot as .csv.gz (DuckDB reads it directly)")
+    p_run.add_argument(
+        "--force", action="store_true", help="replace an existing raw snapshot (download only)"
+    )
+    p_run.add_argument("--extract", action="store_true", help="extract the CSV after download")
+    p_run.add_argument(
+        "--gzip",
+        action="store_true",
+        help="restream the snapshot as .csv.gz (DuckDB reads it directly)",
+    )
     p_run.add_argument("--csv", help="load from this CSV instead of the snapshot")
     p_run.add_argument("--model", help="embedding model (default: config)")
     p_run.add_argument("--batch", type=int, help="encode batch size")
     p_run.add_argument("--device", help="cpu | mps | cuda (default: autodetect)")
-    p_run.add_argument("--limit", type=int,
-                       help="encode only the first N texts; cluster: fit sample size")
+    p_run.add_argument(
+        "--limit", type=int, help="encode only the first N texts; cluster: fit sample size"
+    )
     p_run.add_argument("--dedup-run", help="dedup run whose representatives to cluster")
     p_run.add_argument("--cutoff", help="ISO date; restricts to complaints before it")
     p_run.add_argument("--family", help="cluster only this product family")
     p_run.add_argument("--system", default="harmscope", help="backtest: system label")
-    p_run.add_argument("--strong-only", action="store_true",
-                       help="backtest: require an adjudicated strong link")
+    p_run.add_argument(
+        "--strong-only", action="store_true", help="backtest: require an adjudicated strong link"
+    )
     p_run.add_argument("--run-id", help="cluster run to build signals from")
     p_run.add_argument("--signals-run", help="label: signals run defining which clusters fired")
-    p_run.add_argument("--control-n", type=int, default=50,
-                       help="label: random non-firing clusters to also label, so the "
-                            "LLM_LAYER §2.5 verification sample is not drawn only from alerts")
-    p_run.add_argument("--shuffle", type=int, default=0, metavar="K",
-                       help="negative control: permute cluster labels within "
-                            "family using seed offset K (ROADMAP Phase 5)")
+    p_run.add_argument(
+        "--control-n",
+        type=int,
+        default=50,
+        help="label: random non-firing clusters to also label, so the "
+        "LLM_LAYER §2.5 verification sample is not drawn only from alerts",
+    )
+    p_run.add_argument(
+        "--shuffle",
+        type=int,
+        default=0,
+        metavar="K",
+        help="negative control: permute cluster labels within "
+        "family using seed offset K (ROADMAP Phase 5)",
+    )
     p_run.set_defaults(func=cmd_run)
 
-    p_gate = sub.add_parser("gate", help="Phase 2 gate report: precision, recall, "
-                                         "campaign share")
+    p_gate = sub.add_parser("gate", help="Phase 2 gate report: precision, recall, campaign share")
     p_gate.add_argument("--run-id", help="default: latest successful dedup run")
-    p_gate.add_argument("--merge-audit", type=int, default=40, metavar="N",
-                        help="sample N same-group pairs to measure how much of "
-                             "the merge population the eval set can see")
-    p_gate.add_argument("--disputed", action="store_true",
-                        help="print every pair the detector and the label "
-                             "disagree on, with narrative text, for hand reading")
-    p_gate.add_argument("--read", type=int, default=0, metavar="N",
-                        help="also print N flagged campaigns and N unflagged "
-                             "groups for the manual read (trap T2)")
+    p_gate.add_argument(
+        "--merge-audit",
+        type=int,
+        default=40,
+        metavar="N",
+        help="sample N same-group pairs to measure how much of "
+        "the merge population the eval set can see",
+    )
+    p_gate.add_argument(
+        "--disputed",
+        action="store_true",
+        help="print every pair the detector and the label "
+        "disagree on, with narrative text, for hand reading",
+    )
+    p_gate.add_argument(
+        "--read",
+        type=int,
+        default=0,
+        metavar="N",
+        help="also print N flagged campaigns and N unflagged groups for the manual read (trap T2)",
+    )
     p_gate.set_defaults(func=cmd_gate)
 
     p_adj = sub.add_parser("adjudicate", help="print eval pairs for blind judgement")
@@ -2077,12 +2328,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ask.add_argument("--cluster-id", required=True)
     p_ask.add_argument("--company-id", required=True)
     p_ask.add_argument("--question", required=True)
-    p_ask.add_argument("--model", help="embedding model (default: config)")
+    p_ask.add_argument("--model", help="embedding model (default: selected cluster run provenance)")
     p_ask.add_argument("--include-enforcement-context", action="store_true")
     p_ask.set_defaults(func=cmd_ask)
 
     p_verify = sub.add_parser(
-        "label-verify", help="export, ingest, or report blinded human label review",
+        "label-verify",
+        help="export, ingest, or report blinded human label review",
     )
     verify_sub = p_verify.add_subparsers(dest="verify_action", required=True)
     p_verify_export = verify_sub.add_parser("export", help="write a blinded worklist")

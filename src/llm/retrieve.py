@@ -62,6 +62,7 @@ class FusedHit:
 @dataclass(frozen=True)
 class RetrievedEvidence:
     complaint_id: int
+    cluster_id: str
     date_received: date
     company_id: str
     company_name: str
@@ -646,6 +647,7 @@ def retrieve_variants(
     evidence_rows = tuple(
         RetrievedEvidence(
             complaint_id=hit.complaint_id,
+            cluster_id=corpus.cluster_id,
             date_received=rows_by_id[hit.complaint_id].date_received,
             company_id=rows_by_id[hit.complaint_id].company_id,
             company_name=rows_by_id[hit.complaint_id].company_name,

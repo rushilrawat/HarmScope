@@ -72,6 +72,52 @@ def estimate_cost(usage: TokenUsage, price: ModelPricing) -> float:
     ) / 1_000_000
 
 
+def _token_count(value: object, field: str, *, optional: bool = False) -> int:
+    if optional and value is None:
+        return 0
+    if type(value) is not int or value < 0:
+        raise ValueError(f"response usage {field} must be a non-negative integer")
+    return value
+
+
+def _response_usage(response: object) -> TokenUsage:
+    usage = response.usage
+    return TokenUsage(
+        input_tokens=_token_count(usage.input_tokens, "input_tokens"),
+        output_tokens=_token_count(usage.output_tokens, "output_tokens"),
+        cache_read_input_tokens=_token_count(
+            getattr(usage, "cache_read_input_tokens", None),
+            "cache_read_input_tokens",
+            optional=True,
+        ),
+        cache_creation_input_tokens=_token_count(
+            getattr(usage, "cache_creation_input_tokens", None),
+            "cache_creation_input_tokens",
+            optional=True,
+        ),
+    )
+
+
+def _best_effort_response_usage(response: object) -> TokenUsage:
+    try:
+        usage = response.usage
+    except Exception:
+        return TokenUsage()
+
+    def safe(field: str, *, optional: bool = False) -> int:
+        try:
+            return _token_count(getattr(usage, field, None), field, optional=optional)
+        except Exception:
+            return 0
+
+    return TokenUsage(
+        input_tokens=safe("input_tokens"),
+        output_tokens=safe("output_tokens"),
+        cache_read_input_tokens=safe("cache_read_input_tokens", optional=True),
+        cache_creation_input_tokens=safe("cache_creation_input_tokens", optional=True),
+    )
+
+
 def classify_error(exc: Exception) -> tuple[str, bool]:
     import anthropic
 
@@ -125,9 +171,7 @@ class AnthropicModelClient:
         self.pricing = pricing or _configured_pricing()
         self.max_retries = config.max_retries if max_retries is None else max_retries
         self.retry_base_seconds = (
-            config.retry_base_seconds
-            if retry_base_seconds is None
-            else retry_base_seconds
+            config.retry_base_seconds if retry_base_seconds is None else retry_base_seconds
         )
         self.retry_max_seconds = (
             config.retry_max_seconds if retry_max_seconds is None else retry_max_seconds
@@ -154,11 +198,13 @@ class AnthropicModelClient:
                 response = self.transport.messages.create(
                     model=model,
                     max_tokens=max_tokens,
-                    system=[{
-                        "type": "text",
-                        "text": system,
-                        "cache_control": {"type": "ephemeral"},
-                    }],
+                    system=[
+                        {
+                            "type": "text",
+                            "text": system,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
                     output_config={
                         "format": {"type": "json_schema", "schema": schema},
                     },
@@ -184,34 +230,48 @@ class AnthropicModelClient:
             # Keep extraction outside the transport exception block: parsing
             # failures must never be misclassified as retryable provider calls.
             latency_seconds = self.clock() - started_at
-            response_usage = getattr(response, "usage", None)
-            usage = TokenUsage(
-                input_tokens=getattr(response_usage, "input_tokens", 0),
-                output_tokens=getattr(response_usage, "output_tokens", 0),
-                cache_read_input_tokens=getattr(
-                    response_usage, "cache_read_input_tokens", 0
-                ),
-                cache_creation_input_tokens=getattr(
-                    response_usage, "cache_creation_input_tokens", 0
-                ),
-            )
-            estimated_cost_usd = estimate_cost(usage, self.pricing)
-            if response.stop_reason == "refusal":
+            try:
+                usage = _response_usage(response)
+                estimated_cost_usd = estimate_cost(usage, self.pricing)
+            except Exception as exc:
+                usage = _best_effort_response_usage(response)
+                try:
+                    estimated_cost_usd = estimate_cost(usage, self.pricing)
+                except Exception:
+                    estimated_cost_usd = 0.0
+                raise ModelCallError(
+                    "usage_extraction",
+                    attempts,
+                    False,
+                    usage=usage,
+                    latency_seconds=latency_seconds,
+                    estimated_cost_usd=estimated_cost_usd,
+                    response_received=True,
+                ) from exc
+            try:
+                stop_reason = response.stop_reason
+                if type(stop_reason) is not str:
+                    raise TypeError("response stop_reason must be a string")
+            except Exception as exc:
+                raise ModelCallError(
+                    "malformed_response",
+                    attempts,
+                    False,
+                    usage=usage,
+                    latency_seconds=latency_seconds,
+                    estimated_cost_usd=estimated_cost_usd,
+                    response_received=True,
+                ) from exc
+            if stop_reason == "refusal":
                 payload = {"refused": True, "stop_reason": "refusal"}
             else:
                 category = (
-                    "truncated_response"
-                    if response.stop_reason == "max_tokens"
-                    else "malformed_response"
+                    "truncated_response" if stop_reason == "max_tokens" else "malformed_response"
                 )
                 try:
-                    text = next(
-                        block.text
-                        for block in response.content
-                        if block.type == "text"
-                    )
+                    text = next(block.text for block in response.content if block.type == "text")
                     payload = json.loads(text)
-                except (AttributeError, json.JSONDecodeError, StopIteration, TypeError) as exc:
+                except Exception as exc:
                     raise ModelCallError(
                         category,
                         attempts,
@@ -221,7 +281,7 @@ class AnthropicModelClient:
                         estimated_cost_usd=estimated_cost_usd,
                         response_received=True,
                     ) from exc
-                if response.stop_reason == "max_tokens":
+                if stop_reason == "max_tokens":
                     raise ModelCallError(
                         category,
                         attempts,
@@ -234,7 +294,7 @@ class AnthropicModelClient:
             return ModelCallResult(
                 payload=payload,
                 model=model,
-                stop_reason=response.stop_reason,
+                stop_reason=stop_reason,
                 usage=usage,
                 attempts=attempts,
                 latency_seconds=latency_seconds,
