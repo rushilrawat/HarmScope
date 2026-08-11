@@ -423,6 +423,51 @@ class AnswerEvaluationSummary:
         return "\n".join(lines)
 
 
+def render_evaluation_run(
+    eval_run_id: str,
+    retrieval_summary: EvaluationSummary,
+    answer_summary: AnswerEvaluationSummary | None,
+) -> str:
+    """Render one stable run report while keeping unrun gates visibly unavailable."""
+    if type(eval_run_id) is not str or not _SAFE_ID.fullmatch(eval_run_id):
+        raise ValueError("eval_run_id must be a safe non-blank identifier")
+    if not isinstance(retrieval_summary, EvaluationSummary):
+        raise TypeError("retrieval_summary must be an EvaluationSummary")
+    if answer_summary is not None and not isinstance(answer_summary, AnswerEvaluationSummary):
+        raise TypeError("answer_summary must be an AnswerEvaluationSummary or None")
+
+    if answer_summary is None:
+        answer_section = "\n".join(
+            [
+                "RAG answer evaluation: n/a (retrieval-only run)",
+                "citation validity: n/a",
+                "citation coverage: n/a",
+                "abstention accuracy: n/a",
+                "tokens: n/a",
+                "cache outcomes: n/a",
+                "answer latency: n/a",
+                "estimated cost: n/a",
+            ]
+        )
+    else:
+        answer_section = answer_summary.render()
+    human_section = "\n".join(
+        [
+            "human groundedness gate: PENDING",
+            f"claim review run ID: {eval_run_id}",
+            f"required human-reviewed claims: at least {CONFIG.llm.human_verify_n}",
+        ]
+    )
+    return "\n\n".join(
+        [
+            f"eval run ID: {eval_run_id}",
+            retrieval_summary.render(),
+            answer_section,
+            human_section,
+        ]
+    )
+
+
 @dataclass(frozen=True)
 class _AuthoringCandidate:
     cluster_id: str
@@ -1908,6 +1953,21 @@ def validate_manifest(con, questions: list[EvalQuestion]) -> None:
                     f"question {question.question_id!r} has an eight-token overlap "
                     f"with complaint_id {complaint_id}"
                 )
+
+
+def manifest_embed_model(con, questions: list[EvalQuestion]) -> str:
+    """Return the one cluster-run model shared by a validated evaluation manifest."""
+    if type(questions) is not list or not questions:
+        raise ManifestError("evaluation manifest must contain questions")
+    if any(not isinstance(question, EvalQuestion) for question in questions):
+        raise TypeError("questions must contain EvalQuestion values")
+    models = {
+        _embed_model_for_cluster(con, question.question_id, question.cluster_id)
+        for question in questions
+    }
+    if len(models) != 1:
+        raise ManifestError("evaluation manifest must use exactly one embedding model")
+    return next(iter(models))
 
 
 def _latest_signals_provenance(con) -> tuple[str, str]:

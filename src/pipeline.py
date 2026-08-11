@@ -13,6 +13,8 @@ a dispatch table is exactly how that trap gets sprung.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -2061,6 +2063,151 @@ DISCLAIMER = (
     "CFPB verified the allegations or that the company acted unlawfully."
 )
 
+_SAFE_RAG_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*\Z")
+_RAG_MANIFEST_NAME = "rag_eval_questions.csv"
+
+
+def _rag_identifier(value: object, field: str) -> str:
+    if type(value) is not str or not _SAFE_RAG_IDENTIFIER.fullmatch(value):
+        raise ValueError(f"{field} must be a safe non-blank identifier")
+    return value
+
+
+def _rag_interim_path(value: object, field: str, *, must_exist: bool = False) -> Path:
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{field} is required")
+    path = Path(value)
+    try:
+        path.resolve().relative_to(PATHS.interim.resolve())
+    except ValueError:
+        raise ValueError(f"{field} must stay under configured data/interim") from None
+    if must_exist and not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _load_rag_manifest(llm_eval):
+    """Load and hash one unchanged byte identity before writable work begins."""
+    path = PATHS.ground_truth / _RAG_MANIFEST_NAME
+    before = path.read_bytes()
+    questions = llm_eval.load_manifest(path)
+    after = path.read_bytes()
+    if before != after:
+        raise llm_eval.ManifestError("RAG evaluation manifest changed while it was loading")
+    return path, questions, hashlib.sha256(before).hexdigest()
+
+
+def cmd_rag_eval(args: argparse.Namespace) -> int:
+    """Author, run, and human-review the frozen Phase 8D RAG benchmark."""
+    from src.llm import eval as llm_eval
+
+    action = args.eval_action
+    if action != "run" and getattr(args, "retrieval_only", False):
+        raise ValueError("--retrieval-only is valid only for the rag-eval run action")
+
+    if action == "run":
+        _manifest_path, questions, manifest_sha256 = _load_rag_manifest(llm_eval)
+        con = db.bootstrap()
+        try:
+            llm_eval.validate_manifest(con, questions)
+            embed_model = llm_eval.manifest_embed_model(con, questions)
+            params = {
+                "manifest_sha256": manifest_sha256,
+                "embed_model": embed_model,
+                "retrieval_only": args.retrieval_only,
+            }
+            with db.run(con, "rag-eval", CONFIG, params=params) as r:
+                retrieval_summary = llm_eval.run_retrieval_eval(
+                    con,
+                    questions,
+                    embed_model,
+                    r.run_id,
+                )
+                answer_summary = (
+                    None
+                    if args.retrieval_only
+                    else llm_eval.run_answer_eval(
+                        con,
+                        questions,
+                        embed_model,
+                        r.run_id,
+                    )
+                )
+                report = llm_eval.render_evaluation_run(
+                    r.run_id,
+                    retrieval_summary,
+                    answer_summary,
+                )
+                r.finish(output_rows=len(questions) * 3)
+            print(report)
+            return 0
+        finally:
+            con.close()
+
+    if action == "author":
+        output = _rag_interim_path(args.output, "authoring output")
+        con = db.bootstrap()
+        try:
+            path = llm_eval.export_authoring_worklist(
+                con,
+                CONFIG.llm.verification_seed,
+                output,
+            )
+            print(f"worklist  : {path}")
+            print("rows      : 30")
+            return 0
+        finally:
+            con.close()
+
+    if action == "import":
+        source = _rag_interim_path(args.input, "authoring input", must_exist=True)
+        destination = PATHS.ground_truth / _RAG_MANIFEST_NAME
+        con = db.bootstrap()
+        try:
+            path = llm_eval.import_authoring_worklist(con, source, destination)
+            count = len(llm_eval.load_manifest(path))
+            print(f"manifest  : {path}")
+            print(f"questions : {count}")
+            return 0
+        finally:
+            con.close()
+
+    if action == "claims-export":
+        run_id = _rag_identifier(args.run_id, "run_id")
+        output = _rag_interim_path(args.output, "claim-review output")
+        _load_rag_manifest(llm_eval)
+        con = db.bootstrap()
+        try:
+            path = llm_eval.export_claim_review(
+                con,
+                run_id,
+                CONFIG.llm.human_verify_n,
+                CONFIG.llm.verification_seed,
+                output,
+            )
+            print(f"claims    : {path}")
+            print(f"rows      : {CONFIG.llm.human_verify_n}")
+            return 0
+        finally:
+            con.close()
+
+    if action == "claims-record":
+        run_id = _rag_identifier(args.run_id, "run_id")
+        reviewer_id = _rag_identifier(args.reviewer, "reviewer_id")
+        source = _rag_interim_path(args.input, "claim-review input", must_exist=True)
+        reviews = llm_eval.parse_claim_review(source, reviewer_id)
+        con = db.bootstrap()
+        try:
+            report = llm_eval.record_claim_review(con, run_id, reviews)
+            print(f"recorded  : {report.reviewed}")
+            print(f"eval run ID: {run_id}")
+            print(report.render())
+            return 0
+        finally:
+            con.close()
+
+    raise ValueError(f"unknown rag-eval action {action!r}")
+
 
 def cmd_ask(args: argparse.Namespace) -> int:
     """Retrieve and render one grounded analyst answer for an explicit scope."""
@@ -2349,6 +2496,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify_report = verify_sub.add_parser("report", help="show human-review agreement")
     p_verify_report.add_argument("--worklist-version")
     p_verify_report.set_defaults(func=cmd_label_verify)
+
+    p_rag = sub.add_parser(
+        "rag-eval",
+        help="run or review the frozen thirty-question RAG benchmark",
+    )
+    p_rag.add_argument(
+        "--retrieval-only",
+        action="store_true",
+        help="score dense, BM25, and fused retrieval without a model provider",
+    )
+    rag_sub = p_rag.add_subparsers(dest="eval_action")
+    p_rag.set_defaults(func=cmd_rag_eval, eval_action="run")
+    p_rag_author = rag_sub.add_parser("author", help="write the private authoring worklist")
+    p_rag_author.add_argument("--output", required=True)
+    p_rag_import = rag_sub.add_parser("import", help="freeze a completed authoring worklist")
+    p_rag_import.add_argument("--input", required=True)
+    p_claims_export = rag_sub.add_parser(
+        "claims-export",
+        help="write a blinded claim-review worklist for a completed run",
+    )
+    p_claims_export.add_argument("--run-id", required=True)
+    p_claims_export.add_argument("--output", required=True)
+    p_claims_record = rag_sub.add_parser(
+        "claims-record",
+        help="validate and record one completed human claim review",
+    )
+    p_claims_record.add_argument("--run-id", required=True)
+    p_claims_record.add_argument("--input", required=True)
+    p_claims_record.add_argument("--reviewer", required=True)
 
     p_runs = sub.add_parser("runs", help="show the run registry")
     p_runs.add_argument("-n", type=int, default=20)

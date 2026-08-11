@@ -159,10 +159,28 @@ unit being tracked. Anything else makes the comparison unfair in your favour.
 - Human verification of ≥ 50 labels.
 
 **Accept:**
-- **Determinism test passes:** removing `src/llm/` leaves `signals` and `baseline_results`
-  byte-identical.
-- Label agreement rate reported.
-- RAG Recall@10 and groundedness reported on the 30-question set.
+- **Determinism test passes:** removing `src/llm/` leaves `signals`
+  byte-identical. `baseline_results` is byte-identical given the same
+  human-written `backtest_links`; adjudication is intentionally human-in-loop
+  and is not part of the unconditional claim.
+- Label agreement rates reported with numerators/denominators on at least 50
+  version-bound human-reviewed labels.
+- Dense, BM25, and fused Recall@10/MRR plus fusion win/tie/loss reported on the
+  frozen 30-question set, including losses.
+- Citation validity/coverage and answerable/unanswerable abstention reported for
+  the paid answer run; groundedness reported on at least 50 run-bound
+  human-reviewed claims.
+- Automated, live-provider, and human status are stated separately; fake-client
+  tests never stand in for a live or human metric.
+
+**Status (2026-08-11):** the engineering and automated-test portions are built.
+Phase completion remains open: the human-authored/privacy-reviewed manifest is
+not frozen; 18 private draft rows lack the concrete company scope required for
+answers; the `company_response` authoring evidence needs a scope decision; the
+legacy MiniLM vector artifact needs regeneration under the full-model SHA
+identity; Anthropic billing blocks live labels/answers; and both 50-item human
+reviews are pending. The real retrieval-only command stops before DB creation
+on the missing manifest, so no RAG metric or evaluation run ID exists yet.
 
 ---
 

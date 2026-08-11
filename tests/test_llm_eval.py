@@ -2946,3 +2946,57 @@ def test_claim_review_identity_binds_actual_cited_excerpt_content(
 
     with pytest.raises(ValueError, match="identity|tamper"):
         llm_eval.record_claim_review(con, eval_run_id, reviews)
+
+
+def test_manifest_embed_model_requires_one_recorded_model(monkeypatch):
+    """One evaluation cannot silently compare rankings from distinct vector spaces."""
+    questions = [
+        replace(_retrieval_question("rag-001"), cluster_id="cluster-1"),
+        replace(_retrieval_question("rag-002"), cluster_id="cluster-2"),
+    ]
+    models = {"cluster-1": "embed-a", "cluster-2": "embed-b"}
+    monkeypatch.setattr(
+        llm_eval,
+        "_embed_model_for_cluster",
+        lambda _con, _question_id, cluster_id: models[cluster_id],
+    )
+
+    with pytest.raises(llm_eval.ManifestError, match="one embedding model"):
+        llm_eval.manifest_embed_model(object(), questions)
+
+    models["cluster-2"] = "embed-a"
+    assert llm_eval.manifest_embed_model(object(), questions) == "embed-a"
+
+
+def test_combined_evaluation_render_names_pending_and_measured_gates():
+    """Unavailable paid/human gates must render n/a/PENDING rather than zero/pass."""
+    retrieval = llm_eval.EvaluationSummary(
+        answerable_count=1,
+        unanswerable_count=1,
+        dense=llm_eval.RetrievalMethodSummary(0.5, 0.25, 0.1, 0.2),
+        bm25=llm_eval.RetrievalMethodSummary(0.6, 0.5, 0.2, 0.3),
+        fused=llm_eval.RetrievalMethodSummary(0.7, 1.0, 0.3, 0.4),
+        fused_vs_dense=llm_eval.WinTieLoss(1, 0, 1),
+        fused_vs_bm25=llm_eval.WinTieLoss(1, 1, 0),
+        questions=(),
+    )
+
+    output = llm_eval.render_evaluation_run("eval-1", retrieval, None)
+
+    for label in (
+        "eval run ID: eval-1",
+        "Recall@10",
+        "MRR",
+        "dense",
+        "BM25",
+        "fused",
+        "win/tie/loss",
+        "citation validity: n/a",
+        "citation coverage: n/a",
+        "abstention accuracy: n/a",
+        "tokens: n/a",
+        "estimated cost: n/a",
+        "human groundedness gate: PENDING",
+    ):
+        assert label in output
+    assert "COMPLETE" not in output

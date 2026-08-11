@@ -131,4 +131,18 @@ answer, or verification code was added or changed. Fix commit pending scoped
 re-review.
 Task 4 re-review: APPROVED at 8e08a4b — dedup-expanded evidence, constructed-type rejection before SQL, interim-only parsing, identity, sampling, Wilson, fused-only replay/rollback, and caller-transaction behavior all reproduced with no residual finding.
 
-Task 5: in progress.
+Task 5 implementer: DONE_WITH_CONCERNS — lazy full/retrieval-only RAG
+evaluation, author/import, claim export/record, exact manifest/run provenance,
+provider isolation, connection closure, stable combined rendering, and honest
+documentation are implemented. Strict TDD included missing-interface,
+run-status-on-render-failure, and exact path/count output RED→GREEN waves.
+Fresh verification: required selection 427 passed + 1 expected missing-human-
+manifest skip; full repository 659 passed + 6 expected real-data skips; Ruff,
+scoped format, and diff check clean. The only network-free real-data command
+failed honestly before database bootstrap at the absent frozen manifest, and a
+read-only check found zero `rag-eval` runs. No live provider, human judgment,
+manifest, metric, or migration was fabricated. Human manifest/privacy freeze,
+18 blank company scopes, unsupported `company_response`, legacy embedding
+filename migration/regeneration, Anthropic billing/live work, and 50-label/
+50-claim reviews remain open. Implementation commit is the enclosing `Complete
+Phase 8 RAG evaluation` commit; independent review is pending.
