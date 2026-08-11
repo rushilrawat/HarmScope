@@ -12,8 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from src.llm import answer, retrieve
 from src.llm import eval as llm_eval
-from src.llm import retrieve
+from src.llm.client import ModelCallError, TokenUsage
 
 
 def _token_text(prefix: str, count: int = 12) -> str:
@@ -1154,3 +1155,675 @@ def test_retrieval_summary_reports_linear_p95_and_every_fusion_loss_without_narr
     assert "rag-019" in report and "rag-020" in report and "loss" in report
     assert "private narrative phrase" not in report
     assert all(math.isfinite(method.p95_latency_seconds) for method in summary.methods.values())
+
+
+def _grounded_answer(
+    *,
+    claims: tuple[answer.Claim, ...] = (
+        answer.Claim("Consumers allege the first problem.", (10,)),
+        answer.Claim("Consumers allege the second problem.", (20,)),
+    ),
+    insufficient_evidence: bool = False,
+) -> answer.GroundedAnswer:
+    return answer.GroundedAnswer(
+        answer=" ".join(claim.text for claim in claims),
+        claims=claims,
+        insufficient_evidence=insufficient_evidence,
+        limitation_reasons=(),
+    )
+
+
+def test_citation_metrics_are_deterministic_and_use_all_claims():
+    grounded = _grounded_answer()
+
+    assert llm_eval.citation_validity(grounded, {10, 20}) is True
+    assert llm_eval.citation_validity(grounded, {10}) is False
+    assert llm_eval.citation_coverage(grounded) == 1.0
+
+    partially_cited = _grounded_answer(
+        claims=(
+            answer.Claim("Consumers allege the first problem.", (10,)),
+            answer.Claim("Consumers allege the second problem.", ()),
+        )
+    )
+    assert llm_eval.citation_validity(partially_cited, {10}) is False
+    assert llm_eval.citation_coverage(partially_cited) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    "complaint_ids",
+    [(), (10, 10), (0,), (-1,), (True,), ("10",)],
+)
+def test_citation_validity_fails_closed_for_malformed_claim_citations(complaint_ids):
+    grounded = _grounded_answer(
+        claims=(answer.Claim("Consumers allege a problem.", complaint_ids),)
+    )
+
+    assert llm_eval.citation_validity(grounded, {10}) is False
+
+
+def test_zero_claim_coverage_distinguishes_abstention_from_empty_answer():
+    abstention = _grounded_answer(claims=(), insufficient_evidence=True)
+    empty_answer = _grounded_answer(claims=(), insufficient_evidence=False)
+
+    assert llm_eval.citation_validity(abstention, set()) is True
+    assert llm_eval.citation_coverage(abstention) == 1.0
+    assert llm_eval.citation_coverage(empty_answer) == 0.0
+
+
+def test_citation_coverage_counts_presence_separately_from_citation_validity():
+    duplicate_citation = _grounded_answer(
+        claims=(answer.Claim("Consumers allege a problem.", (10, 10)),)
+    )
+
+    assert llm_eval.citation_validity(duplicate_citation, {10}) is False
+    assert llm_eval.citation_coverage(duplicate_citation) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("answerable", "insufficient", "expected"),
+    [(True, False, True), (True, True, False), (False, True, True), (False, False, False)],
+)
+def test_abstention_accuracy_matrix(answerable, insufficient, expected):
+    assert llm_eval.abstention_correct(answerable, insufficient) is expected
+
+
+@pytest.mark.parametrize(
+    ("call", "match"),
+    [
+        (lambda: llm_eval.citation_validity("answer", {10}), "GroundedAnswer"),
+        (lambda: llm_eval.citation_validity(_grounded_answer(), [10]), "set"),
+        (lambda: llm_eval.citation_coverage("answer"), "GroundedAnswer"),
+        (lambda: llm_eval.abstention_correct(1, False), "boolean"),
+        (lambda: llm_eval.abstention_correct(True, 0), "boolean"),
+    ],
+)
+def test_answer_metrics_reject_wrong_boundary_types(call, match):
+    with pytest.raises(TypeError, match=match):
+        call()
+
+
+def _seed_retrieval_rows(
+    con,
+    eval_run_id: str,
+    questions: list[llm_eval.EvalQuestion],
+) -> None:
+    for question in questions:
+        for method in ("dense", "bm25", "fused"):
+            con.execute(
+                "INSERT INTO rag_eval_results "
+                "(eval_run_id, question_id, retrieval_method, rank_first_relevant, "
+                "relevant_retrieved_count, recall_at_10, reciprocal_rank, latency_seconds, "
+                "created_at) VALUES (?, ?, ?, 1, 1, 0.5, 0.25, 0.125, now())",
+                [eval_run_id, question.question_id, method],
+            )
+
+
+def _answer_evidence(
+    question: llm_eval.EvalQuestion,
+    complaint_id: int = 10,
+    *,
+    cluster_id: str | None = None,
+    company_id: str | None = None,
+) -> retrieve.RetrievedEvidence:
+    return retrieve.RetrievedEvidence(
+        complaint_id=complaint_id,
+        cluster_id=question.cluster_id if cluster_id is None else cluster_id,
+        date_received=date(2020, 1, 2),
+        company_id=question.company_id if company_id is None else company_id,
+        company_name="Private company name",
+        product_family="family-1",
+        text_redacted="Private narrative phrase that must never enter the report.",
+        company_public_response=None,
+        dense_rank=1,
+        dense_score=0.9,
+        sparse_rank=1,
+        sparse_score=0.8,
+        fused_score=0.1,
+    )
+
+
+def _answer_result(
+    question: llm_eval.EvalQuestion,
+    *,
+    grounded: answer.GroundedAnswer | None = None,
+    evidence_rows: tuple[retrieve.RetrievedEvidence, ...] | None = None,
+    cache_status: str = "miss",
+) -> answer.AnswerResult:
+    if evidence_rows is None:
+        evidence_rows = (_answer_evidence(question),)
+    if grounded is None:
+        grounded = _grounded_answer(
+            claims=(answer.Claim("Consumers allege a problem.", (10,)),),
+            insufficient_evidence=False,
+        )
+    return answer.AnswerResult(
+        answer=grounded,
+        evidence=evidence_rows,
+        enforcement_context=(),
+        cache_status=cache_status,
+        usage=TokenUsage(),
+        latency_seconds=0.0,
+        estimated_cost_usd=0.0,
+    )
+
+
+def _insert_answer_usage(
+    con,
+    *,
+    usage_id: str,
+    eval_run_id: str,
+    question: llm_eval.EvalQuestion,
+    cache_status: str,
+    outcome: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+    latency_seconds: float = 0.0,
+    estimated_cost_usd: float = 0.0,
+    operation: str = "answer",
+) -> None:
+    con.execute(
+        "INSERT INTO llm_usage "
+        "(usage_id, run_id, operation, cluster_id, question_hash, model, prompt_version, "
+        "input_hash, cache_status, attempts, input_tokens, output_tokens, "
+        "cache_read_input_tokens, cache_creation_input_tokens, latency_seconds, "
+        "estimated_cost_usd, outcome, error_category, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 'model-private', 'prompt-private', ?, ?, 1, ?, ?, ?, ?, "
+        "?, ?, ?, NULL, now())",
+        [
+            usage_id,
+            eval_run_id,
+            operation,
+            question.cluster_id,
+            f"hash-{question.question_id}",
+            f"input-{question.question_id}",
+            cache_status,
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            latency_seconds,
+            estimated_cost_usd,
+            outcome,
+        ],
+    )
+
+
+class _Answerer:
+    def __init__(
+        self,
+        outcomes: dict[str, answer.AnswerResult | BaseException],
+        usage: dict[str, dict[str, object]] | None = None,
+    ):
+        self.outcomes = outcomes
+        self.usage = usage or {}
+        self.calls: list[tuple[str, str, str, str, str]] = []
+
+    def __call__(
+        self,
+        con,
+        cluster_id,
+        company_id,
+        question,
+        embed_model,
+        *,
+        run_id,
+    ):
+        self.calls.append((cluster_id, company_id, question, embed_model, run_id))
+        outcome = self.outcomes[question]
+        usage = self.usage.get(question)
+        if usage is not None:
+            usage_values = dict(usage)
+            usage_question = usage_values.pop("question")
+            _insert_answer_usage(
+                con,
+                eval_run_id=run_id,
+                question=usage_question,
+                **usage_values,
+            )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def test_answer_eval_updates_only_fused_rows_and_aggregates_exact_usage(con):
+    answerable = _retrieval_question("rag-001")
+    unanswerable = _retrieval_question("rag-002", relevant_ids=frozenset(), answerable=False)
+    bypassed = _retrieval_question("rag-003", relevant_ids=frozenset(), answerable=False)
+    questions = [answerable, unanswerable, bypassed]
+    _seed_retrieval_rows(con, "eval-answer", questions)
+    con.execute(
+        "UPDATE rag_eval_results SET grounded_claims = 7, reviewed_claims = 8 "
+        "WHERE eval_run_id = 'eval-answer' AND question_id = 'rag-001' "
+        "AND retrieval_method = 'fused'"
+    )
+    abstention = _grounded_answer(claims=(), insufficient_evidence=True)
+    answerer = _Answerer(
+        {
+            answerable.question: _answer_result(answerable),
+            unanswerable.question: _answer_result(unanswerable, grounded=abstention),
+            bypassed.question: _answer_result(
+                bypassed,
+                grounded=abstention,
+                evidence_rows=(),
+                cache_status="bypass",
+            ),
+        },
+        {
+            answerable.question: {
+                "usage_id": "usage-1",
+                "question": answerable,
+                "cache_status": "miss",
+                "outcome": "ok",
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 5,
+                "cache_creation_input_tokens": 7,
+                "latency_seconds": 0.4,
+                "estimated_cost_usd": 0.03,
+            },
+            unanswerable.question: {
+                "usage_id": "usage-2",
+                "question": unanswerable,
+                "cache_status": "hit",
+                "outcome": "ok",
+            },
+            bypassed.question: {
+                "usage_id": "usage-3",
+                "question": bypassed,
+                "cache_status": "bypass",
+                "outcome": "skipped",
+            },
+        },
+    )
+
+    summary = llm_eval.run_answer_eval(con, questions, "embed-m", "eval-answer", answerer=answerer)
+
+    assert answerer.calls == [
+        (
+            question.cluster_id,
+            question.company_id,
+            question.question,
+            "embed-m",
+            "eval-answer",
+        )
+        for question in questions
+    ]
+    assert con.execute(
+        "SELECT question_id, retrieval_method, citation_valid, citation_coverage, "
+        "abstention_correct, grounded_claims, reviewed_claims "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-answer' ORDER BY 1, 2"
+    ).fetchall() == [
+        ("rag-001", "bm25", None, None, None, None, None),
+        ("rag-001", "dense", None, None, None, None, None),
+        ("rag-001", "fused", True, 1.0, True, 7, 8),
+        ("rag-002", "bm25", None, None, None, None, None),
+        ("rag-002", "dense", None, None, None, None, None),
+        ("rag-002", "fused", True, 1.0, True, None, None),
+        ("rag-003", "bm25", None, None, None, None, None),
+        ("rag-003", "dense", None, None, None, None, None),
+        ("rag-003", "fused", True, 1.0, True, None, None),
+    ]
+    assert summary.attempted_count == 3
+    assert summary.completed_count == 3
+    assert summary.failed_count == 0
+    assert summary.citation_valid_count == 3
+    assert summary.citation_validity_rate == 1.0
+    assert summary.citation_coverage == 1.0
+    assert summary.abstention_accuracy == 1.0
+    assert summary.input_tokens == 100
+    assert summary.output_tokens == 20
+    assert summary.cache_read_input_tokens == 5
+    assert summary.cache_creation_input_tokens == 7
+    assert summary.total_latency_seconds == pytest.approx(0.4)
+    assert summary.estimated_cost_usd == pytest.approx(0.03)
+    assert (summary.cache_hits, summary.cache_misses, summary.cache_bypasses) == (1, 1, 1)
+    assert (summary.outcome_ok, summary.outcome_refused, summary.outcome_failed) == (2, 0, 0)
+    assert summary.outcome_skipped == 1
+
+
+def test_answer_eval_continues_only_typed_per_question_failures_and_keeps_nulls(con):
+    questions = [_retrieval_question(f"rag-{index:03d}") for index in range(1, 5)]
+    _seed_retrieval_rows(con, "eval-failures", questions)
+    failures: list[BaseException] = [
+        answer.CitationError("private unsupported citation 999"),
+        answer.AnswerSchemaError("private malformed prose"),
+        answer.AnswerRefusalError(
+            answer.ModelCallResult(
+                payload={"refused": True, "stop_reason": "refusal"},
+                model="private-model",
+                stop_reason="refusal",
+                usage=TokenUsage(),
+                attempts=1,
+                latency_seconds=0.0,
+                estimated_cost_usd=0.0,
+            )
+        ),
+    ]
+    answerer = _Answerer(
+        {
+            questions[0].question: failures[0],
+            questions[1].question: failures[1],
+            questions[2].question: failures[2],
+            questions[3].question: _answer_result(questions[3]),
+        }
+    )
+
+    summary = llm_eval.run_answer_eval(
+        con, questions, "embed-m", "eval-failures", answerer=answerer
+    )
+
+    assert [(failure.question_id, failure.category) for failure in summary.failures] == [
+        ("rag-001", "citation"),
+        ("rag-002", "schema"),
+        ("rag-003", "refusal"),
+    ]
+    assert summary.completed_count == 1
+    assert summary.failed_count == 3
+    assert con.execute(
+        "SELECT question_id, citation_valid, citation_coverage, abstention_correct "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-failures' "
+        "AND retrieval_method = 'fused' ORDER BY question_id"
+    ).fetchall() == [
+        ("rag-001", None, None, None),
+        ("rag-002", None, None, None),
+        ("rag-003", None, None, None),
+        ("rag-004", True, 1.0, True),
+    ]
+    rendered = summary.render()
+    assert rendered == summary.render()
+    assert "rag-001 | citation" in rendered
+    assert "rag-002 | schema" in rendered
+    assert "rag-003 | refusal" in rendered
+    assert "private" not in rendered.lower()
+    assert questions[0].question not in rendered
+
+
+def test_answer_eval_terminal_provider_error_stops_and_preserves_prior_question(con):
+    questions = [_retrieval_question(f"rag-{index:03d}") for index in range(1, 4)]
+    _seed_retrieval_rows(con, "eval-terminal", questions)
+    terminal = ModelCallError("billing", 1, False)
+    answerer = _Answerer(
+        {
+            questions[0].question: _answer_result(questions[0]),
+            questions[1].question: terminal,
+            questions[2].question: _answer_result(questions[2]),
+        }
+    )
+
+    with pytest.raises(ModelCallError) as caught:
+        llm_eval.run_answer_eval(con, questions, "embed-m", "eval-terminal", answerer=answerer)
+
+    assert caught.value is terminal
+    assert [call[2] for call in answerer.calls] == [
+        questions[0].question,
+        questions[1].question,
+    ]
+    assert con.execute(
+        "SELECT question_id, citation_valid FROM rag_eval_results "
+        "WHERE eval_run_id = 'eval-terminal' AND retrieval_method = 'fused' "
+        "ORDER BY question_id"
+    ).fetchall() == [("rag-001", True), ("rag-002", None), ("rag-003", None)]
+
+
+def test_answer_eval_rejects_missing_company_before_database_or_provider():
+    question = _retrieval_question("rag-001")
+    question = replace(question, company_id=None)
+    con = _NoDatabaseConnection()
+    answerer = _Answerer({question.question: _answer_result(question)})
+
+    with pytest.raises(ValueError, match="company_id"):
+        llm_eval.run_answer_eval(con, [question], "embed-m", "eval-company", answerer=answerer)
+
+    assert con.calls == []
+    assert answerer.calls == []
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        replace(
+            _retrieval_question("rag-001", relevant_ids=frozenset(), answerable=False),
+            category="mechanism",
+        ),
+        replace(_retrieval_question("rag-001"), category="unanswerable"),
+    ],
+)
+def test_answer_eval_rejects_answerability_category_mismatch_before_database(question):
+    con = _NoDatabaseConnection()
+    answerer = _Answerer({question.question: _answer_result(question)})
+
+    with pytest.raises(ValueError, match="category.*answerable|answerable.*category"):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-category",
+            answerer=answerer,
+        )
+
+    assert con.calls == []
+    assert answerer.calls == []
+
+
+def test_answer_eval_requires_every_fused_row_before_calling_provider(con):
+    questions = [_retrieval_question("rag-001"), _retrieval_question("rag-002")]
+    _seed_retrieval_rows(con, "eval-missing", questions[:1])
+    answerer = _Answerer({question.question: _answer_result(question) for question in questions})
+
+    with pytest.raises(ValueError, match="fused.*rag-002"):
+        llm_eval.run_answer_eval(con, questions, "embed-m", "eval-missing", answerer=answerer)
+
+    assert answerer.calls == []
+
+
+@pytest.mark.parametrize("resolution", ["COMMIT", "ROLLBACK"])
+def test_answer_eval_rejects_caller_transaction_without_altering_it(con, resolution):
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-caller-answer", [question])
+    con.execute("CREATE TABLE caller_answer_work (value INTEGER)")
+    con.execute("BEGIN TRANSACTION")
+    con.execute("INSERT INTO caller_answer_work VALUES (1)")
+    answerer = _Answerer({question.question: _answer_result(question)})
+
+    with pytest.raises(llm_eval.EvaluationTransactionError, match="autocommit"):
+        llm_eval.run_answer_eval(
+            con, [question], "embed-m", "eval-caller-answer", answerer=answerer
+        )
+
+    assert answerer.calls == []
+    assert con.execute("SELECT value FROM caller_answer_work").fetchall() == [(1,)]
+    con.execute(resolution)
+    expected = [(1,)] if resolution == "COMMIT" else []
+    assert con.execute("SELECT value FROM caller_answer_work").fetchall() == expected
+
+
+@pytest.mark.parametrize("malformation", ["wrong-cluster", "wrong-company", "duplicate-id"])
+def test_answer_eval_rejects_returned_evidence_outside_exact_scope(con, malformation):
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-evidence", [question])
+    first = _answer_evidence(
+        question,
+        cluster_id="other-cluster" if malformation == "wrong-cluster" else None,
+        company_id="other-company" if malformation == "wrong-company" else None,
+    )
+    rows = (first, first) if malformation == "duplicate-id" else (first,)
+    answerer = _Answerer({question.question: _answer_result(question, evidence_rows=rows)})
+
+    with pytest.raises(ValueError, match="evidence"):
+        llm_eval.run_answer_eval(con, [question], "embed-m", "eval-evidence", answerer=answerer)
+
+    assert con.execute(
+        "SELECT citation_valid, citation_coverage, abstention_correct "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-evidence' "
+        "AND retrieval_method = 'fused'"
+    ).fetchone() == (None, None, None)
+
+
+class _FailingAnswerUpdateConnection:
+    def __init__(self, con, fail_on_update: int):
+        self._con = con
+        self._fail_on_update = fail_on_update
+        self._updates = 0
+
+    def execute(self, query, parameters=None):
+        if query.lstrip().startswith("UPDATE rag_eval_results"):
+            self._updates += 1
+            if self._updates == self._fail_on_update:
+                raise RuntimeError("simulated answer metric update failure")
+        return (
+            self._con.execute(query) if parameters is None else self._con.execute(query, parameters)
+        )
+
+
+def test_answer_eval_rolls_back_current_metric_update_and_preserves_prior_question(con):
+    questions = [_retrieval_question("rag-001"), _retrieval_question("rag-002")]
+    _seed_retrieval_rows(con, "eval-answer-atomic", questions)
+    answerer = _Answerer({question.question: _answer_result(question) for question in questions})
+    wrapped = _FailingAnswerUpdateConnection(con, fail_on_update=2)
+
+    with pytest.raises(RuntimeError, match="metric update"):
+        llm_eval.run_answer_eval(
+            wrapped,
+            questions,
+            "embed-m",
+            "eval-answer-atomic",
+            answerer=answerer,
+        )
+
+    assert con.execute(
+        "SELECT question_id, citation_valid FROM rag_eval_results "
+        "WHERE eval_run_id = 'eval-answer-atomic' AND retrieval_method = 'fused' "
+        "ORDER BY question_id"
+    ).fetchall() == [("rag-001", True), ("rag-002", None)]
+
+
+def test_answer_eval_replay_preserves_retrieval_human_and_prior_metrics_on_failure(con):
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-answer-replay", [question])
+    con.execute(
+        "UPDATE rag_eval_results SET citation_valid = false, citation_coverage = 0.25, "
+        "abstention_correct = false, grounded_claims = 9, reviewed_claims = 10 "
+        "WHERE eval_run_id = 'eval-answer-replay' AND retrieval_method = 'fused'"
+    )
+    before = con.execute(
+        "SELECT rank_first_relevant, relevant_retrieved_count, recall_at_10, "
+        "reciprocal_rank, latency_seconds, grounded_claims, reviewed_claims, created_at "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-answer-replay' "
+        "AND retrieval_method = 'fused'"
+    ).fetchone()
+
+    llm_eval.run_answer_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-answer-replay",
+        answerer=_Answerer({question.question: _answer_result(question)}),
+    )
+    after_success = con.execute(
+        "SELECT rank_first_relevant, relevant_retrieved_count, recall_at_10, "
+        "reciprocal_rank, latency_seconds, grounded_claims, reviewed_claims, created_at, "
+        "citation_valid, citation_coverage, abstention_correct "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-answer-replay' "
+        "AND retrieval_method = 'fused'"
+    ).fetchone()
+    assert after_success == (*before, True, 1.0, True)
+
+    summary = llm_eval.run_answer_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-answer-replay",
+        answerer=_Answerer({question.question: answer.AnswerSchemaError("private failure")}),
+    )
+    assert summary.failed_count == 1
+    assert con.execute(
+        "SELECT citation_valid, citation_coverage, abstention_correct, "
+        "grounded_claims, reviewed_claims FROM rag_eval_results "
+        "WHERE eval_run_id = 'eval-answer-replay' AND retrieval_method = 'fused'"
+    ).fetchone() == (True, 1.0, True, 9, 10)
+
+
+def test_answer_usage_aggregation_filters_exact_run_and_operation(con):
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-usage", [question])
+    _insert_answer_usage(
+        con,
+        usage_id="usage-current",
+        eval_run_id="eval-usage",
+        question=question,
+        cache_status="miss",
+        outcome="ok",
+        input_tokens=11,
+        output_tokens=3,
+        latency_seconds=0.2,
+        estimated_cost_usd=0.01,
+    )
+    _insert_answer_usage(
+        con,
+        usage_id="usage-other-run",
+        eval_run_id="other-run",
+        question=question,
+        cache_status="hit",
+        outcome="ok",
+        input_tokens=999,
+    )
+    _insert_answer_usage(
+        con,
+        usage_id="usage-label",
+        eval_run_id="eval-usage",
+        question=question,
+        cache_status="miss",
+        outcome="ok",
+        input_tokens=888,
+        operation="label",
+    )
+
+    summary = llm_eval.run_answer_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-usage",
+        answerer=_Answerer({question.question: _answer_result(question)}),
+    )
+
+    assert summary.input_tokens == 11
+    assert summary.output_tokens == 3
+    assert summary.total_latency_seconds == pytest.approx(0.2)
+    assert summary.estimated_cost_usd == pytest.approx(0.01)
+    assert (summary.cache_hits, summary.cache_misses, summary.cache_bypasses) == (0, 1, 0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("input_tokens", -1), ("latency_seconds", -0.1), ("estimated_cost_usd", float("inf"))],
+)
+def test_answer_usage_aggregation_rejects_corrupt_values(con, field, value):
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-corrupt", [question])
+    values = {
+        "input_tokens": 1,
+        "latency_seconds": 0.1,
+        "estimated_cost_usd": 0.01,
+    }
+    values[field] = value
+    _insert_answer_usage(
+        con,
+        usage_id="usage-corrupt",
+        eval_run_id="eval-corrupt",
+        question=question,
+        cache_status="miss",
+        outcome="ok",
+        **values,
+    )
+
+    with pytest.raises(ValueError, match="usage"):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-corrupt",
+            answerer=_Answerer({question.question: _answer_result(question)}),
+        )

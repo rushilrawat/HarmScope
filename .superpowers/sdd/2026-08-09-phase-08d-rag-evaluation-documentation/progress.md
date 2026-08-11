@@ -67,4 +67,19 @@ expected skips; Ruff, scoped format, and diff check clean. Fix commit pending
 scoped re-review.
 Task 2 re-review: APPROVED at 6a8bf4d — zero-I/O invalid inputs, caller-transaction safety, exact fused membership/provenance/score/order/top-k validation, rollback, replay preservation, aggregates, and loss-visible rendering all reproduced with no residual finding.
 
-Task 3: in progress.
+Task 3 implementer: DONE_WITH_CONCERNS — deterministic citation validity,
+coverage, and abstention; typed ID-only answer/failure summary; zero-I/O batch
+validation; concrete company-scope gate; all-fused-row preflight; exact typed
+AnswerResult evidence validation; fused-only per-question transactions; closed
+schema/citation/refusal continuation; terminal provider/preflight propagation;
+replay preservation; and exact run+answer usage aggregation implemented. TDD:
+17 missing-metric RED then GREEN, 16 missing-runner RED then GREEN, one
+coverage-vs-validity semantic RED then GREEN, and two answerability/category
+zero-I/O RED then GREEN. Verification: evaluation 109 passed; compatibility
+slice 363 passed + 1 expected skip; full 601 passed + 6 expected skips; Ruff,
+scoped format, and diff check clean. No live provider call. Concern: 18/30 rows
+in the current private draft have blank company scopes and therefore cannot run
+through the intentionally concrete-company Phase 8C answer contract; Task 3
+rejects the batch before SQL/provider work. Upstream human/controller action is
+required before a full paid answer evaluation. Implementation commit pending
+review gate.

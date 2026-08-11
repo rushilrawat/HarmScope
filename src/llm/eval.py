@@ -22,7 +22,7 @@ from pathlib import Path
 from statistics import median
 
 from src.config import CONFIG, PATHS
-from src.llm import retrieve
+from src.llm import answer, retrieve
 from src.population import EXPANDED_SELECT_SQL
 
 CATEGORY_ORDER = (
@@ -183,6 +183,146 @@ class EvaluationSummary:
                 f"{question.fused.recall_at_10:.6f}/{question.fused.reciprocal_rank:.6f} | "
                 f"{dense_relation} | {bm25_relation}"
             )
+        return "\n".join(lines)
+
+
+def _grounded_claims(value: object) -> tuple[answer.Claim, ...]:
+    if not isinstance(value, answer.GroundedAnswer):
+        raise TypeError("answer must be a GroundedAnswer")
+    if type(value.claims) is not tuple or any(
+        not isinstance(claim, answer.Claim) for claim in value.claims
+    ):
+        raise TypeError("GroundedAnswer claims must be a tuple of Claim values")
+    if type(value.insufficient_evidence) is not bool:
+        raise TypeError("insufficient_evidence must be a boolean")
+    return value.claims
+
+
+def citation_validity(value: answer.GroundedAnswer, retrieved_ids: set[int]) -> bool:
+    """Return whether every claim has unique, positive, in-scope citations."""
+    claims = _grounded_claims(value)
+    if type(retrieved_ids) is not set:
+        raise TypeError("retrieved_ids must be a set")
+    _positive_complaint_ids(retrieved_ids, "retrieved_ids")
+    for claim in claims:
+        complaint_ids = claim.complaint_ids
+        if (
+            type(complaint_ids) is not tuple
+            or not complaint_ids
+            or any(
+                type(complaint_id) is not int or complaint_id <= 0 for complaint_id in complaint_ids
+            )
+            or len(complaint_ids) != len(set(complaint_ids))
+            or any(complaint_id not in retrieved_ids for complaint_id in complaint_ids)
+        ):
+            return False
+    return True
+
+
+def citation_coverage(value: answer.GroundedAnswer) -> float:
+    """Return the share of claims carrying at least one citation."""
+    claims = _grounded_claims(value)
+    if not claims:
+        return 1.0 if value.insufficient_evidence else 0.0
+    cited = 0
+    for claim in claims:
+        complaint_ids = claim.complaint_ids
+        if type(complaint_ids) is tuple and complaint_ids:
+            cited += 1
+    return cited / len(claims)
+
+
+def abstention_correct(answerable: bool, insufficient_evidence: bool) -> bool:
+    """Return whether the answer's abstention state matches benchmark answerability."""
+    if type(answerable) is not bool or type(insufficient_evidence) is not bool:
+        raise TypeError("answerable and insufficient_evidence must be booleans")
+    return answerable != insufficient_evidence
+
+
+@dataclass(frozen=True)
+class AnswerQuestionEvaluation:
+    question_id: str
+    citation_valid: bool
+    citation_coverage: float
+    abstention_correct: bool
+
+
+@dataclass(frozen=True)
+class AnswerEvaluationFailure:
+    question_id: str
+    category: str
+
+
+@dataclass(frozen=True)
+class AnswerEvaluationSummary:
+    attempted_count: int
+    completed_count: int
+    citation_valid_count: int
+    citation_validity_rate: float
+    citation_coverage: float
+    abstention_correct_count: int
+    abstention_accuracy: float
+    input_tokens: int
+    output_tokens: int
+    cache_read_input_tokens: int
+    cache_creation_input_tokens: int
+    total_latency_seconds: float
+    estimated_cost_usd: float
+    cache_hits: int
+    cache_misses: int
+    cache_bypasses: int
+    outcome_ok: int
+    outcome_refused: int
+    outcome_failed: int
+    outcome_skipped: int
+    questions: tuple[AnswerQuestionEvaluation, ...]
+    failures: tuple[AnswerEvaluationFailure, ...]
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failures)
+
+    def render(self) -> str:
+        """Render stable aggregate and ID-only per-question answer results."""
+        lines = [
+            "RAG answer evaluation",
+            f"attempted: {self.attempted_count}",
+            f"completed: {self.completed_count}",
+            f"failed: {self.failed_count}",
+            "citation validity: "
+            f"{self.citation_valid_count}/{self.completed_count} "
+            f"({self.citation_validity_rate:.6f})",
+            f"citation coverage: {self.citation_coverage:.6f}",
+            "abstention accuracy: "
+            f"{self.abstention_correct_count}/{self.completed_count} "
+            f"({self.abstention_accuracy:.6f})",
+            f"input tokens: {self.input_tokens}",
+            f"output tokens: {self.output_tokens}",
+            f"prompt cache read tokens: {self.cache_read_input_tokens}",
+            f"prompt cache creation tokens: {self.cache_creation_input_tokens}",
+            f"total answer latency (s): {self.total_latency_seconds:.6f}",
+            f"estimated cost (USD): {self.estimated_cost_usd:.6f}",
+            f"cache hit/miss/bypass: {self.cache_hits}/{self.cache_misses}/{self.cache_bypasses}",
+            "outcome ok/refused/failed/skipped: "
+            f"{self.outcome_ok}/{self.outcome_refused}/"
+            f"{self.outcome_failed}/{self.outcome_skipped}",
+            "question_id | citation valid | citation coverage | abstention correct",
+        ]
+        for question in sorted(self.questions, key=lambda row: row.question_id):
+            lines.append(
+                f"{question.question_id} | "
+                f"{'yes' if question.citation_valid else 'no'} | "
+                f"{question.citation_coverage:.6f} | "
+                f"{'yes' if question.abstention_correct else 'no'}"
+            )
+        lines.append("failed question_id | category")
+        if self.failures:
+            lines.extend(
+                f"{failure.question_id} | {failure.category}"
+                for failure in sorted(self.failures, key=lambda row: row.question_id)
+            )
+        else:
+            lines.append("(none)")
         return "\n".join(lines)
 
 
@@ -489,6 +629,250 @@ def run_retrieval_eval(
             )
         )
     return _summarize_retrieval(evaluated)
+
+
+def _validate_answer_batch(
+    questions: list[EvalQuestion],
+    embed_model: str,
+    eval_run_id: str,
+    answerer,
+) -> None:
+    _validate_retrieval_batch(questions, embed_model, eval_run_id)
+    if not callable(answerer):
+        raise TypeError("answerer must be callable")
+    for question in questions:
+        if type(question.question) is not str or not question.question.strip():
+            raise ValueError("evaluation question text must be nonblank")
+        if type(question.cluster_id) is not str or not _SAFE_ID.fullmatch(question.cluster_id):
+            raise ValueError("cluster_id must be a safe non-blank identifier")
+        if type(question.company_id) is not str or not _SAFE_ID.fullmatch(question.company_id):
+            raise ValueError("answer evaluation requires a concrete safe non-blank company_id")
+        if question.category not in CATEGORIES:
+            raise ValueError("evaluation question category is invalid")
+        if type(question.answerable) is not bool:
+            raise TypeError("evaluation question answerable must be a boolean")
+        if (question.category == "unanswerable") != (not question.answerable):
+            raise ValueError("evaluation question category and answerable state disagree")
+        if type(question.relevant_complaint_ids) is not frozenset:
+            raise TypeError("relevant_complaint_ids must be a frozenset")
+        _positive_complaint_ids(
+            question.relevant_complaint_ids,
+            "relevant_complaint_ids",
+        )
+
+
+def _require_fused_rows(con, questions: list[EvalQuestion], eval_run_id: str) -> None:
+    present = {
+        question_id
+        for (question_id,) in con.execute(
+            "SELECT question_id FROM rag_eval_results "
+            "WHERE eval_run_id = ? AND retrieval_method = 'fused'",
+            [eval_run_id],
+        ).fetchall()
+    }
+    missing = sorted(
+        question.question_id for question in questions if question.question_id not in present
+    )
+    if missing:
+        raise ValueError("fused retrieval rows are missing for question IDs: " + ", ".join(missing))
+
+
+def _returned_evidence_ids(
+    result: object,
+    question: EvalQuestion,
+) -> set[int]:
+    if type(result) is not answer.AnswerResult:
+        raise TypeError("answerer must return an AnswerResult")
+    evidence = result.evidence
+    if type(evidence) is not tuple or any(
+        type(row) is not retrieve.RetrievedEvidence for row in evidence
+    ):
+        raise ValueError("answer evidence must be a tuple of RetrievedEvidence values")
+    complaint_ids = [row.complaint_id for row in evidence]
+    if any(type(complaint_id) is not int or complaint_id <= 0 for complaint_id in complaint_ids):
+        raise ValueError("answer evidence complaint IDs must be positive integers")
+    if len(complaint_ids) != len(set(complaint_ids)):
+        raise ValueError("answer evidence complaint IDs must be unique")
+    if any(row.cluster_id != question.cluster_id for row in evidence):
+        raise ValueError("answer evidence cluster scope does not match the question")
+    if any(row.company_id != question.company_id for row in evidence):
+        raise ValueError("answer evidence company scope does not match the question")
+    return set(complaint_ids)
+
+
+def _write_answer_metrics(
+    con,
+    eval_run_id: str,
+    metrics: AnswerQuestionEvaluation,
+) -> None:
+    con.execute("BEGIN TRANSACTION")
+    try:
+        con.execute(
+            "UPDATE rag_eval_results SET citation_valid = ?, citation_coverage = ?, "
+            "abstention_correct = ? WHERE eval_run_id = ? AND question_id = ? "
+            "AND retrieval_method = 'fused'",
+            [
+                metrics.citation_valid,
+                metrics.citation_coverage,
+                metrics.abstention_correct,
+                eval_run_id,
+                metrics.question_id,
+            ],
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+
+
+def _usage_nonnegative_integer(value: object, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"answer usage {field} must be a non-negative integer")
+    return value
+
+
+def _usage_nonnegative_number(value: object, field: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(f"answer usage {field} must be a finite non-negative number")
+    return float(value)
+
+
+def _answer_usage(con, eval_run_id: str) -> dict[str, object]:
+    rows = con.execute(
+        "SELECT cache_status, outcome, input_tokens, output_tokens, "
+        "cache_read_input_tokens, cache_creation_input_tokens, latency_seconds, "
+        "estimated_cost_usd FROM llm_usage "
+        "WHERE run_id = ? AND operation = 'answer' ORDER BY usage_id",
+        [eval_run_id],
+    ).fetchall()
+    cache_counts: Counter[str] = Counter()
+    outcome_counts: Counter[str] = Counter()
+    input_tokens = 0
+    output_tokens = 0
+    cache_read_input_tokens = 0
+    cache_creation_input_tokens = 0
+    latencies: list[float] = []
+    costs: list[float] = []
+    for row in rows:
+        cache_status, outcome, raw_input, raw_output, raw_read, raw_creation, latency, cost = row
+        if cache_status not in {"hit", "miss", "bypass"}:
+            raise ValueError("answer usage cache_status is invalid")
+        if outcome not in {"ok", "refused", "failed", "skipped"}:
+            raise ValueError("answer usage outcome is invalid")
+        cache_counts[cache_status] += 1
+        outcome_counts[outcome] += 1
+        input_tokens += _usage_nonnegative_integer(raw_input, "input_tokens")
+        output_tokens += _usage_nonnegative_integer(raw_output, "output_tokens")
+        cache_read_input_tokens += _usage_nonnegative_integer(raw_read, "cache_read_input_tokens")
+        cache_creation_input_tokens += _usage_nonnegative_integer(
+            raw_creation, "cache_creation_input_tokens"
+        )
+        latencies.append(_usage_nonnegative_number(latency, "latency_seconds"))
+        costs.append(_usage_nonnegative_number(cost, "estimated_cost_usd"))
+    total_latency = math.fsum(latencies)
+    estimated_cost = math.fsum(costs)
+    if not math.isfinite(total_latency) or not math.isfinite(estimated_cost):
+        raise ValueError("answer usage aggregate must be finite")
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "total_latency_seconds": total_latency,
+        "estimated_cost_usd": estimated_cost,
+        "cache_hits": cache_counts["hit"],
+        "cache_misses": cache_counts["miss"],
+        "cache_bypasses": cache_counts["bypass"],
+        "outcome_ok": outcome_counts["ok"],
+        "outcome_refused": outcome_counts["refused"],
+        "outcome_failed": outcome_counts["failed"],
+        "outcome_skipped": outcome_counts["skipped"],
+    }
+
+
+def _summarize_answers(
+    attempted_count: int,
+    evaluated: list[AnswerQuestionEvaluation],
+    failures: list[AnswerEvaluationFailure],
+    usage: dict[str, object],
+) -> AnswerEvaluationSummary:
+    completed = len(evaluated)
+    valid_count = sum(question.citation_valid for question in evaluated)
+    abstention_count = sum(question.abstention_correct for question in evaluated)
+    return AnswerEvaluationSummary(
+        attempted_count=attempted_count,
+        completed_count=completed,
+        citation_valid_count=valid_count,
+        citation_validity_rate=valid_count / completed if completed else 0.0,
+        citation_coverage=(
+            math.fsum(question.citation_coverage for question in evaluated) / completed
+            if completed
+            else 0.0
+        ),
+        abstention_correct_count=abstention_count,
+        abstention_accuracy=abstention_count / completed if completed else 0.0,
+        questions=tuple(evaluated),
+        failures=tuple(failures),
+        **usage,
+    )
+
+
+def run_answer_eval(
+    con,
+    questions: list[EvalQuestion],
+    embed_model: str,
+    eval_run_id: str,
+    answerer=answer.answer_question,
+) -> AnswerEvaluationSummary:
+    """Evaluate grounded answers against existing fused retrieval results."""
+    _validate_answer_batch(questions, embed_model, eval_run_id, answerer)
+    _require_autocommit(con)
+    _require_fused_rows(con, questions, eval_run_id)
+    evaluated: list[AnswerQuestionEvaluation] = []
+    failures: list[AnswerEvaluationFailure] = []
+    for question in questions:
+        try:
+            result = answerer(
+                con,
+                question.cluster_id,
+                question.company_id,
+                question.question,
+                embed_model,
+                run_id=eval_run_id,
+            )
+        except answer.CitationError:
+            failures.append(AnswerEvaluationFailure(question.question_id, "citation"))
+            continue
+        except answer.AnswerSchemaError:
+            failures.append(AnswerEvaluationFailure(question.question_id, "schema"))
+            continue
+        except answer.AnswerRefusalError:
+            failures.append(AnswerEvaluationFailure(question.question_id, "refusal"))
+            continue
+
+        retrieved_ids = _returned_evidence_ids(result, question)
+        metrics = AnswerQuestionEvaluation(
+            question_id=question.question_id,
+            citation_valid=citation_validity(result.answer, retrieved_ids),
+            citation_coverage=citation_coverage(result.answer),
+            abstention_correct=abstention_correct(
+                question.answerable,
+                result.answer.insufficient_evidence,
+            ),
+        )
+        _write_answer_metrics(con, eval_run_id, metrics)
+        evaluated.append(metrics)
+    return _summarize_answers(
+        len(questions),
+        evaluated,
+        failures,
+        _answer_usage(con, eval_run_id),
+    )
 
 
 def _required(value: str | None, field: str, line_number: int) -> str:
