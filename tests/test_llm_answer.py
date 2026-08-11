@@ -1893,6 +1893,54 @@ def test_paid_usage_outbox_is_fsynced_atomic_and_privacy_safe(
     }
 
 
+def test_usage_outbox_retry_repairs_failed_parent_directory_fsync(monkeypatch):
+    outbox = answer.PATHS.llm_cache / "usage_outbox"
+    record = answer._usage_record(
+        run_id=None,
+        cluster_id="0000000000001-abcdef01:mortgage:3",
+        question_digest="a" * 64,
+        model="model",
+        prompt_version="prompt-v1",
+        input_digest="b" * 64,
+        cache_status="miss",
+        outcome="ok",
+        result=model_result(),
+    )
+    opened_paths = {}
+    fsynced_paths = []
+    real_open = os.open
+    real_fsync = os.fsync
+
+    def recording_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        opened_paths[descriptor] = Path(path)
+        return descriptor
+
+    def fail_first_parent_fsync(fd):
+        path = opened_paths.get(fd)
+        if path is not None:
+            fsynced_paths.append(path)
+        if path == outbox.parent and fsynced_paths.count(outbox.parent) == 1:
+            raise OSError("parent fsync failed")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "fsync", fail_first_parent_fsync)
+
+    with pytest.raises(OSError, match="parent fsync failed"):
+        answer._stage_usage_record(record)
+
+    assert outbox.is_dir()
+    assert list(outbox.iterdir()) == []
+
+    staged = answer._stage_usage_record(record)
+
+    assert staged == outbox / f"{record.usage_id}.json"
+    assert staged.exists()
+    assert fsynced_paths.count(outbox.parent) == 2
+    assert outbox in fsynced_paths
+
+
 def test_outbox_replay_is_idempotent_after_commit_before_file_removal(
     answer_fixture,
     monkeypatch,

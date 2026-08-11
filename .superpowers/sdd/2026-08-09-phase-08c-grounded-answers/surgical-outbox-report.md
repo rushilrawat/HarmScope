@@ -41,10 +41,11 @@ Result: `5 passed` (exit 0).
   rejected without insert, unlink, commit, or rollback, and remains usable by
   the caller. In autocommit mode, DuckDB commits `_record_usage` when its
   statement completes, before staged-file removal.
-- `_stage_usage_record` distinguishes first directory creation from an existing
-  directory. The creation branch fsyncs `directory.parent` immediately after
-  `mkdir`, while the existing temp-file fsync, atomic replace, outbox-directory
-  fsync, and removal-directory fsync remain unchanged.
+- `_stage_usage_record` establishes that the outbox path is a directory and
+  fsyncs `directory.parent` before opening an event file. Repeating the parent
+  sync for an existing directory repairs a failed first sync and closes the
+  concurrent-creator window, while the existing temp-file fsync, atomic replace,
+  outbox-directory fsync, and removal-directory fsync remain unchanged.
 - Behavioral tests cover both caller COMMIT and ROLLBACK, rejection before a
   malformed event is read, replay database-failure retention, first-use parent
   and child directory fsync attribution, and the pre-existing successful
@@ -83,4 +84,49 @@ formatted; `git diff --check` produced no findings.
   malformed outbox cannot bypass transaction ownership enforcement.
 - Insert failure still propagates before removal, retaining the staged event.
   `usage_id` conflict handling remains unchanged, so replay stays idempotent.
-- No open implementation concerns.
+- The initial self-review did not identify the failed-parent-fsync recovery
+  window corrected in Fix round 1 below.
+
+## Fix round 1 — failed parent-fsync recovery
+
+Reviewer finding: the initial implementation synced the parent only in the
+successful `mkdir` branch. If that fsync raised after creating the directory,
+the empty directory remained; a retry took the `FileExistsError` branch and
+staged an event without retrying the parent sync. A concurrent creator could
+enter the same existing-directory path before the creator completed its sync.
+
+RED regression:
+
+```text
+.venv/bin/pytest -q tests/test_llm_answer.py -k 'retry_repairs_failed_parent_directory_fsync'
+```
+
+Result: failed because the retry staged its event while the recorded parent
+fsync count remained `1`, not `2`.
+
+Fix: move `_fsync_directory(directory.parent)` after the directory
+existence/type branch so every staging attempt performs it before opening or
+writing the event.
+
+GREEN and verification:
+
+```text
+.venv/bin/pytest -q tests/test_llm_answer.py -k 'retry_repairs_failed_parent_directory_fsync'
+# 1 passed
+.venv/bin/pytest tests/test_llm_answer.py -k 'usage_outbox or paid_usage_outbox or outbox_replay' -ra
+# 7 passed, 105 deselected
+.venv/bin/pytest tests/test_llm_answer.py tests/test_llm_client.py -ra
+# 122 passed in 2.17s
+.venv/bin/pytest -ra
+# 492 passed, 5 skipped in 24.10s
+.venv/bin/ruff check .
+# All checks passed!
+.venv/bin/ruff format --check src/llm/answer.py tests/test_llm_answer.py
+# 2 files already formatted
+git diff --check
+# no findings
+```
+
+The five skips remain the pre-existing leakage checks that require a real
+database. Transaction rejection, privacy, idempotence, and failure retention
+remain covered and unchanged.

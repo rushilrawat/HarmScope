@@ -18,3 +18,4 @@ Residual Important (BLOCKING): `drain_usage_outbox` can insert and unlink inside
 Residual Minor (parkable): claim duplicate normalization does not canonicalize Unicode or zero-width variants; all variants remain complaint-cited.
 Phase 8C completion gate: BLOCKED at 76cf81b by durable paid-accounting residual. Per the one-final-fix-wave breaker, do not start Phase 8D without human authorization for a surgical exception.
 Surgical exception: AUTHORIZED by the user on 2026-08-11, limited to transaction-safe outbox draining and first-use parent-directory fsync. Baseline remains 76cf81b.
+Surgical exception: fix round 1/5 — reviewer residual addressed by retrying parent-directory fsync for every established outbox directory before event creation; regression covers failed first sync and existing-directory retry; 492 passed, 5 expected skips; Ruff/format/diff clean; follow-up commit contains this ledger entry.

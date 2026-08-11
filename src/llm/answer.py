@@ -788,8 +788,7 @@ def _stage_usage_record(
     except FileExistsError:
         if not directory.is_dir():
             raise
-    else:
-        _fsync_directory(directory.parent)
+    _fsync_directory(directory.parent)
     target = directory / f"{record.usage_id}.json"
     temporary_path: Path | None = None
     try:
