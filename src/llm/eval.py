@@ -258,10 +258,10 @@ class AnswerEvaluationSummary:
     attempted_count: int
     completed_count: int
     citation_valid_count: int
-    citation_validity_rate: float
-    citation_coverage: float
+    citation_validity_rate: float | None
+    citation_coverage: float | None
     abstention_correct_count: int
-    abstention_accuracy: float
+    abstention_accuracy: float | None
     input_tokens: int
     output_tokens: int
     cache_read_input_tokens: int
@@ -289,13 +289,25 @@ class AnswerEvaluationSummary:
             f"attempted: {self.attempted_count}",
             f"completed: {self.completed_count}",
             f"failed: {self.failed_count}",
-            "citation validity: "
-            f"{self.citation_valid_count}/{self.completed_count} "
-            f"({self.citation_validity_rate:.6f})",
-            f"citation coverage: {self.citation_coverage:.6f}",
-            "abstention accuracy: "
-            f"{self.abstention_correct_count}/{self.completed_count} "
-            f"({self.abstention_accuracy:.6f})",
+            (
+                "citation validity: n/a"
+                if self.citation_validity_rate is None
+                else "citation validity: "
+                f"{self.citation_valid_count}/{self.completed_count} "
+                f"({self.citation_validity_rate:.6f})"
+            ),
+            (
+                "citation coverage: n/a"
+                if self.citation_coverage is None
+                else f"citation coverage: {self.citation_coverage:.6f}"
+            ),
+            (
+                "abstention accuracy: n/a"
+                if self.abstention_accuracy is None
+                else "abstention accuracy: "
+                f"{self.abstention_correct_count}/{self.completed_count} "
+                f"({self.abstention_accuracy:.6f})"
+            ),
             f"input tokens: {self.input_tokens}",
             f"output tokens: {self.output_tokens}",
             f"prompt cache read tokens: {self.cache_read_input_tokens}",
@@ -677,9 +689,34 @@ def _require_fused_rows(con, questions: list[EvalQuestion], eval_run_id: str) ->
         raise ValueError("fused retrieval rows are missing for question IDs: " + ", ".join(missing))
 
 
+def _retrievable_answer_scopes(
+    con,
+    questions: list[EvalQuestion],
+    embed_model: str,
+) -> dict[tuple[str, str], tuple[str, frozenset[int]]]:
+    scopes: dict[tuple[str, str], tuple[str, frozenset[int]]] = {}
+    keys = sorted({(question.cluster_id, question.company_id) for question in questions})
+    for cluster_id, company_id in keys:
+        corpus = retrieve.load_corpus(con, cluster_id, company_id, embed_model)
+        if corpus.cluster_id != cluster_id or corpus.company_id != company_id:
+            raise ValueError("retrievable answer corpus scope does not match the question")
+        product_families = {row.product_family for row in corpus.rows}
+        if len(product_families) != 1:
+            raise ValueError("retrievable answer corpus has inconsistent product families")
+        complaint_ids = frozenset(row.complaint_id for row in corpus.rows)
+        if len(complaint_ids) != len(corpus.rows) or any(
+            type(complaint_id) is not int or complaint_id <= 0 for complaint_id in complaint_ids
+        ):
+            raise ValueError("retrievable answer corpus has invalid complaint IDs")
+        scopes[(cluster_id, company_id)] = (product_families.pop(), complaint_ids)
+    return scopes
+
+
 def _returned_evidence_ids(
     result: object,
     question: EvalQuestion,
+    product_family: str,
+    retrievable_ids: frozenset[int],
 ) -> set[int]:
     if type(result) is not answer.AnswerResult:
         raise TypeError("answerer must return an AnswerResult")
@@ -688,15 +725,20 @@ def _returned_evidence_ids(
         type(row) is not retrieve.RetrievedEvidence for row in evidence
     ):
         raise ValueError("answer evidence must be a tuple of RetrievedEvidence values")
-    complaint_ids = [row.complaint_id for row in evidence]
+    # Keep evaluation aligned with the reviewed Phase 8C evidence boundary
+    # instead of maintaining a second, inevitably drifting validation copy.
+    validated = answer._validate_retrieved_evidence(
+        list(evidence),
+        cluster_id=question.cluster_id,
+        company_id=question.company_id,
+        product_family=product_family,
+        top_k=CONFIG.llm.rag_top_k,
+    )
+    complaint_ids = [row.complaint_id for row in validated]
     if any(type(complaint_id) is not int or complaint_id <= 0 for complaint_id in complaint_ids):
         raise ValueError("answer evidence complaint IDs must be positive integers")
-    if len(complaint_ids) != len(set(complaint_ids)):
-        raise ValueError("answer evidence complaint IDs must be unique")
-    if any(row.cluster_id != question.cluster_id for row in evidence):
-        raise ValueError("answer evidence cluster scope does not match the question")
-    if any(row.company_id != question.company_id for row in evidence):
-        raise ValueError("answer evidence company scope does not match the question")
+    if not set(complaint_ids).issubset(retrievable_ids):
+        raise ValueError("answer evidence IDs are outside the exact retrievable scope")
     return set(complaint_ids)
 
 
@@ -808,14 +850,14 @@ def _summarize_answers(
         attempted_count=attempted_count,
         completed_count=completed,
         citation_valid_count=valid_count,
-        citation_validity_rate=valid_count / completed if completed else 0.0,
+        citation_validity_rate=valid_count / completed if completed else None,
         citation_coverage=(
             math.fsum(question.citation_coverage for question in evaluated) / completed
             if completed
-            else 0.0
+            else None
         ),
         abstention_correct_count=abstention_count,
-        abstention_accuracy=abstention_count / completed if completed else 0.0,
+        abstention_accuracy=abstention_count / completed if completed else None,
         questions=tuple(evaluated),
         failures=tuple(failures),
         **usage,
@@ -833,6 +875,7 @@ def run_answer_eval(
     _validate_answer_batch(questions, embed_model, eval_run_id, answerer)
     _require_autocommit(con)
     _require_fused_rows(con, questions, eval_run_id)
+    retrievable_scopes = _retrievable_answer_scopes(con, questions, embed_model)
     evaluated: list[AnswerQuestionEvaluation] = []
     failures: list[AnswerEvaluationFailure] = []
     for question in questions:
@@ -855,7 +898,15 @@ def run_answer_eval(
             failures.append(AnswerEvaluationFailure(question.question_id, "refusal"))
             continue
 
-        retrieved_ids = _returned_evidence_ids(result, question)
+        product_family, retrievable_ids = retrievable_scopes[
+            (question.cluster_id, question.company_id)
+        ]
+        retrieved_ids = _returned_evidence_ids(
+            result,
+            question,
+            product_family,
+            retrievable_ids,
+        )
         metrics = AnswerQuestionEvaluation(
             question_id=question.question_id,
             citation_valid=citation_validity(result.answer, retrieved_ids),

@@ -1248,6 +1248,81 @@ def _seed_retrieval_rows(
     eval_run_id: str,
     questions: list[llm_eval.EvalQuestion],
 ) -> None:
+    dedup_run = "0000000000098-evalded1"
+    cluster_run = "0000000000099-evalrun1"
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'dedup', 'test', 'test', '{}', now(), 'ok') "
+        "ON CONFLICT (run_id) DO NOTHING",
+        [dedup_run],
+    )
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'cluster', 'test', 'test', ?, now(), 'ok') "
+        "ON CONFLICT (run_id) DO NOTHING",
+        [
+            cluster_run,
+            json.dumps(
+                {
+                    "params": {
+                        "dedup_run": dedup_run,
+                        "model": "embed-m",
+                        "cutoff": "",
+                    }
+                }
+            ),
+        ],
+    )
+    con.execute(
+        "INSERT INTO company_canonical "
+        "(company_id, canonical_name, verified_by) "
+        "VALUES ('company-1', 'Private company name', 'manual') "
+        "ON CONFLICT (company_id) DO NOTHING"
+    )
+    complaint_ids = range(10, 11 + llm_eval.CONFIG.llm.rag_top_k)
+    for row_idx, complaint_id in enumerate(complaint_ids):
+        con.execute(
+            "INSERT INTO complaints "
+            "(complaint_id, date_received, period_month, company_id, "
+            "product_family, has_narrative) VALUES (?, ?, ?, 'company-1', "
+            "'family-1', true) ON CONFLICT (complaint_id) DO NOTHING",
+            [complaint_id, date(2020, 1, 2), date(2020, 1, 1)],
+        )
+        con.execute(
+            "INSERT INTO narratives "
+            "(complaint_id, text_redacted, text_hash, redaction_count) "
+            "VALUES (?, ?, ?, 0) ON CONFLICT (complaint_id) DO NOTHING",
+            [complaint_id, _token_text(f"eval{complaint_id}x"), f"eval-hash-{complaint_id}"],
+        )
+        con.execute(
+            "INSERT INTO embedding_map (complaint_id, row_idx, model, dim) "
+            "VALUES (?, ?, 'embed-m', 2) ON CONFLICT (complaint_id, model) DO NOTHING",
+            [complaint_id, row_idx],
+        )
+        con.execute(
+            "INSERT INTO dup_groups "
+            "(run_id, complaint_id, group_id, is_representative, group_size, as_of) "
+            "VALUES (?, ?, ?, true, 1, ?) ON CONFLICT (run_id, complaint_id) DO NOTHING",
+            [dedup_run, complaint_id, f"eval-group-{complaint_id}", date(2020, 1, 2)],
+        )
+    for cluster_id in sorted({question.cluster_id for question in questions}):
+        con.execute(
+            "INSERT INTO clusters "
+            "(cluster_id, run_id, product_family, n_members, as_of) "
+            "VALUES (?, ?, 'family-1', ?, ?) ON CONFLICT (cluster_id) DO NOTHING",
+            [
+                cluster_id,
+                cluster_run,
+                len(complaint_ids),
+                date(2020, 1, 1),
+            ],
+        )
+        for complaint_id in complaint_ids:
+            con.execute(
+                "INSERT INTO cluster_members (cluster_id, complaint_id) VALUES (?, ?) "
+                "ON CONFLICT (cluster_id, complaint_id) DO NOTHING",
+                [cluster_id, complaint_id],
+            )
     for question in questions:
         for method in ("dense", "bm25", "fused"):
             con.execute(
@@ -1541,6 +1616,88 @@ def test_answer_eval_continues_only_typed_per_question_failures_and_keeps_nulls(
     assert questions[0].question not in rendered
 
 
+def test_all_failed_answer_eval_reports_unavailable_aggregates_as_na(con):
+    questions = [_retrieval_question("rag-001"), _retrieval_question("rag-002")]
+    _seed_retrieval_rows(con, "eval-all-failed", questions)
+    answerer = _Answerer(
+        {
+            questions[0].question: answer.AnswerSchemaError("private schema prose"),
+            questions[1].question: answer.CitationError("private citation prose"),
+        }
+    )
+
+    summary = llm_eval.run_answer_eval(
+        con,
+        questions,
+        "embed-m",
+        "eval-all-failed",
+        answerer=answerer,
+    )
+
+    assert summary.completed_count == 0
+    assert summary.failed_count == 2
+    assert summary.citation_validity_rate is None
+    assert summary.citation_coverage is None
+    assert summary.abstention_accuracy is None
+    rendered = summary.render()
+    assert "citation validity: n/a" in rendered
+    assert "citation coverage: n/a" in rendered
+    assert "abstention accuracy: n/a" in rendered
+    assert "citation validity: 0/0" not in rendered
+
+
+def test_mixed_answer_eval_preserves_measured_numeric_zero(con):
+    completed = _retrieval_question(
+        "rag-001",
+        relevant_ids=frozenset(),
+        answerable=False,
+    )
+    failed = _retrieval_question("rag-002")
+    questions = [completed, failed]
+    _seed_retrieval_rows(con, "eval-mixed-zero", questions)
+    uncited_nonabstention = _grounded_answer(
+        claims=(answer.Claim("Consumers allege a problem.", ()),),
+        insufficient_evidence=False,
+    )
+    answerer = _Answerer(
+        {
+            completed.question: _answer_result(
+                completed,
+                grounded=uncited_nonabstention,
+            ),
+            failed.question: answer.AnswerRefusalError(
+                answer.ModelCallResult(
+                    payload={"refused": True, "stop_reason": "refusal"},
+                    model="private-model",
+                    stop_reason="refusal",
+                    usage=TokenUsage(),
+                    attempts=1,
+                    latency_seconds=0.0,
+                    estimated_cost_usd=0.0,
+                )
+            ),
+        }
+    )
+
+    summary = llm_eval.run_answer_eval(
+        con,
+        questions,
+        "embed-m",
+        "eval-mixed-zero",
+        answerer=answerer,
+    )
+
+    assert summary.completed_count == 1
+    assert summary.failed_count == 1
+    assert summary.citation_validity_rate == 0.0
+    assert summary.citation_coverage == 0.0
+    assert summary.abstention_accuracy == 0.0
+    rendered = summary.render()
+    assert "citation validity: 0/1 (0.000000)" in rendered
+    assert "citation coverage: 0.000000" in rendered
+    assert "abstention accuracy: 0/1 (0.000000)" in rendered
+
+
 def test_answer_eval_terminal_provider_error_stops_and_preserves_prior_question(con):
     questions = [_retrieval_question(f"rag-{index:03d}") for index in range(1, 4)]
     _seed_retrieval_rows(con, "eval-terminal", questions)
@@ -1640,7 +1797,10 @@ def test_answer_eval_rejects_caller_transaction_without_altering_it(con, resolut
     assert con.execute("SELECT value FROM caller_answer_work").fetchall() == expected
 
 
-@pytest.mark.parametrize("malformation", ["wrong-cluster", "wrong-company", "duplicate-id"])
+@pytest.mark.parametrize(
+    "malformation",
+    ["wrong-cluster", "wrong-company", "wrong-product", "duplicate-id"],
+)
 def test_answer_eval_rejects_returned_evidence_outside_exact_scope(con, malformation):
     question = _retrieval_question("rag-001")
     _seed_retrieval_rows(con, "eval-evidence", [question])
@@ -1649,6 +1809,8 @@ def test_answer_eval_rejects_returned_evidence_outside_exact_scope(con, malforma
         cluster_id="other-cluster" if malformation == "wrong-cluster" else None,
         company_id="other-company" if malformation == "wrong-company" else None,
     )
+    if malformation == "wrong-product":
+        first = replace(first, product_family="forged-family")
     rows = (first, first) if malformation == "duplicate-id" else (first,)
     answerer = _Answerer({question.question: _answer_result(question, evidence_rows=rows)})
 
@@ -1658,6 +1820,122 @@ def test_answer_eval_rejects_returned_evidence_outside_exact_scope(con, malforma
     assert con.execute(
         "SELECT citation_valid, citation_coverage, abstention_correct "
         "FROM rag_eval_results WHERE eval_run_id = 'eval-evidence' "
+        "AND retrieval_method = 'fused'"
+    ).fetchone() == (None, None, None)
+
+
+def _structural_evidence(
+    question: llm_eval.EvalQuestion,
+    count: int = 2,
+) -> tuple[retrieve.RetrievedEvidence, ...]:
+    return tuple(
+        replace(
+            _answer_evidence(question, complaint_id=10 + index),
+            dense_rank=index + 1,
+            dense_score=1.0 / (index + 1),
+            sparse_rank=index + 1,
+            sparse_score=0.5 / (index + 1),
+            fused_score=0.1 / (index + 1),
+        )
+        for index in range(count)
+    )
+
+
+@pytest.mark.parametrize(
+    ("malformation", "match"),
+    [
+        ("too-many", "rag_top_k"),
+        ("ascending-fused", "sorted"),
+        ("tie-id-order", "sorted"),
+        ("nonfinite-fused", "fused_score"),
+        ("nonfinite-dense", "dense_score"),
+        ("nonfinite-sparse", "sparse_score"),
+        ("unpaired-dense-rank", "dense_rank.*dense_score"),
+        ("unpaired-dense-score", "dense_rank.*dense_score"),
+        ("unpaired-sparse-rank", "sparse_rank.*sparse_score"),
+        ("unpaired-sparse-score", "sparse_rank.*sparse_score"),
+        ("nonpositive-dense-rank", "dense_rank.*positive"),
+        ("nonpositive-sparse-rank", "sparse_rank.*positive"),
+        ("duplicate-dense-rank", "dense_rank.*unique"),
+        ("duplicate-sparse-rank", "sparse_rank.*unique"),
+    ],
+)
+def test_answer_eval_enforces_complete_phase8c_evidence_structure(
+    con,
+    malformation,
+    match,
+):
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-structure", [question])
+    rows = _structural_evidence(question)
+    first, second = rows
+    if malformation == "too-many":
+        rows = _structural_evidence(question, llm_eval.CONFIG.llm.rag_top_k + 1)
+    elif malformation == "ascending-fused":
+        rows = (replace(first, fused_score=0.1), replace(second, fused_score=0.2))
+    elif malformation == "tie-id-order":
+        rows = (
+            replace(second, fused_score=0.1),
+            replace(first, fused_score=0.1),
+        )
+    elif malformation == "nonfinite-fused":
+        rows = (replace(first, fused_score=float("nan")), second)
+    elif malformation == "nonfinite-dense":
+        rows = (replace(first, dense_score=float("inf")), second)
+    elif malformation == "nonfinite-sparse":
+        rows = (replace(first, sparse_score=float("-inf")), second)
+    elif malformation == "unpaired-dense-rank":
+        rows = (replace(first, dense_score=None), second)
+    elif malformation == "unpaired-dense-score":
+        rows = (replace(first, dense_rank=None), second)
+    elif malformation == "unpaired-sparse-rank":
+        rows = (replace(first, sparse_score=None), second)
+    elif malformation == "unpaired-sparse-score":
+        rows = (replace(first, sparse_rank=None), second)
+    elif malformation == "nonpositive-dense-rank":
+        rows = (replace(first, dense_rank=0), second)
+    elif malformation == "nonpositive-sparse-rank":
+        rows = (replace(first, sparse_rank=0), second)
+    elif malformation == "duplicate-dense-rank":
+        rows = (first, replace(second, dense_rank=first.dense_rank))
+    else:
+        rows = (first, replace(second, sparse_rank=first.sparse_rank))
+    answerer = _Answerer({question.question: _answer_result(question, evidence_rows=rows)})
+
+    with pytest.raises(ValueError, match=match):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-structure",
+            answerer=answerer,
+        )
+
+    assert con.execute(
+        "SELECT citation_valid, citation_coverage, abstention_correct "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-structure' "
+        "AND retrieval_method = 'fused'"
+    ).fetchone() == (None, None, None)
+
+
+def test_answer_eval_rejects_structurally_valid_id_outside_retrievable_scope(con):
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-forged-id", [question])
+    forged = _answer_evidence(question, complaint_id=999_999)
+    answerer = _Answerer({question.question: _answer_result(question, evidence_rows=(forged,))})
+
+    with pytest.raises(ValueError, match="retrievable.*scope"):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-forged-id",
+            answerer=answerer,
+        )
+
+    assert con.execute(
+        "SELECT citation_valid, citation_coverage, abstention_correct "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-forged-id' "
         "AND retrieval_method = 'fused'"
     ).fetchone() == (None, None, None)
 

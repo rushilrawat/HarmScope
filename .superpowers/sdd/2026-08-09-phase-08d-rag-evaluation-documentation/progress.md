@@ -83,3 +83,17 @@ through the intentionally concrete-company Phase 8C answer contract; Task 3
 rejects the batch before SQL/provider work. Upstream human/controller action is
 required before a full paid answer evaluation. Implementation commit pending
 review gate.
+
+Task 3: fix round 1/5 — reproduced both Important reviewer findings plus the
+related forged-membership counterexample. Zero-completed answer aggregates are
+now unavailable (`None`) and render as deterministic `n/a`; batches with at
+least one completed answer preserve genuine numeric zero. Before any provider
+call, answer evaluation loads each exact retrievable cluster/company/model
+corpus, pins its product family and complaint-ID membership, and delegates all
+Phase 8C evidence-shape checks to the shared reviewed validator. Product
+forgeries, out-of-corpus IDs, overlong evidence, invalid ordering/scores, and
+invalid component ranks now fail without metric updates. GREEN: reviewer,
+mixed-zero, membership, and scope selection 21 passed; evaluation 127 passed;
+compatibility slice 381 passed + 1 expected skip; full 619 passed + 6 expected
+skips; Ruff, scoped format, and diff check clean. Replay semantics remain as
+reviewer-adjudicated; no live provider call or schema/answer/client edit.
