@@ -91,3 +91,75 @@ The following remain external prerequisites, not implementation passes:
 The ignored private authoring draft was neither committed nor treated as ground
 truth. Fake-client tests were not reported as model quality, and skipped
 real-data tests were not represented as passing external gates.
+
+## Fix round 1/5 — exact scored evidence reuse and pure import preflight
+
+The Task 5 review found two Important orchestration gaps and one Minor evidence
+wording error. The original full CLI scored one retrieval result and then let
+`answer_question` retrieve and query-encode a second time; import opened the
+database before it parsed the private artifact; and the engineering notes
+mislocated the 2026-08-07 insufficient-credit error at provider preflight.
+
+### RED evidence
+
+- The focused five-test regression selection failed 5/5 on `207ab7b`.
+- Evaluation rejected the requested `retain_results` and
+  `scored_retrievals` interfaces, demonstrating that no scored evidence crossed
+  the retrieval/answer boundary.
+- Full CLI orchestration did not request or forward retained retrieval results.
+- A malformed authoring header opened the database before raising, and its
+  invalid fake connection then masked the original `ManifestError` during close.
+- Replacing one valid authoring worklist with a different valid worklist during
+  `db.bootstrap()` silently imported the replacement instead of rejecting the
+  byte-identity change.
+- A subsequent two-test privacy-hardening RED showed that default dataclass
+  representations echoed private worklist bytes/questions and retrieved
+  narratives from the new in-memory carriers.
+
+### Fix
+
+- Full evaluation now asks `run_retrieval_eval` for a frozen
+  `RetrievalEvaluationRun`: the existing summary plus one immutable
+  `ScoredRetrieval(question_id, RetrievalResult)` per question. Retrieval-only
+  retains the original summary-only path and never retains or forwards answer
+  evidence.
+- Before any answer/provider work, answer evaluation requires exact question-ID
+  coverage, revalidates component rankings and configured RRF, compares the
+  carried corpus to the exact live cluster/company/model corpus, reconstructs
+  the fused evidence from that corpus, and compares all three metric/latency rows
+  to the same evaluation run's persisted identity. Omission, mutation, live
+  corpus forgery, or persisted-metric tampering fails closed.
+- The default Phase 8C answerer receives a fresh list copy of the exact carried
+  fused tuple through its existing `retriever` dependency. Its full evidence,
+  cache, schema, citation, usage, and outbox validators remain unchanged. The
+  returned `AnswerResult.evidence` must still equal the scored fused tuple, so a
+  custom caller cannot answer from a silently dropped subset.
+- `prepare_authoring_import` reads exact bytes once and fully validates UTF-8,
+  header, physical arity, 30-row count, privacy decisions, manifest field
+  semantics, category balance, and relevance/answerability before bootstrap. It
+  returns a frozen object containing the source path, SHA-256, exact bytes,
+  parsed questions, and ID-only rows.
+- DB-backed import rebuilds and verifies that prepared identity, compares the
+  current source bytes and SHA-256 to reject bootstrap-time TOCTOU, validates
+  only the prepared questions against database scope/privacy, and atomically
+  writes only the prepared ID-only rows. Direct callers retain the original
+  convenience API through an internal preflight.
+- Sensitive prepared bytes/questions/rows and retained retrieval results are
+  excluded from dataclass representations, while safe source/hash/question IDs
+  remain available for diagnostics.
+- Engineering notes now state the exact live sequence: authentication and model
+  preflight succeeded on 2026-08-07, the subsequent messages request returned
+  insufficient credit, and Phase 8D did not recheck the current balance on
+  2026-08-11.
+
+### Fresh fix verification
+
+- Review regressions: 5 passed after the initial 5 expected RED failures;
+  sensitive-representation hardening passed 2 after 2 expected RED failures.
+- Required LLM/CLI/eval/answer/retrieval/run/SDK/schema/ground-truth/isolation
+  selection: 434 passed, 1 expected missing-human-manifest skip in 40.65s.
+- Full repository: 665 passed, 6 expected real-data skips in 42.10s.
+- `ruff check src tests`, scoped format, and `git diff --check`: passed.
+- No provider call, balance check, paid request, private artifact import, or
+  human decision occurred. All previously documented external gates remain
+  open. Fix commit pending scoped re-review.

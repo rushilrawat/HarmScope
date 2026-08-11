@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -16,7 +17,7 @@ import re
 import tempfile
 from collections import Counter
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from numbers import Real
 from pathlib import Path
@@ -169,6 +170,17 @@ class EvalQuestion:
 
 
 @dataclass(frozen=True)
+class PreparedAuthoringImport:
+    """One exact, fully parsed private worklist identity awaiting DB validation."""
+
+    source: Path
+    source_sha256: str
+    source_bytes: bytes = field(repr=False)
+    questions: tuple[EvalQuestion, ...] = field(repr=False)
+    manifest_rows: tuple[tuple[str, ...], ...] = field(repr=False)
+
+
+@dataclass(frozen=True)
 class RetrievalMetrics:
     rank_first_relevant: int | None
     relevant_retrieved_count: int
@@ -269,6 +281,22 @@ class EvaluationSummary:
                 f"{dense_relation} | {bm25_relation}"
             )
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ScoredRetrieval:
+    """One question's immutable in-memory link to its persisted retrieval score."""
+
+    question_id: str
+    result: retrieve.RetrievalResult = field(repr=False)
+
+
+@dataclass(frozen=True)
+class RetrievalEvaluationRun:
+    """A retrieval summary plus exact evidence retained for same-run answering."""
+
+    summary: EvaluationSummary
+    scored: tuple[ScoredRetrieval, ...]
 
 
 def _grounded_claims(value: object) -> tuple[answer.Claim, ...]:
@@ -736,11 +764,16 @@ def run_retrieval_eval(
     embed_model: str,
     eval_run_id: str,
     retriever=retrieve.retrieve_variants,
-) -> EvaluationSummary:
+    *,
+    retain_results: bool = False,
+) -> EvaluationSummary | RetrievalEvaluationRun:
     """Evaluate and persist all retrieval variants with one call per question."""
     _validate_retrieval_batch(questions, embed_model, eval_run_id)
+    if type(retain_results) is not bool:
+        raise TypeError("retain_results must be a boolean")
     _require_autocommit(con)
     evaluated: list[QuestionRetrievalEvaluation] = []
+    scored: list[ScoredRetrieval] = []
     for question in questions:
         result = retriever(
             con,
@@ -758,6 +791,8 @@ def run_retrieval_eval(
             "fused": _latency(result.fusion_seconds, "fused"),
         }
         _write_retrieval_rows(con, eval_run_id, question, metrics, latencies)
+        if retain_results:
+            scored.append(ScoredRetrieval(question.question_id, result))
         evaluated.append(
             QuestionRetrievalEvaluation(
                 question_id=question.question_id,
@@ -770,7 +805,10 @@ def run_retrieval_eval(
                 fused_seconds=latencies["fused"],
             )
         )
-    return _summarize_retrieval(evaluated)
+    summary = _summarize_retrieval(evaluated)
+    if retain_results:
+        return RetrievalEvaluationRun(summary, tuple(scored))
+    return summary
 
 
 def _validate_answer_batch(
@@ -842,11 +880,166 @@ def _retrievable_answer_scopes(
     return scopes
 
 
+def _index_scored_retrievals(
+    questions: list[EvalQuestion],
+    scored_retrievals: object,
+) -> dict[str, retrieve.RetrievalResult]:
+    if type(scored_retrievals) is not tuple:
+        raise TypeError("scored_retrievals must be a tuple")
+    indexed: dict[str, retrieve.RetrievalResult] = {}
+    for scored in scored_retrievals:
+        if type(scored) is not ScoredRetrieval:
+            raise TypeError("scored_retrievals must contain ScoredRetrieval values")
+        if type(scored.question_id) is not str or not _SAFE_ID.fullmatch(scored.question_id):
+            raise ValueError("scored retrieval question_id must be a safe identifier")
+        if scored.question_id in indexed:
+            raise ValueError("scored retrieval question IDs must be unique")
+        if type(scored.result) is not retrieve.RetrievalResult:
+            raise TypeError("scored retrieval result must be a RetrievalResult")
+        indexed[scored.question_id] = scored.result
+    expected = {question.question_id for question in questions}
+    if set(indexed) != expected:
+        raise ValueError("scored retrievals must exactly cover evaluation question IDs")
+    return indexed
+
+
+def _fused_evidence(result: retrieve.RetrievalResult) -> tuple[retrieve.RetrievedEvidence, ...]:
+    rows_by_id = {row.complaint_id: row for row in result.corpus.rows}
+    if len(rows_by_id) != len(result.corpus.rows):
+        raise ValueError("scored retrieval corpus has duplicate complaint IDs")
+    expected: list[retrieve.RetrievedEvidence] = []
+    for hit in result.fused:
+        row = rows_by_id.get(hit.complaint_id)
+        if row is None:
+            raise ValueError("scored fused ranking references evidence outside its corpus")
+        expected.append(
+            retrieve.RetrievedEvidence(
+                complaint_id=hit.complaint_id,
+                cluster_id=result.corpus.cluster_id,
+                date_received=row.date_received,
+                company_id=row.company_id,
+                company_name=row.company_name,
+                product_family=row.product_family,
+                text_redacted=row.text_redacted,
+                company_public_response=row.company_public_response,
+                dense_rank=hit.dense_rank,
+                dense_score=hit.dense_score,
+                sparse_rank=hit.sparse_rank,
+                sparse_score=hit.sparse_score,
+                fused_score=hit.fused_score,
+            )
+        )
+    return tuple(expected)
+
+
+def _require_persisted_retrieval_identity(
+    con,
+    eval_run_id: str,
+    question: EvalQuestion,
+    metrics: dict[str, RetrievalMetrics],
+    latencies: dict[str, float],
+) -> None:
+    rows = con.execute(
+        "SELECT retrieval_method, rank_first_relevant, relevant_retrieved_count, "
+        "recall_at_10, reciprocal_rank, latency_seconds FROM rag_eval_results "
+        "WHERE eval_run_id = ? AND question_id = ? ORDER BY retrieval_method",
+        [eval_run_id, question.question_id],
+    ).fetchall()
+    actual = {method: values for method, *values in rows}
+    if set(actual) != set(_RETRIEVAL_METHODS):
+        raise ValueError("persisted retrieval rows do not exactly cover all scored methods")
+    for method in _RETRIEVAL_METHODS:
+        metric = metrics[method]
+        expected = [
+            metric.rank_first_relevant,
+            metric.relevant_retrieved_count,
+            metric.recall_at_10,
+            metric.reciprocal_rank,
+            latencies[method],
+        ]
+        if actual[method] != expected:
+            raise ValueError("persisted retrieval rows do not match the scored retrieval identity")
+
+
+def _validated_scored_answer_inputs(
+    con,
+    questions: list[EvalQuestion],
+    embed_model: str,
+    eval_run_id: str,
+    indexed: dict[str, retrieve.RetrievalResult],
+) -> tuple[
+    dict[tuple[str, str], tuple[str, frozenset[int]]],
+    dict[str, tuple[retrieve.RetrievedEvidence, ...]],
+]:
+    scopes: dict[tuple[str, str], tuple[str, frozenset[int]]] = {}
+    evidence_by_question: dict[str, tuple[retrieve.RetrievedEvidence, ...]] = {}
+    for question in questions:
+        result = indexed[question.question_id]
+        if result.corpus.embed_model != embed_model:
+            raise ValueError("scored retrieval embedding model does not match embed_model")
+        metrics = evaluate_retrieval_question(question, result)
+        latencies = {
+            "dense": _latency(result.dense_seconds, "dense"),
+            "bm25": _latency(result.sparse_seconds, "bm25"),
+            "fused": _latency(result.fusion_seconds, "fused"),
+        }
+        live_corpus = retrieve.load_corpus(
+            con,
+            question.cluster_id,
+            question.company_id,
+            embed_model,
+        )
+        if result.corpus != live_corpus:
+            raise ValueError("scored retrieval corpus does not match exact live provenance")
+        exact_evidence = _fused_evidence(result)
+        if type(result.evidence) is not tuple or result.evidence != exact_evidence:
+            raise ValueError("scored retrieval does not contain the exact fused evidence")
+        _require_persisted_retrieval_identity(
+            con,
+            eval_run_id,
+            question,
+            metrics,
+            latencies,
+        )
+        product_families = {row.product_family for row in live_corpus.rows}
+        if len(product_families) != 1:
+            raise ValueError("retrievable answer corpus has inconsistent product families")
+        complaint_ids = frozenset(row.complaint_id for row in live_corpus.rows)
+        if len(complaint_ids) != len(live_corpus.rows):
+            raise ValueError("retrievable answer corpus has invalid complaint IDs")
+        scopes[(question.cluster_id, question.company_id)] = (
+            product_families.pop(),
+            complaint_ids,
+        )
+        evidence_by_question[question.question_id] = exact_evidence
+    return scopes, evidence_by_question
+
+
+def _bound_evidence_retriever(
+    question: EvalQuestion,
+    embed_model: str,
+    evidence: tuple[retrieve.RetrievedEvidence, ...],
+):
+    def bound(con, cluster_id, company_id, raw_question, raw_embed_model):
+        del con
+        if (
+            cluster_id != question.cluster_id
+            or company_id != question.company_id
+            or raw_question != question.question
+            or raw_embed_model != embed_model
+        ):
+            raise ValueError("answerer requested evidence outside the scored retrieval identity")
+        return list(evidence)
+
+    return bound
+
+
 def _returned_evidence_ids(
     result: object,
     question: EvalQuestion,
     product_family: str,
     retrievable_ids: frozenset[int],
+    expected_evidence: tuple[retrieve.RetrievedEvidence, ...] | None = None,
 ) -> set[int]:
     if type(result) is not answer.AnswerResult:
         raise TypeError("answerer must return an AnswerResult")
@@ -864,6 +1057,8 @@ def _returned_evidence_ids(
         product_family=product_family,
         top_k=CONFIG.llm.rag_top_k,
     )
+    if expected_evidence is not None and tuple(validated) != expected_evidence:
+        raise ValueError("answer evidence does not match the exact scored fused evidence")
     complaint_ids = [row.complaint_id for row in validated]
     if any(type(complaint_id) is not int or complaint_id <= 0 for complaint_id in complaint_ids):
         raise ValueError("answer evidence complaint IDs must be positive integers")
@@ -1000,23 +1195,47 @@ def run_answer_eval(
     embed_model: str,
     eval_run_id: str,
     answerer=answer.answer_question,
+    *,
+    scored_retrievals: tuple[ScoredRetrieval, ...] | None = None,
 ) -> AnswerEvaluationSummary:
     """Evaluate grounded answers against existing fused retrieval results."""
     _validate_answer_batch(questions, embed_model, eval_run_id, answerer)
+    indexed = (
+        None
+        if scored_retrievals is None
+        else _index_scored_retrievals(questions, scored_retrievals)
+    )
     _require_autocommit(con)
     _require_fused_rows(con, questions, eval_run_id)
-    retrievable_scopes = _retrievable_answer_scopes(con, questions, embed_model)
+    if indexed is None:
+        retrievable_scopes = _retrievable_answer_scopes(con, questions, embed_model)
+        evidence_by_question: dict[str, tuple[retrieve.RetrievedEvidence, ...]] = {}
+    else:
+        retrievable_scopes, evidence_by_question = _validated_scored_answer_inputs(
+            con,
+            questions,
+            embed_model,
+            eval_run_id,
+            indexed,
+        )
     evaluated: list[AnswerQuestionEvaluation] = []
     failures: list[AnswerEvaluationFailure] = []
     for question in questions:
         try:
+            answer_kwargs = {"run_id": eval_run_id}
+            if indexed is not None:
+                answer_kwargs["retriever"] = _bound_evidence_retriever(
+                    question,
+                    embed_model,
+                    evidence_by_question[question.question_id],
+                )
             result = answerer(
                 con,
                 question.cluster_id,
                 question.company_id,
                 question.question,
                 embed_model,
-                run_id=eval_run_id,
+                **answer_kwargs,
             )
         except answer.CitationError:
             failures.append(AnswerEvaluationFailure(question.question_id, "citation"))
@@ -1036,6 +1255,7 @@ def run_answer_eval(
             question,
             product_family,
             retrievable_ids,
+            evidence_by_question.get(question.question_id),
         )
         metrics = AnswerQuestionEvaluation(
             question_id=question.question_id,
@@ -1610,18 +1830,18 @@ def parse_claim_review(path: Path, reviewer_id: str) -> list[ClaimReview]:
 def _validate_constructed_review(review: ClaimReview) -> None:
     if type(review.review_id) is not str or not _HEX_DIGEST.fullmatch(review.review_id):
         raise ValueError("review_id must be a lowercase SHA-256 digest")
-    for field, value in (
+    for field_name, value in (
         ("eval_run_id", review.eval_run_id),
         ("question_id", review.question_id),
         ("reviewer_id", review.reviewer_id),
     ):
         if type(value) is not str or not _SAFE_ID.fullmatch(value):
-            raise ValueError(f"{field} must be a safe non-blank identifier")
+            raise ValueError(f"{field_name} must be a safe non-blank identifier")
     if type(review.claim_position) is not int or review.claim_position <= 0:
         raise ValueError("claim_position must be a positive integer")
-    for field, value in (("question", review.question), ("claim text", review.claim_text)):
-        if type(value) is not str or _review_text(value, field) != value:
-            raise ValueError(f"{field} contains unsafe text")
+    for field_name, value in (("question", review.question), ("claim text", review.claim_text)):
+        if type(value) is not str or _review_text(value, field_name) != value:
+            raise ValueError(f"{field_name} contains unsafe text")
     if review.notes is not None and (
         type(review.notes) is not str or _review_text(review.notes, "notes") != review.notes
     ):
@@ -1876,23 +2096,32 @@ def load_manifest(path: Path, expected_n: int = 30) -> list[EvalQuestion]:
     return _parse_rows(rows, expected_n)
 
 
-def _read_strict_csv(path: Path, header: tuple[str, ...], artifact: str) -> list[dict[str, str]]:
-    """Read a CSV only when every physical row has exactly the header's arity."""
+def _read_strict_csv_bytes(
+    data: bytes,
+    header: tuple[str, ...],
+    artifact: str,
+) -> list[dict[str, str]]:
+    """Parse exact UTF-8 CSV bytes only when every row has the header's arity."""
     try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            if reader.fieldnames != list(header):
-                raise ManifestError(f"{artifact} columns do not match the contract")
-            rows: list[dict[str, str]] = []
-            for line_number, row in enumerate(reader, start=2):
-                if None in row or any(value is None for value in row.values()):
-                    raise ManifestError(
-                        f"line {line_number}: {artifact} field count does not match its header"
-                    )
-                rows.append(row)
+        text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ManifestError(f"{artifact} must be UTF-8") from exc
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    if reader.fieldnames != list(header):
+        raise ManifestError(f"{artifact} columns do not match the contract")
+    rows: list[dict[str, str]] = []
+    for line_number, row in enumerate(reader, start=2):
+        if None in row or any(value is None for value in row.values()):
+            raise ManifestError(
+                f"line {line_number}: {artifact} field count does not match its header"
+            )
+        rows.append(row)
     return rows
+
+
+def _read_strict_csv(path: Path, header: tuple[str, ...], artifact: str) -> list[dict[str, str]]:
+    """Read a CSV only when every physical row has exactly the header's arity."""
+    return _read_strict_csv_bytes(path.read_bytes(), header, artifact)
 
 
 def _shingles(tokens: list[str]) -> set[tuple[str, ...]]:
@@ -2259,9 +2488,12 @@ def export_authoring_worklist(con, seed: int, path: Path) -> Path:
     return _write_rows(path, AUTHORING_HEADER, rows)
 
 
-def import_authoring_worklist(con, source: Path, destination: Path) -> Path:
-    """Validate a completed human worklist and emit only committed ID columns."""
-    source_rows = _read_strict_csv(source, AUTHORING_HEADER, "authoring worklist")
+def _prepare_authoring_bytes(source: Path, source_bytes: bytes) -> PreparedAuthoringImport:
+    source_rows = _read_strict_csv_bytes(
+        source_bytes,
+        AUTHORING_HEADER,
+        "authoring worklist",
+    )
     if len(source_rows) != len(CATEGORY_ORDER) * _QUESTIONS_PER_CATEGORY:
         raise ManifestError("authoring worklist must contain exactly 30 completed rows")
 
@@ -2274,6 +2506,47 @@ def import_authoring_worklist(con, source: Path, destination: Path) -> Path:
         manifest_rows.append({field: row.get(field, "") for field in MANIFEST_HEADER})
 
     manifest_rows.sort(key=lambda row: row["question_id"])
-    questions = _parse_rows(manifest_rows, expected_n=30)
+    questions = tuple(_parse_rows(manifest_rows, expected_n=30))
+    rows = tuple(tuple(row[field] for field in MANIFEST_HEADER) for row in manifest_rows)
+    return PreparedAuthoringImport(
+        source=source.resolve(),
+        source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+        source_bytes=source_bytes,
+        questions=questions,
+        manifest_rows=rows,
+    )
+
+
+def prepare_authoring_import(source: Path) -> PreparedAuthoringImport:
+    """Fully parse one exact private worklist before opening a writable database."""
+    if not isinstance(source, Path):
+        raise TypeError("source must be a Path")
+    return _prepare_authoring_bytes(source, source.read_bytes())
+
+
+def import_authoring_worklist(
+    con,
+    source: Path,
+    destination: Path,
+    *,
+    preflight: PreparedAuthoringImport | None = None,
+) -> Path:
+    """DB-validate one preflighted byte identity and emit committed ID columns."""
+    prepared = prepare_authoring_import(source) if preflight is None else preflight
+    if type(prepared) is not PreparedAuthoringImport:
+        raise TypeError("preflight must be a PreparedAuthoringImport")
+    if prepared.source != source.resolve():
+        raise ManifestError("authoring worklist path does not match its preflight")
+    rebuilt = _prepare_authoring_bytes(source, prepared.source_bytes)
+    if rebuilt != prepared:
+        raise ManifestError("authoring worklist preflight identity is invalid")
+    current_bytes = source.read_bytes()
+    if (
+        current_bytes != prepared.source_bytes
+        or hashlib.sha256(current_bytes).hexdigest() != prepared.source_sha256
+    ):
+        raise ManifestError("authoring worklist changed after preflight")
+    questions = list(prepared.questions)
     validate_manifest(con, questions)
+    manifest_rows = [dict(zip(MANIFEST_HEADER, row, strict=True)) for row in prepared.manifest_rows]
     return _write_rows(destination, MANIFEST_HEADER, manifest_rows)

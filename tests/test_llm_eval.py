@@ -566,6 +566,9 @@ def test_authoring_import_strips_private_columns_and_is_stable(authoring_fixture
     draft = llm_eval.export_authoring_worklist(authoring_fixture, 13, tmp_path / "draft.csv")
     completed = _completed_worklist(draft)
     _write_csv(draft, list(llm_eval.AUTHORING_HEADER), completed)
+    prepared = llm_eval.prepare_authoring_import(draft)
+
+    assert completed[0]["question"] not in repr(prepared)
 
     first = llm_eval.import_authoring_worklist(
         authoring_fixture, draft, tmp_path / "manifest-1.csv"
@@ -723,6 +726,41 @@ class _VariantRetriever:
         del con
         self.calls.append((cluster_id, company_id, question, embed_model))
         return self.results[question]
+
+
+class _BoundEvidenceAnswerer:
+    """Exercise the answerer's real retriever boundary without a provider call."""
+
+    def __init__(self):
+        self.calls: list[tuple[retrieve.RetrievedEvidence, ...]] = []
+
+    def __call__(
+        self,
+        con,
+        cluster_id,
+        company_id,
+        question,
+        embed_model,
+        *,
+        run_id,
+        retriever,
+    ):
+        del run_id
+        evidence = tuple(retriever(con, cluster_id, company_id, question, embed_model))
+        self.calls.append(evidence)
+        grounded = _grounded_answer(
+            claims=(answer.Claim("Consumers allege a problem.", (evidence[0].complaint_id,)),),
+            insufficient_evidence=False,
+        )
+        return answer.AnswerResult(
+            answer=grounded,
+            evidence=evidence,
+            enforcement_context=(),
+            cache_status="hit",
+            usage=TokenUsage(),
+            latency_seconds=0.0,
+            estimated_cost_usd=0.0,
+        )
 
 
 class _NoDatabaseConnection:
@@ -918,6 +956,231 @@ def test_retrieval_eval_persists_three_variants_once_and_aggregates_answerable_o
     assert summary.methods["fused"].reciprocal_rank == pytest.approx(1.0)
     assert summary.fused_vs_dense == llm_eval.WinTieLoss(wins=0, ties=2, losses=0)
     assert summary.fused_vs_bm25 == llm_eval.WinTieLoss(wins=1, ties=1, losses=0)
+
+
+def _live_retrieval_result(con, question):
+    corpus = retrieve.load_corpus(con, question.cluster_id, question.company_id, "embed-m")
+    complaint_ids = tuple(row.complaint_id for row in corpus.rows[:2])
+    dense = tuple(
+        retrieve.RankedHit(complaint_id, rank, 1.0 / rank)
+        for rank, complaint_id in enumerate(complaint_ids, start=1)
+    )
+    sparse = tuple(
+        retrieve.RankedHit(complaint_id, rank, 1.0 / rank)
+        for rank, complaint_id in enumerate(reversed(complaint_ids), start=1)
+    )
+    fused = tuple(
+        retrieve.reciprocal_rank_fusion(
+            list(dense),
+            list(sparse),
+            llm_eval.CONFIG.llm.rrf_k,
+            llm_eval.CONFIG.llm.rag_top_k,
+        )
+    )
+    rows = {row.complaint_id: row for row in corpus.rows}
+    evidence = tuple(
+        retrieve.RetrievedEvidence(
+            complaint_id=hit.complaint_id,
+            cluster_id=corpus.cluster_id,
+            date_received=rows[hit.complaint_id].date_received,
+            company_id=rows[hit.complaint_id].company_id,
+            company_name=rows[hit.complaint_id].company_name,
+            product_family=rows[hit.complaint_id].product_family,
+            text_redacted=rows[hit.complaint_id].text_redacted,
+            company_public_response=rows[hit.complaint_id].company_public_response,
+            dense_rank=hit.dense_rank,
+            dense_score=hit.dense_score,
+            sparse_rank=hit.sparse_rank,
+            sparse_score=hit.sparse_score,
+            fused_score=hit.fused_score,
+        )
+        for hit in fused
+    )
+    return retrieve.RetrievalResult(
+        corpus=corpus,
+        dense=dense,
+        sparse=sparse,
+        fused=fused,
+        evidence=evidence,
+        dense_seconds=0.01,
+        sparse_seconds=0.02,
+        fusion_seconds=0.003,
+    )
+
+
+def test_full_eval_answers_from_exact_scored_evidence_without_second_retrieval(con):
+    """Dropping the carried result would query-encode and retrieve twice per question."""
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-bound", [question])
+    result = _live_retrieval_result(con, question)
+    retriever = _VariantRetriever({question.question: result})
+
+    retrieval_run = llm_eval.run_retrieval_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-bound",
+        retriever=retriever,
+        retain_results=True,
+    )
+    assert result.evidence[0].text_redacted not in repr(retrieval_run)
+    answerer = _BoundEvidenceAnswerer()
+    llm_eval.run_answer_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-bound",
+        answerer=answerer,
+        scored_retrievals=retrieval_run.scored,
+    )
+
+    assert len(retriever.calls) == 1
+    assert answerer.calls == [result.evidence]
+
+
+def test_bound_answer_eval_rejects_missing_or_mutated_scored_retrieval(con):
+    """A caller cannot omit or alter the exact scored fused evidence before answering."""
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-bound-invalid", [question])
+    result = _live_retrieval_result(con, question)
+    retrieval_run = llm_eval.run_retrieval_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-bound-invalid",
+        retriever=_VariantRetriever({question.question: result}),
+        retain_results=True,
+    )
+    answerer = _BoundEvidenceAnswerer()
+
+    with pytest.raises(ValueError, match="exactly cover"):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-bound-invalid",
+            answerer=answerer,
+            scored_retrievals=(),
+        )
+
+    object.__setattr__(
+        retrieval_run.scored[0].result,
+        "evidence",
+        tuple(reversed(retrieval_run.scored[0].result.evidence)),
+    )
+    with pytest.raises(ValueError, match="exact fused evidence"):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-bound-invalid",
+            answerer=answerer,
+            scored_retrievals=retrieval_run.scored,
+        )
+
+    assert answerer.calls == []
+
+
+def test_bound_answer_eval_rejects_forged_run_rows_or_live_corpus(con):
+    """A structurally valid carried object is not trusted over run/DB provenance."""
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-bound-forged", [question])
+    result = _live_retrieval_result(con, question)
+    retrieval_run = llm_eval.run_retrieval_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-bound-forged",
+        retriever=_VariantRetriever({question.question: result}),
+        retain_results=True,
+    )
+    con.execute(
+        "UPDATE rag_eval_results SET recall_at_10 = 0.125 "
+        "WHERE eval_run_id = 'eval-bound-forged' AND question_id = 'rag-001' "
+        "AND retrieval_method = 'fused'"
+    )
+
+    with pytest.raises(ValueError, match="persisted retrieval.*scored"):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-bound-forged",
+            answerer=_BoundEvidenceAnswerer(),
+            scored_retrievals=retrieval_run.scored,
+        )
+
+    con.execute(
+        "UPDATE rag_eval_results SET recall_at_10 = 1.0 "
+        "WHERE eval_run_id = 'eval-bound-forged' AND question_id = 'rag-001' "
+        "AND retrieval_method = 'fused'"
+    )
+    changed_rows = (
+        replace(result.corpus.rows[0], text_redacted="Different private corpus bytes."),
+        *result.corpus.rows[1:],
+    )
+    object.__setattr__(result, "corpus", replace(result.corpus, rows=changed_rows))
+
+    with pytest.raises(ValueError, match="live provenance"):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-bound-forged",
+            answerer=_BoundEvidenceAnswerer(),
+            scored_retrievals=retrieval_run.scored,
+        )
+
+
+def test_bound_answer_eval_rejects_answerer_that_drops_scored_fused_evidence(con):
+    """Answer metrics cannot silently use a subset of the ranking that was scored."""
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-bound-subset", [question])
+    result = _live_retrieval_result(con, question)
+    retrieval_run = llm_eval.run_retrieval_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-bound-subset",
+        retriever=_VariantRetriever({question.question: result}),
+        retain_results=True,
+    )
+
+    def subset_answerer(
+        con,
+        cluster_id,
+        company_id,
+        raw_question,
+        embed_model,
+        *,
+        run_id,
+        retriever,
+    ):
+        del run_id
+        evidence = tuple(retriever(con, cluster_id, company_id, raw_question, embed_model))[:1]
+        grounded = _grounded_answer(
+            claims=(answer.Claim("Consumers allege a problem.", (evidence[0].complaint_id,)),),
+            insufficient_evidence=False,
+        )
+        return answer.AnswerResult(
+            answer=grounded,
+            evidence=evidence,
+            enforcement_context=(),
+            cache_status="hit",
+            usage=TokenUsage(),
+            latency_seconds=0.0,
+            estimated_cost_usd=0.0,
+        )
+
+    with pytest.raises(ValueError, match="exact scored fused evidence"):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-bound-subset",
+            answerer=subset_answerer,
+            scored_retrievals=retrieval_run.scored,
+        )
 
 
 class _FailingInsertConnection:

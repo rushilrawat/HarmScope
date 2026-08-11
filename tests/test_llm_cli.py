@@ -324,6 +324,30 @@ def _rag_args(**overrides):
     return SimpleNamespace(**values)
 
 
+def _write_completed_authoring(path, *, question_suffix=""):
+    rows = []
+    for index in range(30):
+        category = llm_eval.CATEGORY_ORDER[index // 5]
+        row = dict.fromkeys(llm_eval.AUTHORING_HEADER, "")
+        row.update(
+            {
+                "question_id": f"rag-{index + 1:03d}",
+                "question": f"Synthetic scoped question {index + 1}{question_suffix}?",
+                "cluster_id": "cluster-1",
+                "company_id": "company-1",
+                "category": category,
+                "answerable": "false" if category == "unanswerable" else "true",
+                "relevant_complaint_ids": "" if category == "unanswerable" else "10",
+                "privacy_reviewed": "yes",
+            }
+        )
+        rows.append(row)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=llm_eval.AUTHORING_HEADER)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def test_rag_eval_parser_defaults_to_full_run_and_exposes_every_action():
     """Removing a subcommand would make a reviewed workflow unreachable."""
     parser = pipeline.build_parser()
@@ -419,22 +443,18 @@ def test_rag_eval_registers_exact_manifest_identity_and_finishes_ninety_rows(
     )
     retrieval = SimpleNamespace(render=lambda: "retrieval metrics")
     answers = SimpleNamespace(render=lambda: "answer metrics")
-    monkeypatch.setattr(
-        llm_eval,
-        "run_retrieval_eval",
-        lambda connection, rows, model, run_id: events.append(
-            ("retrieval", connection, rows, model, run_id)
-        )
-        or retrieval,
-    )
-    monkeypatch.setattr(
-        llm_eval,
-        "run_answer_eval",
-        lambda connection, rows, model, run_id: events.append(
-            ("answers", connection, rows, model, run_id)
-        )
-        or answers,
-    )
+    scored = (object(),)
+
+    def run_retrieval(connection, rows, model, run_id, *, retain_results):
+        events.append(("retrieval", connection, rows, model, run_id, retain_results))
+        return SimpleNamespace(summary=retrieval, scored=scored)
+
+    def run_answers(connection, rows, model, run_id, *, scored_retrievals):
+        events.append(("answers", connection, rows, model, run_id, scored_retrievals))
+        return answers
+
+    monkeypatch.setattr(llm_eval, "run_retrieval_eval", run_retrieval)
+    monkeypatch.setattr(llm_eval, "run_answer_eval", run_answers)
     monkeypatch.setattr(
         llm_eval,
         "render_evaluation_run",
@@ -465,8 +485,10 @@ def test_rag_eval_registers_exact_manifest_identity_and_finishes_ninety_rows(
     ]
     assert events[4][0:4] == ("retrieval", spy, questions, "embed-m")
     assert events[4][4] == run_id
+    assert events[4][5] is True
     assert events[5][0:4] == ("answers", spy, questions, "embed-m")
     assert events[5][4] == run_id
+    assert events[5][5] is scored
     output = capsys.readouterr().out
     assert f"eval run ID: {run_id}" in output
     assert "human groundedness gate: PENDING" in output
@@ -602,7 +624,7 @@ def test_rag_eval_author_import_and_claim_actions_wire_exact_contracts(
     interim.mkdir()
     manifest = ground_truth / "rag_eval_questions.csv"
     source = interim / "rag_eval_authoring.csv"
-    source.write_text("private")
+    _write_completed_authoring(source)
     claims = interim / "claims.csv"
     completed = interim / "claims.reviewer-1.csv"
     completed.write_text("human decisions")
@@ -629,8 +651,8 @@ def test_rag_eval_author_import_and_claim_actions_wire_exact_contracts(
     monkeypatch.setattr(
         llm_eval,
         "import_authoring_worklist",
-        lambda connection, got_source, destination: calls.append(
-            ("import", connection, got_source, destination)
+        lambda connection, got_source, destination, *, preflight: calls.append(
+            ("import", connection, got_source, destination, preflight)
         )
         or destination,
     )
@@ -684,7 +706,8 @@ def test_rag_eval_author_import_and_claim_actions_wire_exact_contracts(
         pipeline.CONFIG.llm.verification_seed,
         source,
     )
-    assert calls[1] == ("import", connections[1], source, manifest)
+    assert calls[1][0:4] == ("import", connections[1], source, manifest)
+    assert isinstance(calls[1][4], llm_eval.PreparedAuthoringImport)
     assert calls[2] == ("claims-export", connections[2], "eval-1", 50, 20260809, claims)
     assert calls[3] == ("parse", completed, "reviewer-1")
     assert calls[4] == ("claims-record", connections[3], "eval-1", reviews)
@@ -728,6 +751,54 @@ def test_rag_eval_claim_record_parses_before_opening_database(monkeypatch, tmp_p
         )
 
     assert opened == []
+
+
+def test_rag_eval_import_fully_parses_malformed_worklist_before_database(monkeypatch, tmp_path):
+    """A malformed private artifact must not bootstrap a writable database."""
+    interim = tmp_path / "interim"
+    interim.mkdir()
+    source = interim / "rag_eval_authoring.csv"
+    source.write_text("wrong,header\nvalue,value\n", encoding="utf-8")
+    monkeypatch.setattr(
+        pipeline,
+        "PATHS",
+        SimpleNamespace(ground_truth=tmp_path / "ground_truth", interim=interim),
+    )
+    opened = []
+    monkeypatch.setattr(pipeline.db, "bootstrap", lambda: opened.append(True))
+
+    with pytest.raises(llm_eval.ManifestError, match="columns"):
+        pipeline.cmd_rag_eval(_rag_args(eval_action="import", input=str(source)))
+
+    assert opened == []
+
+
+def test_rag_eval_import_rejects_source_changed_during_database_bootstrap(monkeypatch, tmp_path):
+    """The DB-backed scope check must remain bound to the preflighted private bytes."""
+    interim = tmp_path / "interim"
+    interim.mkdir()
+    ground_truth = tmp_path / "ground_truth"
+    ground_truth.mkdir()
+    source = interim / "rag_eval_authoring.csv"
+    _write_completed_authoring(source)
+    monkeypatch.setattr(
+        pipeline,
+        "PATHS",
+        SimpleNamespace(ground_truth=ground_truth, interim=interim),
+    )
+    monkeypatch.setattr(llm_eval, "validate_manifest", lambda *_args: None)
+    connection = SimpleNamespace(close=lambda: None)
+
+    def mutate_then_open():
+        _write_completed_authoring(source, question_suffix=" changed")
+        return connection
+
+    monkeypatch.setattr(pipeline.db, "bootstrap", mutate_then_open)
+
+    with pytest.raises(llm_eval.ManifestError, match="changed after preflight"):
+        pipeline.cmd_rag_eval(_rag_args(eval_action="import", input=str(source)))
+
+    assert not (ground_truth / "rag_eval_questions.csv").exists()
 
 
 def test_rag_eval_rejects_private_artifacts_outside_interim_before_database(monkeypatch, tmp_path):

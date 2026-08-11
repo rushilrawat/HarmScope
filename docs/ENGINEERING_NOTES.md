@@ -1178,12 +1178,14 @@ _Open gates, in dependency order:_
    loader requires `embeddings.<sha256(full model name)>.npy` plus exact model,
    row-count, dimension, completion, and array-shape checks. No ambiguous
    fallback exists.
-5. **Live provider/billing.** The 2026-08-07 call authenticated and reached the
-   API, then returned terminal `400 invalid_request_error` because the
-   organization's credit balance was too low. The earlier CLI token-expiry
-   interpretation was wrong; authentication auto-refreshed. The earlier full
-   4,818-cluster estimate was roughly $205, but pricing and population must be
-   re-estimated before purchase. No Task 8D call incurred provider cost.
+5. **Live provider/funding check.** On 2026-08-07, authentication and model
+   preflight succeeded; the subsequent messages request returned terminal
+   `400 invalid_request_error` because the organization's credit balance was
+   too low. The earlier CLI token-expiry interpretation was wrong because
+   authentication auto-refreshed. Phase 8D made no provider call on 2026-08-11,
+   so it did not recheck the current balance. The earlier full 4,818-cluster
+   estimate was roughly $205, but pricing and population must be re-estimated
+   before purchase. No Task 8D call incurred provider cost.
 6. **Human label and claim review.** At least 50 version-bound labels and at
    least 50 run-bound claims must be reviewed by a person. Automated/LLM judges
    cannot complete either denominator.
@@ -1191,9 +1193,11 @@ _Open gates, in dependency order:_
 _Label agreement rate on 50 verified:_ **PENDING — 0 human worklists recorded;
 not reported as 0%.**
 
-_Observed live LLM failure modes:_ billing preflight failure only. Structured
-schema/refusal/retry/cache behaviors are test-fixture observations, not live
-model frequencies.
+_Observed live LLM failure modes:_ the 2026-08-07 messages request returned the
+insufficient-credit error after successful authentication and model preflight.
+No provider request or balance check ran during Phase 8D on 2026-08-11.
+Structured schema/refusal/retry/cache behaviors are test-fixture observations,
+not live model frequencies.
 
 _RAG Recall@10 / MRR / fusion win-tie-loss:_ **PENDING — no frozen manifest and
 no evaluation run.**
@@ -1360,6 +1364,7 @@ privacy review, and freeze. Eighteen rows have no concrete company scope, and
 the five planned `company_response` questions lack independent public-response
 evidence in the complaint-only worklist. The existing embedding artifacts use
 the legacy short-model filename rather than the current full model-SHA contract
-and require a validated migration or regeneration. Anthropic billing still
-blocks live labeling and answering, and both the 50-label and 50-claim blinded
-human reviews remain pending.
+and require a validated migration or regeneration. The last live messages
+request returned insufficient credit, but Phase 8D did not recheck the current
+balance; live labeling and answering plus both the 50-label and 50-claim
+blinded human reviews remain pending.

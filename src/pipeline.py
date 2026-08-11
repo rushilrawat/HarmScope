@@ -2117,22 +2117,30 @@ def cmd_rag_eval(args: argparse.Namespace) -> int:
                 "retrieval_only": args.retrieval_only,
             }
             with db.run(con, "rag-eval", CONFIG, params=params) as r:
-                retrieval_summary = llm_eval.run_retrieval_eval(
-                    con,
-                    questions,
-                    embed_model,
-                    r.run_id,
-                )
-                answer_summary = (
-                    None
-                    if args.retrieval_only
-                    else llm_eval.run_answer_eval(
+                if args.retrieval_only:
+                    retrieval_summary = llm_eval.run_retrieval_eval(
                         con,
                         questions,
                         embed_model,
                         r.run_id,
                     )
-                )
+                    answer_summary = None
+                else:
+                    retrieval_run = llm_eval.run_retrieval_eval(
+                        con,
+                        questions,
+                        embed_model,
+                        r.run_id,
+                        retain_results=True,
+                    )
+                    retrieval_summary = retrieval_run.summary
+                    answer_summary = llm_eval.run_answer_eval(
+                        con,
+                        questions,
+                        embed_model,
+                        r.run_id,
+                        scored_retrievals=retrieval_run.scored,
+                    )
                 report = llm_eval.render_evaluation_run(
                     r.run_id,
                     retrieval_summary,
@@ -2162,9 +2170,15 @@ def cmd_rag_eval(args: argparse.Namespace) -> int:
     if action == "import":
         source = _rag_interim_path(args.input, "authoring input", must_exist=True)
         destination = PATHS.ground_truth / _RAG_MANIFEST_NAME
+        preflight = llm_eval.prepare_authoring_import(source)
         con = db.bootstrap()
         try:
-            path = llm_eval.import_authoring_worklist(con, source, destination)
+            path = llm_eval.import_authoring_worklist(
+                con,
+                source,
+                destination,
+                preflight=preflight,
+            )
             count = len(llm_eval.load_manifest(path))
             print(f"manifest  : {path}")
             print(f"questions : {count}")

@@ -146,3 +146,20 @@ manifest, metric, or migration was fabricated. Human manifest/privacy freeze,
 filename migration/regeneration, Anthropic billing/live work, and 50-label/
 50-claim reviews remain open. Implementation commit is the enclosing `Complete
 Phase 8 RAG evaluation` commit; independent review is pending.
+
+Task 5: fix round 1/5 — reproduced both Important findings and the Minor
+documentation error with five focused RED failures. Full evaluation now retains
+one frozen scored retrieval per question, rebinds it to exact live corpus plus
+same-run persisted dense/BM25/fused metrics, injects a copy of that exact fused
+evidence through Phase 8C's existing retriever boundary, and rejects missing,
+mutated, forged, or subset evidence before provider work. Import now performs a
+complete byte/SHA-bound pure preflight before bootstrap, rejects bootstrap-time
+TOCTOU, DB-validates the prepared questions, and atomically writes only prepared
+ID-only rows. A second 2-failure RED→GREEN wave removed private authoring and
+retrieval content from the new carriers' representations. Engineering notes
+distinguish successful 2026-08-07 auth/model
+preflight from the subsequent insufficient-credit messages request and state
+that Phase 8D did not recheck current balance. GREEN: review regressions 5
+passed; required selection 434 passed + 1 expected skip; full repository 665
+passed + 6 expected skips; Ruff, scoped format, and diff check clean. No
+provider/private/human action. Fix commit pending scoped re-review.
