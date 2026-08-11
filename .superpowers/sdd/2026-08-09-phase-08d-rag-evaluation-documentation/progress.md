@@ -65,3 +65,6 @@ retrieval/persistence without altering caller state. GREEN: targeted 5 passed;
 evaluation 73 passed; compatibility slice 166 passed; full 565 passed + 6
 expected skips; Ruff, scoped format, and diff check clean. Fix commit pending
 scoped re-review.
+Task 2 re-review: APPROVED at 6a8bf4d — zero-I/O invalid inputs, caller-transaction safety, exact fused membership/provenance/score/order/top-k validation, rollback, replay preservation, aggregates, and loss-visible rendering all reproduced with no residual finding.
+
+Task 3: in progress.
