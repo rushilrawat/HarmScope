@@ -26,3 +26,6 @@ contains narrative excerpts only; no code change made pending plan resolution.
 Final verification: focused 129 passed + 1 expected skip; full 526 passed + 6
 expected skips; Ruff, scoped format, and diff check clean. The Task 1 fix commit
 contains this ledger update.
+Task 1 re-review: APPROVED at 4614378 — all four counterexamples fixed; 16 targeted tests and the complete suite pass; private draft independently confirms 15 canonical fired / 15 controls, 300/300 shown IDs retrievable, zero status mismatches, and blank human fields. Engineering implementation accepted. Human manifest freeze and the `company_response` plan contradiction remain open external/design gates.
+
+Task 2: in progress.
