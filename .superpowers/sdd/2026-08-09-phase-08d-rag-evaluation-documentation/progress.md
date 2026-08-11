@@ -113,3 +113,19 @@ format, and diff clean. No live provider or human review; actual groundedness
 remains an external gate. Task 5 must write `params.manifest_sha256` and enforce
 the completed filename suffix `.<reviewer_id>.csv`. Implementation commit
 pending review gate.
+
+Task 4: fix round 1/5 — reproduced all three Important reviewer findings plus
+the related Python `bool == int` identity edge. Cited evidence now comes from a
+cached exact `retrieve.load_corpus` cluster/company/recorded-model scope, so a
+valid cross-company dedup-expanded nonrepresentative is admitted without a
+direct `cluster_members` row while out-of-scope IDs still fail closed. Public
+recording parser-equivalently validates every exact `ClaimReview` and
+`ClaimEvidence` field/type before SQL, including booleans masquerading as
+integers. Parsing enforces configured `data/interim` containment before opening
+the file and leaks no copied private content in the failure. GREEN: reviewer
+regressions 3 passed; Task 4 selection 29 passed; evaluation 156 passed;
+evaluation/answer/verification/schema/isolation slice 324 passed; full 648
+passed + 6 expected skips; Ruff, scoped format, and diff check clean. No
+run-finished adjudication requirement, live provider call, human claim, schema,
+answer, or verification code was added or changed. Fix commit pending scoped
+re-review.

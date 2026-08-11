@@ -1088,28 +1088,64 @@ def _claim_evidence(
     con,
     question: EvalQuestion,
     complaint_ids: tuple[int, ...],
+    corpus_cache: dict[tuple[str, str, str], dict[int, str]],
 ) -> tuple[tuple[ClaimEvidence, ...], tuple[tuple[int, str, str], ...]]:
+    if question.company_id is None:
+        raise ValueError(f"question {question.question_id!r} has no concrete evidence scope")
+    embed_model = _embed_model_for_cluster(con, question.question_id, question.cluster_id)
+    scope_key = (question.cluster_id, question.company_id, embed_model)
+    evidence_by_id = corpus_cache.get(scope_key)
+    if evidence_by_id is None:
+        try:
+            corpus = retrieve.load_corpus(
+                con,
+                question.cluster_id,
+                question.company_id,
+                embed_model,
+            )
+        except ValueError:
+            raise ValueError(
+                f"question {question.question_id!r} has no exact retrievable evidence scope"
+            ) from None
+        if (
+            corpus.cluster_id != question.cluster_id
+            or corpus.company_id != question.company_id
+            or corpus.embed_model != embed_model
+        ):
+            raise ValueError(
+                f"question {question.question_id!r} has mismatched retrievable evidence scope"
+            )
+        evidence_by_id = {row.complaint_id: row.text_redacted for row in corpus.rows}
+        if len(evidence_by_id) != len(corpus.rows):
+            raise ValueError(
+                f"question {question.question_id!r} has duplicate retrievable evidence IDs"
+            )
+        corpus_cache[scope_key] = evidence_by_id
+
     visible: list[ClaimEvidence] = []
     identity: list[tuple[int, str, str]] = []
     for complaint_id in complaint_ids:
-        row = con.execute(
-            "SELECT n.text_redacted, n.text_hash FROM narratives n "
-            "JOIN complaints c USING (complaint_id) "
-            "JOIN cluster_members m USING (complaint_id) "
-            "WHERE n.complaint_id = ? AND m.cluster_id = ? AND c.company_id = ?",
-            [complaint_id, question.cluster_id, question.company_id],
+        text_redacted = evidence_by_id.get(complaint_id)
+        text_hash_row = con.execute(
+            "SELECT text_hash FROM narratives WHERE complaint_id = ?",
+            [complaint_id],
         ).fetchone()
-        if row is None or type(row[0]) is not str or type(row[1]) is not str:
+        if (
+            type(text_redacted) is not str
+            or not text_redacted.strip()
+            or text_hash_row is None
+            or type(text_hash_row[0]) is not str
+        ):
             raise ValueError(
                 f"question {question.question_id!r} has unavailable cited evidence "
                 f"for complaint_id {complaint_id}"
             )
-        visible.append(ClaimEvidence(complaint_id, _review_text(row[0], "evidence excerpt")))
+        visible.append(ClaimEvidence(complaint_id, _review_text(text_redacted, "evidence excerpt")))
         identity.append(
             (
                 complaint_id,
-                row[1],
-                hashlib.sha256(row[0].encode("utf-8")).hexdigest(),
+                text_hash_row[0],
+                hashlib.sha256(text_redacted.encode("utf-8")).hexdigest(),
             )
         )
     return tuple(visible), tuple(identity)
@@ -1193,6 +1229,7 @@ def _claim_candidates(con, eval_run_id: str) -> list[_ClaimCandidate]:
         [eval_run_id],
     ).fetchall()
     candidates: list[_ClaimCandidate] = []
+    corpus_cache: dict[tuple[str, str, str], dict[int, str]] = {}
     for question in questions:
         question_hash = answer.question_hash(question.question)
         matching_usage = [
@@ -1269,6 +1306,7 @@ def _claim_candidates(con, eval_run_id: str) -> list[_ClaimCandidate]:
                 con,
                 question,
                 claim.complaint_ids,
+                corpus_cache,
             )
             review_id = _review_identity(
                 eval_run_id=eval_run_id,
@@ -1450,6 +1488,7 @@ def parse_claim_review(path: Path, reviewer_id: str) -> list[ClaimReview]:
     """Parse completed human judgments without trusting artifact identities."""
     if type(reviewer_id) is not str or not _SAFE_ID.fullmatch(reviewer_id):
         raise ValueError("reviewer_id must be a safe non-blank identifier")
+    _ensure_claim_review_destination(path)
     if not path.stem.endswith(f".{reviewer_id}"):
         raise ValueError("claim review filename must end with the reviewer_id")
     rows = _read_strict_csv(path, CLAIM_REVIEW_HEADER, "claim review")
@@ -1523,6 +1562,68 @@ def parse_claim_review(path: Path, reviewer_id: str) -> list[ClaimReview]:
     return parsed
 
 
+def _validate_constructed_review(review: ClaimReview) -> None:
+    if type(review.review_id) is not str or not _HEX_DIGEST.fullmatch(review.review_id):
+        raise ValueError("review_id must be a lowercase SHA-256 digest")
+    for field, value in (
+        ("eval_run_id", review.eval_run_id),
+        ("question_id", review.question_id),
+        ("reviewer_id", review.reviewer_id),
+    ):
+        if type(value) is not str or not _SAFE_ID.fullmatch(value):
+            raise ValueError(f"{field} must be a safe non-blank identifier")
+    if type(review.claim_position) is not int or review.claim_position <= 0:
+        raise ValueError("claim_position must be a positive integer")
+    for field, value in (("question", review.question), ("claim text", review.claim_text)):
+        if type(value) is not str or _review_text(value, field) != value:
+            raise ValueError(f"{field} contains unsafe text")
+    if review.notes is not None and (
+        type(review.notes) is not str or _review_text(review.notes, "notes") != review.notes
+    ):
+        raise ValueError("review notes contain unsafe text")
+    if (
+        type(review.cited_complaint_ids) is not tuple
+        or not review.cited_complaint_ids
+        or any(
+            type(complaint_id) is not int or complaint_id <= 0
+            for complaint_id in review.cited_complaint_ids
+        )
+        or len(review.cited_complaint_ids) != len(set(review.cited_complaint_ids))
+    ):
+        raise ValueError(
+            "cited_complaint_ids must be a non-empty tuple of unique positive integers"
+        )
+    if type(review.cited_evidence) is not tuple or len(review.cited_evidence) != len(
+        review.cited_complaint_ids
+    ):
+        raise ValueError("cited_evidence must be a tuple matching cited_complaint_ids")
+    for expected_id, evidence in zip(
+        review.cited_complaint_ids,
+        review.cited_evidence,
+        strict=True,
+    ):
+        if (
+            type(evidence) is not ClaimEvidence
+            or type(evidence.complaint_id) is not int
+            or evidence.complaint_id <= 0
+            or evidence.complaint_id != expected_id
+        ):
+            raise ValueError("cited evidence IDs must exactly match cited_complaint_ids")
+        if (
+            type(evidence.text_redacted) is not str
+            or _review_text(evidence.text_redacted, "evidence excerpt") != evidence.text_redacted
+        ):
+            raise ValueError("cited evidence contains unsafe text")
+    if type(review.grounded) is not bool:
+        raise TypeError("grounded must be a boolean")
+    if type(review.failure_category) is not str:
+        raise TypeError("failure_category must be a string")
+    if review.grounded and review.failure_category != "none":
+        raise ValueError("failure_category must be none when grounded=yes")
+    if not review.grounded and review.failure_category not in _CLAIM_FAILURE_CATEGORIES:
+        raise ValueError("failure_category is required and must be valid when grounded=no")
+
+
 def _validate_review_batch(eval_run_id: str, reviews: list[ClaimReview]) -> str:
     if type(eval_run_id) is not str or not _SAFE_ID.fullmatch(eval_run_id):
         raise ValueError("eval_run_id must be a safe non-blank identifier")
@@ -1532,26 +1633,18 @@ def _validate_review_batch(eval_run_id: str, reviews: list[ClaimReview]) -> str:
         raise ValueError(
             f"human groundedness requires at least {CONFIG.llm.human_verify_n} reviews"
         )
+    for review in reviews:
+        _validate_constructed_review(review)
     review_ids = [review.review_id for review in reviews]
     claim_keys = [(review.question_id, review.claim_position) for review in reviews]
     if len(review_ids) != len(set(review_ids)) or len(claim_keys) != len(set(claim_keys)):
         raise ValueError("duplicate claim reviews are forbidden")
     if any(review.eval_run_id != eval_run_id for review in reviews):
         raise ValueError("review eval_run_id does not match the requested eval_run_id")
-    for review in reviews:
-        if review.grounded and review.failure_category != "none":
-            raise ValueError("failure_category must be none when grounded=yes")
-        if not review.grounded and review.failure_category not in _CLAIM_FAILURE_CATEGORIES:
-            raise ValueError("failure_category is required and must be valid when grounded=no")
-        if review.notes is not None and _review_text(review.notes, "notes") != review.notes:
-            raise ValueError("review notes contain unsafe text")
     reviewer_ids = {review.reviewer_id for review in reviews}
     if len(reviewer_ids) != 1:
         raise ValueError("claim reviews must contain exactly one reviewer_id")
-    reviewer_id = next(iter(reviewer_ids))
-    if not _SAFE_ID.fullmatch(reviewer_id):
-        raise ValueError("reviewer_id must be a safe non-blank identifier")
-    return reviewer_id
+    return next(iter(reviewer_ids))
 
 
 def record_claim_review(

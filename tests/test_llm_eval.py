@@ -2419,6 +2419,21 @@ def test_parse_claim_review_requires_safe_reviewer_filename_and_exact_rows(
         llm_eval.parse_claim_review(completed, "reviewer-1")
 
 
+def test_parse_claim_review_rejects_non_interim_path_before_exposing_content(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(con, eval_run_id, 50, 7, paths.interim / "claims.csv")
+    completed = _fill_claim_review(exported)
+    outside = paths.ground_truth / completed.name
+    outside.write_bytes(completed.read_bytes())
+
+    with pytest.raises(ValueError, match="data/interim") as caught:
+        llm_eval.parse_claim_review(outside, "reviewer-1")
+
+    assert "Synthetic private" not in str(caught.value)
+
+
 def test_record_claim_review_persists_fused_counts_report_and_replay(
     claim_review_fixture,
 ):
@@ -2526,6 +2541,168 @@ def test_record_claim_review_rejects_tamper_cross_run_duplicates_and_short_batch
         "AND grounded_claims IS NOT NULL",
         [eval_run_id],
     ).fetchone() == (0,)
+
+
+def test_record_claim_review_revalidates_constructed_rows_before_database_access(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(con, eval_run_id, 50, 7, paths.interim / "claims.csv")
+    reviews = llm_eval.parse_claim_review(
+        _fill_claim_review(exported),
+        "reviewer-1",
+    )
+    first = reviews[0]
+    first_evidence = first.cited_evidence[0]
+    malformed = [
+        replace(first, grounded=2),
+        replace(first, claim_position=True),
+        replace(first, claim_position=0),
+        replace(first, review_id="not-a-digest"),
+        replace(first, question_id="unsafe question id"),
+        replace(first, question="=FORMULA"),
+        replace(first, claim_text="\x1bunsafe claim"),
+        replace(first, notes="=FORMULA"),
+        replace(first, cited_complaint_ids=list(first.cited_complaint_ids)),
+        replace(first, cited_complaint_ids=(True,)),
+        replace(first, cited_complaint_ids=(first.cited_complaint_ids[0],) * 2),
+        replace(first, cited_evidence=list(first.cited_evidence)),
+        replace(
+            first,
+            cited_complaint_ids=(1,),
+            cited_evidence=(llm_eval.ClaimEvidence(True, first_evidence.text_redacted),),
+        ),
+        replace(
+            first,
+            cited_evidence=(
+                llm_eval.ClaimEvidence(
+                    first_evidence.complaint_id + 999, first_evidence.text_redacted
+                ),
+            ),
+        ),
+        replace(
+            first,
+            cited_evidence=(llm_eval.ClaimEvidence(first_evidence.complaint_id, "=FORMULA"),),
+        ),
+    ]
+    for invalid in malformed:
+        no_database = _NoDatabaseConnection()
+        with pytest.raises((TypeError, ValueError)):
+            llm_eval.record_claim_review(
+                no_database,
+                eval_run_id,
+                [invalid, *reviews[1:]],
+            )
+        assert no_database.calls == []
+
+
+def test_claim_review_resolves_cross_company_nonrepresentative_from_expanded_corpus(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    con.execute(
+        "INSERT INTO company_canonical (company_id, canonical_name, verified_by) "
+        "VALUES ('company-2', 'Synthetic second company', 'manual')"
+    )
+    con.execute(
+        "INSERT INTO complaints (complaint_id, date_received, period_month, company_id, "
+        "product_family, has_narrative) VALUES "
+        "(999, '2020-01-02', '2020-01-01', 'company-2', 'family-1', true)"
+    )
+    con.execute(
+        "INSERT INTO narratives (complaint_id, text_redacted, text_hash, redaction_count) "
+        "VALUES (999, ?, 'expanded-hash-999', 0)",
+        [_token_text("expanded999x")],
+    )
+    con.execute(
+        "INSERT INTO embedding_map (complaint_id, row_idx, model, dim) "
+        "VALUES (999, 11, 'embed-m', 2)"
+    )
+    con.execute(
+        "INSERT INTO dup_groups "
+        "(run_id, complaint_id, group_id, is_representative, group_size, as_of) "
+        "VALUES ('0000000000098-evalded1', 999, 'eval-group-10', false, 2, '2020-01-02')"
+    )
+
+    manifest = paths.ground_truth / "rag_eval_questions.csv"
+    header, rows = _read_rows(manifest)
+    rows[0]["company_id"] = "company-2"
+    rows[0]["relevant_complaint_ids"] = "999"
+    _write_csv(manifest, header, rows)
+    con.execute(
+        "UPDATE runs SET params_json = ? WHERE run_id = ?",
+        [
+            json.dumps(
+                {"params": {"manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}}
+            ),
+            eval_run_id,
+        ],
+    )
+    question = llm_eval.load_manifest(manifest)[0]
+    evidence_rows = [
+        replace(
+            _answer_evidence(question, complaint_id=999),
+            company_id="company-2",
+            dense_rank=1,
+            sparse_rank=1,
+            fused_score=0.1,
+        )
+    ]
+    grounded = _grounded_answer(
+        claims=(
+            answer.Claim("Synthetic expanded claim one.", (999,)),
+            answer.Claim("Synthetic expanded claim two.", (999,)),
+        )
+    )
+    answer.write_cached_answer(
+        con,
+        question.question,
+        question.cluster_id,
+        question.company_id,
+        "model-private",
+        "prompt-private",
+        evidence_rows,
+        grounded,
+    )
+    con.execute("DELETE FROM llm_usage WHERE usage_id = 'claim-usage-000'")
+    con.execute(
+        "INSERT INTO llm_usage "
+        "(usage_id, run_id, operation, cluster_id, question_hash, model, prompt_version, "
+        "input_hash, cache_status, attempts, input_tokens, output_tokens, "
+        "cache_read_input_tokens, cache_creation_input_tokens, latency_seconds, "
+        "estimated_cost_usd, outcome, error_category, created_at) "
+        "VALUES ('expanded-usage-999', ?, 'answer', ?, ?, 'model-private', "
+        "'prompt-private', ?, 'miss', 1, 1, 1, 0, 0, 0.1, 0.01, 'ok', NULL, now())",
+        [
+            eval_run_id,
+            question.cluster_id,
+            answer.question_hash(question.question),
+            answer.answer_input_hash(
+                question.question,
+                question.cluster_id,
+                question.company_id,
+                "model-private",
+                "prompt-private",
+                evidence_rows,
+            ),
+        ],
+    )
+
+    exported = llm_eval.export_claim_review(
+        con,
+        eval_run_id,
+        60,
+        7,
+        paths.interim / "expanded-claims.csv",
+    )
+
+    expanded_rows = [row for row in _read_rows(exported)[1] if row["question_id"] == "rag-001"]
+    assert len(expanded_rows) == 2
+    assert {row["cited_complaint_ids"] for row in expanded_rows} == {"999"}
+    assert all(
+        [item["complaint_id"] for item in json.loads(row["cited_evidence_json"])] == [999]
+        for row in expanded_rows
+    )
 
 
 def test_groundedness_report_derives_pending_gate_below_human_minimum():
