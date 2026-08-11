@@ -129,3 +129,6 @@ passed + 6 expected skips; Ruff, scoped format, and diff check clean. No
 run-finished adjudication requirement, live provider call, human claim, schema,
 answer, or verification code was added or changed. Fix commit pending scoped
 re-review.
+Task 4 re-review: APPROVED at 8e08a4b — dedup-expanded evidence, constructed-type rejection before SQL, interim-only parsing, identity, sampling, Wilson, fused-only replay/rollback, and caller-transaction behavior all reproduced with no residual finding.
+
+Task 5: in progress.
