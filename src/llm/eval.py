@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import os
 import re
+import tempfile
 from collections import Counter
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 from src.config import CONFIG, PATHS
-from src.llm.retrieve import tokenize
+from src.llm import retrieve
+from src.population import EXPANDED_SELECT_SQL
 
 CATEGORY_ORDER = (
     "mechanism",
@@ -190,15 +194,27 @@ def _parse_rows(rows: list[dict[str, str]], expected_n: int) -> list[EvalQuestio
 
 def load_manifest(path: Path, expected_n: int = 30) -> list[EvalQuestion]:
     """Load the exact seven-column, category-balanced evaluation manifest."""
+    rows = _read_strict_csv(path, MANIFEST_HEADER, "manifest")
+    return _parse_rows(rows, expected_n)
+
+
+def _read_strict_csv(path: Path, header: tuple[str, ...], artifact: str) -> list[dict[str, str]]:
+    """Read a CSV only when every physical row has exactly the header's arity."""
     try:
         with path.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
-            if reader.fieldnames != list(MANIFEST_HEADER):
-                raise ManifestError("manifest columns do not match the seven-column contract")
-            rows = list(reader)
+            if reader.fieldnames != list(header):
+                raise ManifestError(f"{artifact} columns do not match the contract")
+            rows: list[dict[str, str]] = []
+            for line_number, row in enumerate(reader, start=2):
+                if None in row or any(value is None for value in row.values()):
+                    raise ManifestError(
+                        f"line {line_number}: {artifact} field count does not match its header"
+                    )
+                rows.append(row)
     except UnicodeDecodeError as exc:
-        raise ManifestError("manifest must be UTF-8") from exc
-    return _parse_rows(rows, expected_n)
+        raise ManifestError(f"{artifact} must be UTF-8") from exc
+    return rows
 
 
 def _shingles(tokens: list[str]) -> set[tuple[str, ...]]:
@@ -208,38 +224,35 @@ def _shingles(tokens: list[str]) -> set[tuple[str, ...]]:
     }
 
 
-def _scope_rows(con, question: EvalQuestion) -> list[tuple[int, str]]:
-    cluster = con.execute(
-        "SELECT 1 FROM clusters WHERE cluster_id = ?", [question.cluster_id]
-    ).fetchone()
-    if cluster is None:
-        raise ManifestError(f"question {question.question_id!r} references an unknown cluster_id")
-    if question.company_id is not None:
-        company_is_member = con.execute(
-            """
-            SELECT EXISTS (
-              SELECT 1 FROM cluster_members m
-              JOIN complaints c USING (complaint_id)
-              WHERE m.cluster_id = ? AND c.company_id = ?
-            )
-            """,
-            [question.cluster_id, question.company_id],
-        ).fetchone()[0]
-        if not company_is_member:
-            raise ManifestError(
-                f"question {question.question_id!r} company_id is not a member of its cluster"
-            )
-    return con.execute(
+def _embed_model_for_cluster(con, question_id: str, cluster_id: str) -> str:
+    row = con.execute(
         """
-        SELECT m.complaint_id, n.text_redacted
-        FROM cluster_members m
-        JOIN complaints c USING (complaint_id)
-        JOIN narratives n USING (complaint_id)
-        WHERE m.cluster_id = ? AND (? IS NULL OR c.company_id = ?)
-        ORDER BY m.complaint_id
+        SELECT json_extract_string(r.params_json, '$.params.model')
+        FROM clusters c JOIN runs r ON r.run_id = c.run_id
+        WHERE c.cluster_id = ?
         """,
-        [question.cluster_id, question.company_id, question.company_id],
-    ).fetchall()
+        [cluster_id],
+    ).fetchone()
+    if row is None:
+        raise ManifestError(f"question {question_id!r} references an unknown cluster_id")
+    model = row[0]
+    if not isinstance(model, str) or not model.strip():
+        raise ManifestError(
+            f"question {question_id!r} has no retrievable evidence for its cluster/model scope"
+        )
+    return model
+
+
+def _scope_rows(con, question: EvalQuestion) -> list[tuple[int, str]]:
+    model = _embed_model_for_cluster(con, question.question_id, question.cluster_id)
+    try:
+        corpus = retrieve.load_corpus(con, question.cluster_id, question.company_id, model)
+    except ValueError:
+        raise ManifestError(
+            f"question {question.question_id!r} has no retrievable evidence for "
+            "its cluster/company/model scope"
+        ) from None
+    return [(row.complaint_id, row.text_redacted) for row in corpus.rows]
 
 
 def validate_manifest(con, questions: list[EvalQuestion]) -> None:
@@ -253,11 +266,11 @@ def validate_manifest(con, questions: list[EvalQuestion]) -> None:
                 f"question {question.question_id!r} has relevant complaint IDs outside "
                 "its exact cluster/company scope"
             )
-        question_shingles = _shingles(tokenize(question.question))
+        question_shingles = _shingles(retrieve.tokenize(question.question))
         if not question_shingles:
             continue
         for complaint_id, text_redacted in rows:
-            if question_shingles & _shingles(tokenize(text_redacted)):
+            if question_shingles & _shingles(retrieve.tokenize(text_redacted)):
                 raise ManifestError(
                     f"question {question.question_id!r} has an eight-token overlap "
                     f"with complaint_id {complaint_id}"
@@ -284,24 +297,64 @@ def _latest_signals_provenance(con) -> tuple[str, str]:
 
 def _authoring_candidates(con) -> list[_AuthoringCandidate]:
     signals_run, cluster_run = _latest_signals_provenance(con)
-    rows = con.execute(
+    provenance = con.execute(
         """
-        WITH member_counts AS (
-          SELECT m.cluster_id, c.company_id, count(*) AS n_narratives
-          FROM cluster_members m
-          JOIN complaints c USING (complaint_id)
+        SELECT json_extract_string(params_json, '$.params.dedup_run'),
+               json_extract_string(params_json, '$.params.model'),
+               nullif(json_extract_string(params_json, '$.params.cutoff'), '')
+        FROM runs WHERE run_id = ? AND phase = 'cluster' AND status = 'ok'
+        """,
+        [cluster_run],
+    ).fetchone()
+    if provenance is None or not all(
+        isinstance(value, str) and value.strip() for value in provenance[:2]
+    ):
+        raise ManifestError("the authoring cluster run lacks retrieval provenance")
+    dedup_run, embed_model, cutoff = provenance
+    query = f"""
+        WITH expanded AS (
+          {EXPANDED_SELECT_SQL}
+        ),
+        ranked AS (
+          SELECT expanded.*, dates.date_received,
+                 row_number() OVER (
+                   PARTITION BY expanded.group_id, expanded.company_id
+                   ORDER BY dates.date_received, expanded.complaint_id
+                 ) AS evidence_rank
+          FROM expanded
+          JOIN complaints dates USING (complaint_id)
+          WHERE expanded.cluster_id IS NOT NULL
+            AND expanded.product_family = expanded.cluster_family
+        ),
+        retrievable AS (
+          SELECT ranked.cluster_id, ranked.company_id, ranked.group_id,
+                 ranked.complaint_id
+          FROM ranked
           JOIN narratives n USING (complaint_id)
-          WHERE length(trim(n.text_redacted)) > 0
-          GROUP BY m.cluster_id, c.company_id
+          JOIN embedding_map e
+            ON e.complaint_id = ranked.complaint_id AND e.model = ?
+          WHERE ranked.evidence_rank = 1
+        ),
+        scope_counts AS (
+          SELECT cluster_id, company_id, count(*) AS n_evidence
+          FROM retrievable GROUP BY cluster_id, company_id
         ),
         cluster_counts AS (
-          SELECT cluster_id, sum(n_narratives) AS n_narratives
-          FROM member_counts GROUP BY cluster_id
+          SELECT cluster_id, sum(n_evidence) AS n_evidence
+          FROM scope_counts GROUP BY cluster_id
         ),
-        fired_scopes AS (
-          SELECT DISTINCT cluster_id, company_id
-          FROM signals
-          WHERE run_id = ? AND q_value <= ?
+        grouped_signals AS (
+          SELECT cluster_id, company_id,
+                 min(CASE WHEN method = 'ebgm' THEN q_value END) AS q_value,
+                 max(CASE WHEN method IN ('ewma', 'pelt') THEN 1 ELSE 0 END) AS changed,
+                 max(n_supporting_groups) AS n_groups
+          FROM signals WHERE run_id = ? GROUP BY cluster_id, company_id
+        ),
+        canonical_fired AS (
+          SELECT g.cluster_id, g.company_id
+          FROM grouped_signals g JOIN clusters c USING (cluster_id)
+          WHERE c.run_id = ? AND c.coherence >= ? AND g.n_groups >= ?
+            AND (g.q_value <= ? OR g.changed = 1)
         ),
         fired AS (
           SELECT fs.cluster_id,
@@ -309,39 +362,48 @@ def _authoring_candidates(con) -> list[_AuthoringCandidate]:
                    AS company_id,
                  cl.product_family,
                  true AS did_fire
-          FROM fired_scopes fs
+          FROM canonical_fired fs
           JOIN clusters cl ON cl.cluster_id = fs.cluster_id AND cl.run_id = ?
-          LEFT JOIN member_counts mc
-            ON mc.cluster_id = fs.cluster_id AND mc.company_id = fs.company_id
+          LEFT JOIN scope_counts sc
+            ON sc.cluster_id = fs.cluster_id AND sc.company_id = fs.company_id
           LEFT JOIN cluster_counts cc ON cc.cluster_id = fs.cluster_id
           WHERE CASE WHEN fs.company_id = '__ALL__'
-                     THEN coalesce(cc.n_narratives, 0)
-                     ELSE coalesce(mc.n_narratives, 0)
+                     THEN coalesce(cc.n_evidence, 0)
+                     ELSE coalesce(sc.n_evidence, 0)
                 END >= ?
         ),
         controls AS (
           SELECT cl.cluster_id, NULL AS company_id, cl.product_family, false AS did_fire
           FROM clusters cl
           JOIN cluster_counts cc USING (cluster_id)
-          WHERE cl.run_id = ? AND cc.n_narratives >= ?
+          WHERE cl.run_id = ? AND cc.n_evidence >= ?
             AND NOT EXISTS (
-              SELECT 1 FROM signals s
-              WHERE s.run_id = ? AND s.cluster_id = cl.cluster_id
+              SELECT 1 FROM canonical_fired f WHERE f.cluster_id = cl.cluster_id
             )
         )
         SELECT DISTINCT cluster_id, company_id, product_family, did_fire FROM fired
         UNION ALL
         SELECT cluster_id, company_id, product_family, did_fire FROM controls
         ORDER BY cluster_id, company_id
-        """,
+        """  # noqa: S608 - interpolation is the static shared population SQL
+    rows = con.execute(
+        query,
         [
+            cluster_run,
+            dedup_run,
+            dedup_run,
+            cutoff,
+            cutoff,
+            embed_model,
             signals_run,
+            cluster_run,
+            CONFIG.novelty.min_coherence,
+            CONFIG.signals.min_supporting_groups,
             CONFIG.signals.fdr_alpha,
             cluster_run,
             _EXCERPTS_PER_ROW,
             cluster_run,
             _EXCERPTS_PER_ROW,
-            signals_run,
         ],
     ).fetchall()
     return [_AuthoringCandidate(*row) for row in rows]
@@ -405,24 +467,14 @@ def _spreadsheet_safe(value: str | None) -> str:
 
 
 def _evidence(con, candidate: _AuthoringCandidate) -> list[tuple[int, str]]:
-    return con.execute(
-        """
-        SELECT m.complaint_id, n.text_redacted
-        FROM cluster_members m
-        JOIN complaints c USING (complaint_id)
-        JOIN narratives n USING (complaint_id)
-        WHERE m.cluster_id = ? AND (? IS NULL OR c.company_id = ?)
-          AND length(trim(n.text_redacted)) > 0
-        ORDER BY m.complaint_id
-        LIMIT ?
-        """,
-        [
-            candidate.cluster_id,
-            candidate.company_id,
-            candidate.company_id,
-            _EXCERPTS_PER_ROW,
-        ],
-    ).fetchall()
+    model = _embed_model_for_cluster(con, "authoring", candidate.cluster_id)
+    try:
+        corpus = retrieve.load_corpus(con, candidate.cluster_id, candidate.company_id, model)
+    except ValueError:
+        raise ManifestError(
+            f"candidate cluster {candidate.cluster_id!r} no longer has retrievable evidence"
+        ) from None
+    return [(row.complaint_id, row.text_redacted) for row in corpus.rows[:_EXCERPTS_PER_ROW]]
 
 
 def _inside(path: Path, parent: Path) -> bool:
@@ -444,12 +496,43 @@ def _ensure_private_destination(path: Path) -> None:
 
 
 def _write_rows(path: Path, header: tuple[str, ...], rows: list[dict[str, str]]) -> Path:
+    parent_existed = path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(header), extrasaction="raise")
-        writer.writeheader()
-        writer.writerows(rows)
-    return path
+    if not parent_existed:
+        _fsync_directory(path.parent.parent)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            writer = csv.DictWriter(handle, fieldnames=list(header), extrasaction="raise")
+            writer.writeheader()
+            writer.writerows(rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+        return path
+    except BaseException:
+        if temporary_path is not None:
+            with suppress(FileNotFoundError):
+                temporary_path.unlink()
+        raise
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def export_authoring_worklist(con, seed: int, path: Path) -> Path:
@@ -485,11 +568,7 @@ def export_authoring_worklist(con, seed: int, path: Path) -> Path:
 
 def import_authoring_worklist(con, source: Path, destination: Path) -> Path:
     """Validate a completed human worklist and emit only committed ID columns."""
-    with source.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames != list(AUTHORING_HEADER):
-            raise ManifestError("authoring worklist columns do not match the contract")
-        source_rows = list(reader)
+    source_rows = _read_strict_csv(source, AUTHORING_HEADER, "authoring worklist")
     if len(source_rows) != len(CATEGORY_ORDER) * _QUESTIONS_PER_CATEGORY:
         raise ManifestError("authoring worklist must contain exactly 30 completed rows")
 

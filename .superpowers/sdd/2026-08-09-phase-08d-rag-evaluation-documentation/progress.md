@@ -15,3 +15,14 @@ families; zero unsafe formula-prefix cells). Human author/privacy review and the
 committed ID-only manifest remain intentionally pending. Verification: 58 passed
 + 1 expected focused skip; full 515 passed + 6 expected skips; Ruff, scoped
 format, and diff check clean. Implementation committed with the Task 1 files.
+
+Task 1: fix round 1/5 — four reviewer findings reproduced and addressed:
+retrieval-identical scope, canonical alert status, exact CSV row arity, and
+failure-atomic durable writes. Corrected real draft independently audits to 15
+canonical fired / 15 canonical controls with zero mismatches. Focused
+compatibility: 129 passed + 1 expected skip. Open human-curation plan concern:
+`company_response` requires public-response evidence, but the mandated worklist
+contains narrative excerpts only; no code change made pending plan resolution.
+Final verification: focused 129 passed + 1 expected skip; full 526 passed + 6
+expected skips; Ruff, scoped format, and diff check clean. The Task 1 fix commit
+contains this ledger update.

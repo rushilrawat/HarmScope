@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from src.llm import eval as llm_eval
+from src.llm import retrieve
 
 
 def _token_text(prefix: str, count: int = 12) -> str:
@@ -125,19 +126,54 @@ def test_manifest_parser_rejects_wrong_header_and_distribution(tmp_path):
         )
 
 
+@pytest.mark.parametrize("malformation", ["extra", "missing"])
+def test_manifest_parser_rejects_wrong_row_arity(tmp_path, malformation):
+    path = _write_csv(
+        tmp_path / "manifest.csv",
+        list(llm_eval.MANIFEST_HEADER),
+        _small_manifest_rows(),
+    )
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if malformation == "extra":
+        lines[1] += ",unexpected"
+    else:
+        lines[-1] = lines[-1].rsplit(",", 1)[0]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(llm_eval.ManifestError, match="field count"):
+        llm_eval.load_manifest(path, expected_n=6)
+
+
 @pytest.fixture
 def validation_fixture(con):
+    dedup_run = "0000000000000-dedup001"
     run_id = "0000000000001-cluster1"
     con.execute(
         "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
-        "started_at, status) VALUES (?, 'cluster', 'test', 'test', '{}', now(), 'ok')",
-        [run_id],
+        "started_at, status) VALUES (?, 'dedup', 'test', 'test', '{}', now(), 'ok')",
+        [dedup_run],
+    )
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'cluster', 'test', 'test', ?, now(), 'ok')",
+        [
+            run_id,
+            json.dumps(
+                {
+                    "params": {
+                        "dedup_run": dedup_run,
+                        "model": "embed-m",
+                        "cutoff": "2020-02-01",
+                    }
+                }
+            ),
+        ],
     )
     for cluster_id in ("cluster-1", "cluster-2"):
         con.execute(
             "INSERT INTO clusters "
             "(cluster_id, run_id, product_family, n_members, as_of) "
-            "VALUES (?, ?, 'family-1', 3, ?)",
+            "VALUES (?, ?, 'family-1', 8, ?)",
             [cluster_id, run_id, date(2020, 1, 1)],
         )
     for company_id in ("company-1", "company-2", "company-3"):
@@ -147,16 +183,22 @@ def validation_fixture(con):
             [company_id, company_id],
         )
     records = [
-        (10, "cluster-1", "company-1", _token_text("alpha")),
-        (20, "cluster-1", "company-2", _token_text("beta")),
-        (30, "cluster-2", "company-1", _token_text("gamma")),
+        (10, "cluster-1", "company-1", "family-1", _token_text("alpha")),
+        (20, "cluster-1", "company-2", "family-1", _token_text("beta")),
+        (30, "cluster-2", "company-1", "family-1", _token_text("gamma")),
+        (50, None, "company-2", "family-1", _token_text("delta")),
+        (60, "cluster-1", "company-1", "family-1", _token_text("campaign")),
+        (70, "cluster-1", "company-1", "family-1", _token_text("future")),
+        (80, "cluster-1", "company-1", "family-2", _token_text("family")),
+        (90, "cluster-1", "company-1", "family-1", _token_text("unembedded")),
     ]
-    for complaint_id, cluster_id, company_id, text in records:
+    for row_idx, (complaint_id, cluster_id, company_id, family, text) in enumerate(records):
+        received = date(2020, 3, 1) if complaint_id == 70 else date(2020, 1, 1)
         con.execute(
             "INSERT INTO complaints "
             "(complaint_id, date_received, period_month, company_id, "
-            "product_family, has_narrative) VALUES (?, ?, ?, ?, 'family-1', true)",
-            [complaint_id, date(2020, 1, 1), date(2020, 1, 1), company_id],
+            "product_family, has_narrative) VALUES (?, ?, ?, ?, ?, true)",
+            [complaint_id, received, received.replace(day=1), company_id, family],
         )
         con.execute(
             "INSERT INTO narratives "
@@ -164,10 +206,31 @@ def validation_fixture(con):
             "VALUES (?, ?, ?, 0)",
             [complaint_id, text, f"hash-{complaint_id}"],
         )
+        if complaint_id != 90:
+            con.execute(
+                "INSERT INTO embedding_map (complaint_id, row_idx, model, dim) "
+                "VALUES (?, ?, 'embed-m', 2)",
+                [complaint_id, row_idx],
+            )
+        group_id = "group-10" if complaint_id in {10, 50} else f"group-{complaint_id}"
         con.execute(
-            "INSERT INTO cluster_members (cluster_id, complaint_id) VALUES (?, ?)",
-            [cluster_id, complaint_id],
+            "INSERT INTO dup_groups "
+            "(run_id, complaint_id, group_id, is_representative, group_size, as_of) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                dedup_run,
+                complaint_id,
+                group_id,
+                complaint_id != 50,
+                2 if complaint_id in {10, 50} else 1,
+                date(2020, 3, 1),
+            ],
         )
+        if cluster_id is not None:
+            con.execute(
+                "INSERT INTO cluster_members (cluster_id, complaint_id) VALUES (?, ?)",
+                [cluster_id, complaint_id],
+            )
     con.execute(
         "INSERT INTO complaints "
         "(complaint_id, date_received, period_month, company_id, "
@@ -175,6 +238,15 @@ def validation_fixture(con):
         [date(2020, 1, 1), date(2020, 1, 1)],
     )
     con.execute("INSERT INTO cluster_members (cluster_id, complaint_id) VALUES ('cluster-1', 40)")
+    con.execute(
+        "INSERT INTO campaigns "
+        "(campaign_id, run_id, n_complaints, n_groups, product_family, n_signals, "
+        "flagged, as_of) VALUES ('campaign-1', ?, 1, 1, 'family-1', 3, true, ?)",
+        [dedup_run, date(2020, 1, 1)],
+    )
+    con.execute(
+        "INSERT INTO campaign_members (complaint_id, campaign_id) VALUES (60, 'campaign-1')"
+    )
     return con
 
 
@@ -232,7 +304,7 @@ def test_privacy_guard_accepts_shorter_overlap(validation_fixture):
     llm_eval.validate_manifest(validation_fixture, [_question(question=seven_tokens)])
 
 
-def test_company_membership_does_not_require_a_narrative(validation_fixture):
+def test_retrieval_scope_requires_retrievable_narrative_evidence(validation_fixture):
     question = llm_eval.EvalQuestion(
         question_id="rag-006",
         question="Synthetic unavailable fact?",
@@ -243,24 +315,68 @@ def test_company_membership_does_not_require_a_narrative(validation_fixture):
         answerable=False,
     )
 
+    with pytest.raises(llm_eval.ManifestError, match="retrievable evidence"):
+        llm_eval.validate_manifest(validation_fixture, [question])
+
+
+def test_validation_includes_nonrepresentative_cross_company_duplicate(
+    validation_fixture,
+):
+    corpus = retrieve.load_corpus(validation_fixture, "cluster-1", "company-2", "embed-m")
+    assert [row.complaint_id for row in corpus.rows] == [20, 50]
+
+    question = _question(company_id="company-2", relevant_ids=frozenset({50}))
     llm_eval.validate_manifest(validation_fixture, [question])
+
+    overlap = " ".join(f"delta{index}" for index in range(8))
+    with pytest.raises(llm_eval.ManifestError, match="eight-token"):
+        llm_eval.validate_manifest(
+            validation_fixture,
+            [_question(question=overlap, company_id="company-2", relevant_ids=frozenset({50}))],
+        )
+
+
+@pytest.mark.parametrize("excluded_id", [60, 70, 80, 90])
+def test_validation_rejects_ids_excluded_by_retrieval_scope(validation_fixture, excluded_id):
+    with pytest.raises(llm_eval.ManifestError, match="outside"):
+        llm_eval.validate_manifest(
+            validation_fixture,
+            [_question(company_id="company-1", relevant_ids=frozenset({excluded_id}))],
+        )
 
 
 @pytest.fixture
 def authoring_fixture(con):
+    dedup_run = "0000000000000-dedup001"
     cluster_run = "0000000000001-cluster1"
     signals_run = "0000000000002-signal01"
     con.execute(
         "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
-        "started_at, status) VALUES (?, 'cluster', 'test', 'test', '{}', now(), 'ok')",
-        [cluster_run],
+        "started_at, status) VALUES (?, 'dedup', 'test', 'test', '{}', now(), 'ok')",
+        [dedup_run],
+    )
+    con.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'cluster', 'test', 'test', ?, now(), 'ok')",
+        [
+            cluster_run,
+            json.dumps(
+                {
+                    "params": {
+                        "dedup_run": dedup_run,
+                        "model": "embed-m",
+                        "cutoff": "",
+                    }
+                }
+            ),
+        ],
     )
     con.execute(
         "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
         "started_at, status) VALUES (?, 'signals', 'test', 'test', ?, now(), 'ok')",
         [signals_run, json.dumps({"params": {"cluster_run": cluster_run}})],
     )
-    for company_number in range(36):
+    for company_number in range(42):
         company_id = f"company-{company_number:02d}"
         con.execute(
             "INSERT INTO company_canonical "
@@ -268,24 +384,54 @@ def authoring_fixture(con):
             [company_id, company_id],
         )
     complaint_id = 1_000
-    for cluster_number in range(36):
+    for cluster_number in range(42):
         cluster_id = f"{cluster_run}:family-{cluster_number % 6}:{cluster_number:02d}"
         family = f"family-{cluster_number % 6}"
         company_id = f"company-{cluster_number:02d}"
         con.execute(
             "INSERT INTO clusters "
-            "(cluster_id, run_id, product_family, n_members, as_of) "
-            "VALUES (?, ?, ?, 10, ?)",
+            "(cluster_id, run_id, product_family, n_members, coherence, as_of) "
+            "VALUES (?, ?, ?, 10, 0.9, ?)",
             [cluster_id, cluster_run, family, date(2020, 1, 1)],
         )
-        if cluster_number < 18:
+        if cluster_number < 9:
             con.execute(
                 "INSERT INTO signals "
                 "(signal_id, run_id, cluster_id, company_id, period_month, method, "
                 "statistic, q_value, n_supporting, n_supporting_groups, as_of) "
-                "VALUES (?, ?, ?, ?, ?, 'ewma', 1.0, 0.01, 10, 10, ?)",
+                "VALUES (?, ?, ?, ?, ?, 'ebgm', 1.0, 0.01, 20, 15, ?)",
                 [
                     f"signal-{cluster_number}",
+                    signals_run,
+                    cluster_id,
+                    company_id,
+                    date(2020, 1, 1),
+                    date(2020, 1, 1),
+                ],
+            )
+        elif cluster_number < 18:
+            con.execute(
+                "INSERT INTO signals "
+                "(signal_id, run_id, cluster_id, company_id, period_month, method, "
+                "statistic, q_value, n_supporting, n_supporting_groups, as_of) "
+                "VALUES (?, ?, ?, ?, ?, 'ewma', 1.0, NULL, 20, 15, ?)",
+                [
+                    f"signal-{cluster_number}",
+                    signals_run,
+                    cluster_id,
+                    company_id,
+                    date(2020, 1, 1),
+                    date(2020, 1, 1),
+                ],
+            )
+        elif cluster_number == 18:
+            con.execute(
+                "INSERT INTO signals "
+                "(signal_id, run_id, cluster_id, company_id, period_month, method, "
+                "statistic, q_value, n_supporting, n_supporting_groups, as_of) "
+                "VALUES (?, ?, ?, ?, ?, 'ebgm', 1.0, 0.01, 20, 14, ?)",
+                [
+                    "signal-noncanonical",
                     signals_run,
                     cluster_id,
                     company_id,
@@ -314,6 +460,17 @@ def authoring_fixture(con):
                 "(complaint_id, text_redacted, text_hash, redaction_count) "
                 "VALUES (?, ?, ?, 0)",
                 [complaint_id, text, f"hash-{complaint_id}"],
+            )
+            con.execute(
+                "INSERT INTO embedding_map (complaint_id, row_idx, model, dim) "
+                "VALUES (?, ?, 'embed-m', 2)",
+                [complaint_id, complaint_id - 1_000],
+            )
+            con.execute(
+                "INSERT INTO dup_groups "
+                "(run_id, complaint_id, group_id, is_representative, group_size, as_of) "
+                "VALUES (?, ?, ?, true, 1, ?)",
+                [dedup_run, complaint_id, f"group-{complaint_id}", date(2020, 1, 1)],
             )
             con.execute(
                 "INSERT INTO cluster_members (cluster_id, complaint_id) VALUES (?, ?)",
@@ -353,6 +510,37 @@ def test_authoring_export_is_deterministic_balanced_and_spreadsheet_safe(
         assert all(row[f"evidence_{index}_complaint_id"] for index in range(1, 11))
         for value in row.values():
             assert not value.startswith(("=", "+", "-", "@"))
+
+
+def test_authoring_status_matches_canonical_alert_gate(authoring_fixture, tmp_path):
+    path = llm_eval.export_authoring_worklist(authoring_fixture, 29, tmp_path / "canonical.csv")
+    _, rows = _read_rows(path)
+    canonical = {
+        (cluster_id, company_id)
+        for cluster_id, company_id in authoring_fixture.execute(
+            """
+            WITH grouped AS (
+              SELECT cluster_id, company_id,
+                     min(CASE WHEN method = 'ebgm' THEN q_value END) AS q_value,
+                     max(CASE WHEN method IN ('ewma', 'pelt') THEN 1 ELSE 0 END) AS changed,
+                     max(n_supporting_groups) AS n_groups
+              FROM signals WHERE run_id = '0000000000002-signal01'
+              GROUP BY 1, 2
+            )
+            SELECT g.cluster_id, g.company_id
+            FROM grouped g JOIN clusters c USING (cluster_id)
+            WHERE c.coherence >= 0.45 AND g.n_groups >= 15
+              AND (g.q_value <= 0.05 OR g.changed = 1)
+            """
+        ).fetchall()
+    }
+    canonical_clusters = {cluster_id for cluster_id, _ in canonical}
+    for row in rows:
+        scope = (row["cluster_id"], row["company_id"] or "__ALL__")
+        if row["fired_status"] == "fired":
+            assert scope in canonical
+        else:
+            assert row["cluster_id"] not in canonical_clusters
 
 
 def _completed_worklist(path: Path) -> list[dict[str, str]]:
@@ -413,6 +601,41 @@ def test_authoring_import_rejects_formula_question_and_out_of_scope_id(authoring
     _write_csv(draft, list(llm_eval.AUTHORING_HEADER), completed)
     with pytest.raises(llm_eval.ManifestError, match="outside"):
         llm_eval.import_authoring_worklist(authoring_fixture, draft, tmp_path / "manifest.csv")
+
+
+@pytest.mark.parametrize("malformation", ["extra", "missing"])
+def test_authoring_import_rejects_wrong_row_arity(authoring_fixture, tmp_path, malformation):
+    draft = llm_eval.export_authoring_worklist(authoring_fixture, 31, tmp_path / "draft.csv")
+    completed = _completed_worklist(draft)
+    _write_csv(draft, list(llm_eval.AUTHORING_HEADER), completed)
+    lines = draft.read_text(encoding="utf-8").splitlines()
+    if malformation == "extra":
+        lines[1] += ",unexpected"
+    else:
+        lines[-1] = lines[-1].rsplit(",", 1)[0]
+    draft.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(llm_eval.ManifestError, match="field count"):
+        llm_eval.import_authoring_worklist(authoring_fixture, draft, tmp_path / "manifest.csv")
+
+
+def test_export_write_failure_preserves_destination_and_cleans_temporary_file(
+    authoring_fixture, tmp_path, monkeypatch
+):
+    destination = tmp_path / "draft.csv"
+    original = b"existing valid destination\n"
+    destination.write_bytes(original)
+
+    def fail_mid_write(writer, rows):
+        writer.writerow(rows[0])
+        raise OSError("simulated mid-write failure")
+
+    monkeypatch.setattr(csv.DictWriter, "writerows", fail_mid_write)
+    with pytest.raises(OSError, match="simulated mid-write failure"):
+        llm_eval.export_authoring_worklist(authoring_fixture, 37, destination)
+
+    assert destination.read_bytes() == original
+    assert list(tmp_path.glob(".draft.csv.*.tmp")) == []
 
 
 def test_authoring_export_refuses_a_tracked_repository_destination(
