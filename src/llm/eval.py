@@ -251,25 +251,24 @@ def _validate_component_ranking(hits: tuple[retrieve.RankedHit, ...], label: str
     return complaint_ids
 
 
-def _validate_fused_ranking(hits: tuple[retrieve.FusedHit, ...]) -> list[int]:
+def _validate_fused_ranking(
+    hits: tuple[retrieve.FusedHit, ...],
+    dense: tuple[retrieve.RankedHit, ...],
+    sparse: tuple[retrieve.RankedHit, ...],
+) -> list[int]:
     if type(hits) is not tuple:
         raise ValueError("fused ranking must be a tuple")
-    complaint_ids: list[int] = []
-    for hit in hits:
-        if not isinstance(hit, retrieve.FusedHit):
-            raise ValueError("fused ranking contains an invalid hit")
-        if type(hit.complaint_id) is not int or hit.complaint_id <= 0:
-            raise ValueError("fused complaint IDs must be positive integers")
-        if (
-            not isinstance(hit.fused_score, Real)
-            or isinstance(hit.fused_score, bool)
-            or not math.isfinite(hit.fused_score)
-        ):
-            raise ValueError("fused scores must be finite numbers")
-        complaint_ids.append(hit.complaint_id)
-    if len(complaint_ids) != len(set(complaint_ids)):
-        raise ValueError("fused ranking contains duplicate complaint IDs")
-    return complaint_ids
+    expected = tuple(
+        retrieve.reciprocal_rank_fusion(
+            list(dense),
+            list(sparse),
+            CONFIG.llm.rrf_k,
+            CONFIG.llm.rag_top_k,
+        )
+    )
+    if hits != expected:
+        raise ValueError("fused ranking does not match the configured reciprocal-rank fusion")
+    return [hit.complaint_id for hit in hits]
 
 
 def evaluate_retrieval_question(
@@ -287,7 +286,7 @@ def evaluate_retrieval_question(
         raise ValueError("retrieval result scope does not match the evaluation question")
     dense_ids = _validate_component_ranking(result.dense, "dense")
     bm25_ids = _validate_component_ranking(result.sparse, "bm25")
-    fused_ids = _validate_fused_ranking(result.fused)
+    fused_ids = _validate_fused_ranking(result.fused, result.dense, result.sparse)
     relevant = set(question.relevant_complaint_ids)
     return {
         "dense": score_ranking(dense_ids, relevant),
@@ -321,8 +320,8 @@ def _validate_retrieval_batch(
         raise ValueError("questions must be a non-empty list")
     if type(embed_model) is not str or not embed_model.strip():
         raise ValueError("embed_model is required")
-    if type(eval_run_id) is not str or not eval_run_id.strip():
-        raise ValueError("eval_run_id is required")
+    if type(eval_run_id) is not str or not _SAFE_ID.fullmatch(eval_run_id):
+        raise ValueError("eval_run_id must be a safe non-blank identifier")
     seen: set[str] = set()
     for question in questions:
         if not isinstance(question, EvalQuestion):

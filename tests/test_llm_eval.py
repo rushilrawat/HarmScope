@@ -6,6 +6,7 @@ import csv
 import json
 import math
 from collections import Counter
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -672,7 +673,6 @@ def _retrieval_result(
     *,
     dense_ids: tuple[int, ...] = (10, 20, 30),
     bm25_ids: tuple[int, ...] = (20, 10, 30),
-    fused_ids: tuple[int, ...] = (30, 10, 20),
     latencies: tuple[float, float, float] = (0.01, 0.02, 0.003),
 ) -> retrieve.RetrievalResult:
     dense = tuple(
@@ -684,15 +684,12 @@ def _retrieval_result(
         for rank, complaint_id in enumerate(bm25_ids, start=1)
     )
     fused = tuple(
-        retrieve.FusedHit(
-            complaint_id,
-            1.0 / (60 + rank),
-            next((hit.rank for hit in dense if hit.complaint_id == complaint_id), None),
-            next((hit.score for hit in dense if hit.complaint_id == complaint_id), None),
-            next((hit.rank for hit in sparse if hit.complaint_id == complaint_id), None),
-            next((hit.score for hit in sparse if hit.complaint_id == complaint_id), None),
+        retrieve.reciprocal_rank_fusion(
+            list(dense),
+            list(sparse),
+            llm_eval.CONFIG.llm.rrf_k,
+            llm_eval.CONFIG.llm.rag_top_k,
         )
-        for rank, complaint_id in enumerate(fused_ids, start=1)
     )
     return retrieve.RetrievalResult(
         corpus=retrieve.ScopedCorpus("cluster-1", "company-1", "embed-m", ()),
@@ -704,6 +701,14 @@ def _retrieval_result(
         sparse_seconds=latencies[1],
         fusion_seconds=latencies[2],
     )
+
+
+def _valid_rrf_result(
+    *,
+    dense_ids: tuple[int, ...] = (10, 20),
+    bm25_ids: tuple[int, ...] = (20, 10),
+) -> retrieve.RetrievalResult:
+    return _retrieval_result(dense_ids=dense_ids, bm25_ids=bm25_ids)
 
 
 class _VariantRetriever:
@@ -758,7 +763,7 @@ def test_evaluate_retrieval_question_scores_exactly_three_orderings():
     assert set(got) == {"dense", "bm25", "fused"}
     assert got["dense"].rank_first_relevant == 1
     assert got["bm25"].rank_first_relevant == 2
-    assert got["fused"].rank_first_relevant == 2
+    assert got["fused"].rank_first_relevant == 1
 
 
 def test_evaluate_retrieval_question_rejects_wrong_scope_and_rank_shapes():
@@ -783,6 +788,82 @@ def test_evaluate_retrieval_question_rejects_wrong_scope_and_rank_shapes():
     )
     with pytest.raises(ValueError, match="dense.*rank|dense.*duplicate"):
         llm_eval.evaluate_retrieval_question(question, malformed)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "outside-component-union",
+        "dense-rank",
+        "sparse-score",
+        "rank-score-presence",
+        "reversed-order",
+        "wrong-fused-score",
+        "truncated",
+    ],
+)
+def test_evaluate_retrieval_question_rejects_fused_output_not_produced_by_rrf(
+    malformation,
+):
+    question = _retrieval_question("rag-001")
+    result = _valid_rrf_result()
+    fused = result.fused
+    if malformation == "outside-component-union":
+        malformed = (
+            retrieve.FusedHit(999, fused[0].fused_score, None, None, None, None),
+            fused[1],
+        )
+    elif malformation == "dense-rank":
+        malformed = (replace(fused[0], dense_rank=2), fused[1])
+    elif malformation == "sparse-score":
+        malformed = (replace(fused[0], sparse_score=999.0), fused[1])
+    elif malformation == "rank-score-presence":
+        malformed = (replace(fused[0], sparse_rank=None), fused[1])
+    elif malformation == "reversed-order":
+        malformed = tuple(reversed(fused))
+    elif malformation == "wrong-fused-score":
+        malformed = (replace(fused[0], fused_score=0.99), fused[1])
+    else:
+        malformed = fused[:-1]
+    object.__setattr__(result, "fused", malformed)
+
+    with pytest.raises(ValueError, match="fused"):
+        llm_eval.evaluate_retrieval_question(question, result)
+
+
+def test_evaluate_retrieval_question_rejects_fused_rows_when_components_are_empty():
+    result = _valid_rrf_result(dense_ids=(), bm25_ids=())
+    object.__setattr__(
+        result,
+        "fused",
+        (retrieve.FusedHit(999, 0.5, None, None, None, None),),
+    )
+
+    with pytest.raises(ValueError, match="fused"):
+        llm_eval.evaluate_retrieval_question(_retrieval_question("rag-001"), result)
+
+
+@pytest.mark.parametrize("length_change", ["truncated", "extra"])
+def test_evaluate_retrieval_question_requires_configured_fused_top_k(length_change):
+    dense_ids = tuple(range(1, llm_eval.CONFIG.llm.rag_top_k + 3))
+    result = _valid_rrf_result(dense_ids=dense_ids, bm25_ids=())
+    assert len(result.fused) == llm_eval.CONFIG.llm.rag_top_k
+    if length_change == "truncated":
+        malformed = result.fused[:-1]
+    else:
+        full = retrieve.reciprocal_rank_fusion(
+            list(result.dense),
+            list(result.sparse),
+            llm_eval.CONFIG.llm.rrf_k,
+            len(dense_ids),
+        )
+        malformed = tuple(full)
+    object.__setattr__(result, "fused", malformed)
+
+    with pytest.raises(ValueError, match="fused"):
+        llm_eval.evaluate_retrieval_question(
+            _retrieval_question("rag-001", relevant_ids=frozenset({1})), result
+        )
 
 
 def test_retrieval_eval_persists_three_variants_once_and_aggregates_answerable_only(con):
@@ -821,9 +902,9 @@ def test_retrieval_eval_persists_three_variants_once_and_aggregates_answerable_o
     assert summary.methods["dense"].recall_at_10 == pytest.approx(1.0)
     assert summary.methods["dense"].reciprocal_rank == pytest.approx(1.0)
     assert summary.methods["bm25"].reciprocal_rank == pytest.approx(0.5)
-    assert summary.methods["fused"].reciprocal_rank == pytest.approx(0.5)
-    assert summary.fused_vs_dense == llm_eval.WinTieLoss(wins=0, ties=1, losses=1)
-    assert summary.fused_vs_bm25 == llm_eval.WinTieLoss(wins=0, ties=2, losses=0)
+    assert summary.methods["fused"].reciprocal_rank == pytest.approx(1.0)
+    assert summary.fused_vs_dense == llm_eval.WinTieLoss(wins=0, ties=2, losses=0)
+    assert summary.fused_vs_bm25 == llm_eval.WinTieLoss(wins=1, ties=1, losses=0)
 
 
 class _FailingInsertConnection:
@@ -885,7 +966,6 @@ def test_retrieval_eval_replay_updates_metrics_without_erasing_answer_review_fie
             question.question: _retrieval_result(
                 dense_ids=(20, 10),
                 bm25_ids=(10, 20),
-                fused_ids=(10, 20),
                 latencies=(0.5, 0.6, 0.7),
             )
         }
@@ -946,6 +1026,10 @@ def test_retrieval_eval_rejects_caller_transaction_before_retrieval(con, resolut
         ),
         ([_retrieval_question("rag-001")], "", "eval-1", "embed_model"),
         ([_retrieval_question("rag-001")], "embed-m", "", "eval_run_id"),
+        ([_retrieval_question("rag-001")], "embed-m", "unsafe run id\n", "eval_run_id"),
+        ([_retrieval_question("rag-001")], "embed-m", " eval-1", "eval_run_id"),
+        ([_retrieval_question("rag-001")], "embed-m", "=eval-1", "eval_run_id"),
+        ([_retrieval_question("rag-001")], "embed-m", "eval/1", "eval_run_id"),
         (
             [_retrieval_question("rag-001", relevant_ids=frozenset())],
             "embed-m",
@@ -994,11 +1078,15 @@ def test_retrieval_summary_reports_linear_p95_and_every_fusion_loss_without_narr
             question_text=f"private narrative phrase {index}",
         )
         questions.append(question)
-        fused_ids = (20, 10) if index == 20 else (10, 20)
+        dense_ids = (10, 20)
+        bm25_ids = (10, 20)
+        if index == 19:
+            bm25_ids = (20, 30)
+        elif index == 20:
+            dense_ids = (20, 30)
         results[question.question] = _retrieval_result(
-            dense_ids=(10, 20),
-            bm25_ids=(10, 20),
-            fused_ids=fused_ids,
+            dense_ids=dense_ids,
+            bm25_ids=bm25_ids,
             latencies=(index / 1000, index / 500, index / 2000),
         )
     summary = llm_eval.run_retrieval_eval(
@@ -1011,15 +1099,15 @@ def test_retrieval_summary_reports_linear_p95_and_every_fusion_loss_without_narr
 
     assert summary.methods["dense"].median_latency_seconds == pytest.approx(0.0105)
     assert summary.methods["dense"].p95_latency_seconds == pytest.approx(0.01905)
-    assert summary.fused_vs_dense == llm_eval.WinTieLoss(wins=0, ties=19, losses=1)
+    assert summary.fused_vs_dense == llm_eval.WinTieLoss(wins=1, ties=18, losses=1)
     report = summary.render()
     assert report == summary.render()
     assert "answerable: 20" in report
     assert "unanswerable: 0" in report
     assert "Recall@10" in report
     assert "MRR" in report
-    assert "fused vs dense win/tie/loss: 0/19/1" in report
-    assert "fused vs BM25 win/tie/loss: 0/19/1" in report
-    assert "rag-020" in report and "loss" in report
+    assert "fused vs dense win/tie/loss: 1/18/1" in report
+    assert "fused vs BM25 win/tie/loss: 1/18/1" in report
+    assert "rag-019" in report and "rag-020" in report and "loss" in report
     assert "private narrative phrase" not in report
     assert all(math.isfinite(method.p95_latency_seconds) for method in summary.methods.values())

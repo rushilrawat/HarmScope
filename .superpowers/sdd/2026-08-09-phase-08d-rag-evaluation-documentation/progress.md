@@ -37,3 +37,17 @@ win/tie/loss; stable ID-only loss-visible rendering with linear p95. Strict TDD:
 RED failures, then final 27 GREEN. Verification: focused 27 passed; retrieval/
 schema/isolation slice 149 passed; full 548 passed + 6 expected skips; Ruff,
 scoped format, and diff check clean. Implementation commit pending review gate.
+
+Task 2 review at 25e5387: FIXES_REQUIRED — Important: independent fused-field
+validation admitted impossible fused wins because membership, component
+provenance, RRF score/order, and configured result length were not tied to the
+component rankings. Minor: unsafe nonblank `eval_run_id` values were persisted.
+
+Task 2: fix round 1/5 — both findings reproduced with 14 behavioral RED
+counterexamples. Fused validation now requires exact output from the shared
+`retrieve.reciprocal_rank_fusion` implementation using configured RRF/top-k;
+`eval_run_id` now matches `_SAFE_ID` before retrieval. Fake results also use the
+real fusion function, and the report demonstrates valid fusion losses. GREEN:
+new regressions 19 passed; final Task 2 selection 32 passed; compatibility
+slice 163 passed; full 562 passed + 6 expected skips; Ruff, scoped format, and
+diff check clean. Fix commit pending scoped re-review.
