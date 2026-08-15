@@ -1099,11 +1099,115 @@ replaced by a copy of MiniLM's, cross-encoder ARI is 1.000 and within-encoder
 disjoint halves is 0.499 against the recorded 0.505.
 
 ### Phase 8 — LLM layer
-_Determinism test result:_
-_Label agreement rate on 50 verified:_
-_Observed LLM failure modes:_
-_RAG Recall@10:_
-_Cost incurred:_
+
+_State on 2026-08-11:_ **engineering built; live-provider, frozen-benchmark,
+and human gates pending.** This distinction matters. Unit/integration tests with
+fake clients demonstrate cache, retry, retrieval, persistence, and metric
+behavior; they do not measure whether Opus labels or answers well.
+
+_Detection boundary:_ the structural isolation suite rejects any import from
+`signals`, `cluster`, `dedup`, `embed`, or `evaluation` into `src.llm` and any
+query from those packages to Phase 8 tables. `pipeline.py` imports LLM handlers
+inside their commands. The exact claim is: `signals` is byte-identical with
+`src/llm` absent; `baseline_results` is byte-identical given the same
+human-written `backtest_links`.
+
+_What was built:_
+
+- A single typed Anthropic transport with closed structured outputs, bounded
+  retry taxonomy, model preflight, cache-token accounting, latency, and
+  configuration-fingerprinted price estimates.
+- Deterministic 12-medoid/8-MMR label selection, lazy fired-plus-control
+  population, atomic cache/resume, per-cluster transactions, refusal/failure
+  visibility, a version-bound blinded 50-label worklist, and Wilson reporting.
+- Signal-consistent cluster/company evidence with exact cluster-run/dedup/model
+  provenance; exact FAISS cosine search; versioned BM25 cache; configured RRF;
+  top-10 complaint IDs/dates/company responses; and grounded structured answers
+  whose citations are validated against returned complaint evidence.
+- An answer cache and crash-durable usage outbox keyed without narrative prose.
+  An interrupted or failed call cannot silently lose paid usage, and a caller's
+  open transaction cannot cause a staged event to be deleted before commit.
+- A strict 30-question authoring/freeze workflow; dense/BM25/fused Recall@10,
+  MRR, latency, and win/tie/loss evaluation; fused-answer citation validity,
+  coverage, abstention, cache/token/outcome/cost aggregation; and a run-bound,
+  blinded 50-claim human groundedness workflow.
+- Lazy `rag-eval` CLI actions for default full evaluation, retrieval-only,
+  author, import, claims export, and claims record. A run records exact
+  `manifest_sha256`, the one cluster-recorded `embed_model`, and
+  `retrieval_only`; it declares 90 rows only after all requested work and stable
+  rendering succeed. Retrieval-only never reaches answer/provider code.
+
+_Network-free real-data exercise (2026-08-11):_
+
+```text
+HARMSCOPE_DATA_DIR=/Users/rushilrawat/HarmScope/data \
+  .venv/bin/python -m src.pipeline rag-eval --retrieval-only
+
+FileNotFoundError: .../data/ground_truth/rag_eval_questions.csv
+exit status: 1
+rag-eval rows in the real runs registry afterward: 0
+```
+
+This is the correct first failure. The command loads the exact frozen file
+before `db.bootstrap()` or `db.run`, so an absent human artifact cannot create a
+misleading failed benchmark run. There is consequently no manifest hash, run
+ID, Recall@10/MRR, fusion loss count, or latency to record.
+
+_Private authoring state (not ground truth):_ the ignored
+`data/interim/rag_eval_authoring.csv` contains 30 blank candidates, five per
+category, 15 fired/15 controls, 30 distinct clusters, and all 12 product
+families. Human question/relevance/privacy fields are blank. Eighteen rows have
+blank company scope. Calling this a benchmark, or deriving metrics from it,
+would substitute agent selection for the required human ground truth.
+
+_Open gates, in dependency order:_
+
+1. **Human benchmark author/privacy review and freeze.** A person writes the 30
+   synthetic analyst questions, marks every relevant complaint ID, performs
+   semantic paraphrase/privacy review, and records author/reviewer/freeze
+   provenance. Relevant IDs cannot be edited after metrics are viewed.
+2. **Company-scope decision.** Grounded answers and `rag_answers` intentionally
+   require a concrete company, but 18 candidate rows are cluster-wide. Regenerate
+   those candidates or approve an explicit schema/answer amendment; do not
+   silently broaden scope.
+3. **`company_response` evidence decision.** The authoring worklist contains ten
+   complaint excerpts, not independently sourced public responses. Five honest
+   questions in this category cannot be authored from that view alone.
+4. **Embedding artifact regeneration/migration.** The real data has
+   `embeddings.all-MiniLM-L6-v2.npy` and its old tail-named sidecar. The reviewed
+   loader requires `embeddings.<sha256(full model name)>.npy` plus exact model,
+   row-count, dimension, completion, and array-shape checks. No ambiguous
+   fallback exists.
+5. **Live provider/funding check.** On 2026-08-07, authentication and model
+   preflight succeeded; the subsequent messages request returned terminal
+   `400 invalid_request_error` because the organization's credit balance was
+   too low. The earlier CLI token-expiry interpretation was wrong because
+   authentication auto-refreshed. Phase 8D made no provider call on 2026-08-11,
+   so it did not recheck the current balance. The earlier full 4,818-cluster
+   estimate was roughly $205, but pricing and population must be re-estimated
+   before purchase. No Task 8D call incurred provider cost.
+6. **Human label and claim review.** At least 50 version-bound labels and at
+   least 50 run-bound claims must be reviewed by a person. Automated/LLM judges
+   cannot complete either denominator.
+
+_Label agreement rate on 50 verified:_ **PENDING — 0 human worklists recorded;
+not reported as 0%.**
+
+_Observed live LLM failure modes:_ the 2026-08-07 messages request returned the
+insufficient-credit error after successful authentication and model preflight.
+No provider request or balance check ran during Phase 8D on 2026-08-11.
+Structured schema/refusal/retry/cache behaviors are test-fixture observations,
+not live model frequencies.
+
+_RAG Recall@10 / MRR / fusion win-tie-loss:_ **PENDING — no frozen manifest and
+no evaluation run.**
+
+_Citation validity / coverage / abstention / groundedness:_ **PENDING — no paid
+answer run; 50-claim human review not started.**
+
+_Cost incurred by Phase 8D evaluation:_ **$0 observed.** Configuration-based
+cost arithmetic is tested, but no test value is presented as an invoice or live
+metric.
 
 ### Phase 9 — Evaluation
 _Headline result:_
@@ -1232,3 +1336,35 @@ selection, campaign detection, clustering, novelty, and signals are refit.
 Roughly 8× off the most expensive stage with the leakage guarantee intact — and
 the anti-leakage suite tests the guarantee directly, so the saving does not
 depend on this reasoning being right.
+
+### 2026-08-11 — Phase 8D orchestration is built; real evaluation remains gated
+
+The `rag-eval` CLI now registers the exact manifest SHA-256, embedding model,
+and retrieval-only mode under one run ID; it runs retrieval and, in full mode,
+answer evaluation under that identity. Authoring, import, blinded claim export,
+and reviewer-bound claim recording are also exposed through lazy handlers. The
+fresh required selection passed 427 tests with one expected missing-manifest
+skip; the full repository passed 659 tests with six expected real-data skips.
+
+The only honest network-free exercise was:
+
+```console
+HARMSCOPE_DATA_DIR=/Users/rushilrawat/HarmScope/data \
+  .venv/bin/python -m src.pipeline rag-eval --retrieval-only
+```
+
+It exited 1 with `FileNotFoundError` for
+`data/ground_truth/rag_eval_questions.csv`, before database bootstrap or run
+creation. A read-only query immediately afterward found zero `rag-eval` run
+rows. No manifest hash, run ID, RAG metric, label metric, answer cost, or human
+judgment therefore exists to record.
+
+The private ignored authoring draft still needs human question authorship,
+privacy review, and freeze. Eighteen rows have no concrete company scope, and
+the five planned `company_response` questions lack independent public-response
+evidence in the complaint-only worklist. The existing embedding artifacts use
+the legacy short-model filename rather than the current full model-SHA contract
+and require a validated migration or regeneration. The last live messages
+request returned insufficient credit, but Phase 8D did not recheck the current
+balance; live labeling and answering plus both the 50-label and 50-claim
+blinded human reviews remain pending.

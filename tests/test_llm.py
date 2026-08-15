@@ -15,7 +15,7 @@ can reach the package, deleting it cannot change their output.
 from __future__ import annotations
 
 import ast
-import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +29,19 @@ ROOT = Path(__file__).resolve().parents[1]
 # The detection path, as `LLM_LAYER.md` §1 defines it: everything that decides
 # whether a signal fires or what any statistic is.
 DETECTION = ["signals", "cluster", "dedup", "embed", "evaluation"]
+
+
+def complete_label() -> dict:
+    return {
+        "harm_mechanism": "A servicer applies fees after a payment.",
+        "actors": ["servicer"],
+        "preconditions": "The consumer makes a payment.",
+        "consumer_impact": "The consumer pays an unexpected fee.",
+        "distinct_from_taxonomy": True,
+        "distinctness_rationale": "The existing label does not describe fees.",
+        "confidence": "high",
+        "is_likely_template": False,
+    }
 
 
 def _imports(path: Path) -> set[str]:
@@ -45,14 +58,27 @@ def _imports(path: Path) -> set[str]:
 def test_detection_path_never_imports_the_llm_layer():
     """§1 — deleting src/llm/ must leave `signals` byte-identical."""
     offenders = []
+    llm_only_tables = {"llm_usage", "rag_answers", "rag_eval_results", "label_verifications"}
     for package in DETECTION:
         for source in (ROOT / "src" / package).rglob("*.py"):
+            tree = ast.parse(source.read_text())
             for name in _imports(source):
                 if name.startswith("src.llm") or name == "anthropic":
                     offenders.append(f"{source.relative_to(ROOT)} imports {name}")
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                    continue
+                queried = {
+                    table
+                    for table in llm_only_tables
+                    if re.search(rf"\b{re.escape(table)}\b", node.value, re.IGNORECASE)
+                }
+                offenders.extend(
+                    f"{source.relative_to(ROOT)} queries {table}" for table in sorted(queried)
+                )
     assert not offenders, (
-        "the detection path can reach the LLM layer, so deleting src/llm/ "
-        "could change `signals`:\n  " + "\n  ".join(offenders)
+        "the detection path can reach LLM code or result tables, so deleting "
+        "src/llm/ could change `signals`:\n  " + "\n  ".join(offenders)
     )
 
 
@@ -69,9 +95,7 @@ def test_pipeline_imports_the_llm_layer_lazily():
         if not isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
         names = (
-            [a.name for a in node.names]
-            if isinstance(node, ast.Import)
-            else [node.module or ""]
+            [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
         )
         if any(n.startswith("src.llm") for n in names):
             assert node.col_offset > 0, (
@@ -80,14 +104,33 @@ def test_pipeline_imports_the_llm_layer_lazily():
             )
 
 
+def test_cmd_ask_imports_the_llm_layer_inside_its_function():
+    """The analyst CLI must not make the deterministic pipeline import Phase 8."""
+    tree = ast.parse((ROOT / "src" / "pipeline.py").read_text())
+    cmd_ask = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "cmd_ask"
+    )
+    imports = [node for node in ast.walk(cmd_ask) if isinstance(node, (ast.Import, ast.ImportFrom))]
+    assert any(
+        (isinstance(node, ast.ImportFrom) and node.module == "src.llm")
+        or (
+            isinstance(node, ast.Import)
+            and any(alias.name.startswith("src.llm") for alias in node.names)
+        )
+        for node in imports
+    )
+
+
 # --- selection (deterministic, no API) --------------------------------------
 def test_mmr_prefers_a_far_point_over_a_near_duplicate():
     """The reason §2.1 asks for diversity at all."""
     selected = np.array([[1.0, 0.0]])
-    candidates = np.array([
-        [0.9999, 0.0141],  # near-duplicate of what is already selected
-        [0.0, 1.0],        # orthogonal — the informative one
-    ])
+    candidates = np.array(
+        [
+            [0.9999, 0.0141],  # near-duplicate of what is already selected
+            [0.0, 1.0],  # orthogonal — the informative one
+        ]
+    )
     assert mmr_first(candidates, selected) == 1
 
 
@@ -111,8 +154,7 @@ def test_selection_is_stable_and_bounded():
 
 def test_selection_handles_a_cluster_smaller_than_k():
     X = np.eye(3, dtype=np.float32)
-    got = select_mod.select_for_label(X, np.arange(3), np.array([7, 8, 9]),
-                                      None, k=20, medoid_k=12)
+    got = select_mod.select_for_label(X, np.arange(3), np.array([7, 8, 9]), None, k=20, medoid_k=12)
     assert sorted(got) == [7, 8, 9]
 
 
@@ -129,11 +171,36 @@ def test_cache_key_ignores_selection_order_but_not_prompt_version():
     assert label_mod.input_hash("v1", "other", [1, 2, 3]) != a
 
 
-def test_cache_roundtrip(tmp_path):
+def test_cache_write_is_atomic_and_validated(tmp_path):
     key = label_mod.input_hash("v1", "m", [1])
     assert label_mod.cached(tmp_path, key) is None
-    label_mod.write_cache(tmp_path, key, {"harm_mechanism": "x"})
-    assert label_mod.cached(tmp_path, key)["harm_mechanism"] == "x"
+    label_mod.write_cache(tmp_path, key, complete_label())
+    assert label_mod.cached(tmp_path, key) == complete_label()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_corrupt_cache_is_quarantined(tmp_path):
+    key = "broken"
+    path = tmp_path / "broken.json"
+    path.write_text("{")
+
+    assert label_mod.cached(tmp_path, key) is None
+    assert not path.exists()
+    assert len(list(tmp_path.glob("broken.json.corrupt-*"))) == 1
+
+
+def test_label_validation_rejects_missing_or_extra_fields(tmp_path):
+    missing = complete_label()
+    missing.pop("confidence")
+    with pytest.raises(label_mod.LabelSchemaError, match="confidence"):
+        label_mod.validate_label(missing)
+
+    extra = complete_label() | {"extra": True}
+    with pytest.raises(label_mod.LabelSchemaError, match="extra"):
+        label_mod.validate_label(extra)
+
+    with pytest.raises(label_mod.LabelSchemaError, match="object"):
+        label_mod.write_cache(tmp_path, "scalar", None)
 
 
 # --- output contract --------------------------------------------------------
@@ -141,9 +208,7 @@ def test_schema_is_enforceable():
     """§2.2 wants strict JSON. Structured outputs only guarantee that when the
     schema closes the object and requires every field."""
     assert label_mod.LABEL_SCHEMA["additionalProperties"] is False
-    assert set(label_mod.LABEL_SCHEMA["required"]) == set(
-        label_mod.LABEL_SCHEMA["properties"]
-    )
+    assert set(label_mod.LABEL_SCHEMA["required"]) == set(label_mod.LABEL_SCHEMA["properties"])
 
 
 def test_guardrails_are_in_the_system_prompt():
@@ -171,38 +236,37 @@ def test_refusal_is_recorded_rather_than_raised():
     """A declined label is a fact about the cluster; a batch must not abort."""
 
     class _Refusing:
-        class messages:
-            @staticmethod
-            def create(**_):
-                return type("R", (), {"stop_reason": "refusal", "content": []})()
+        @staticmethod
+        def call_json(**_):
+            return type(
+                "R",
+                (),
+                {
+                    "payload": {"refused": True, "stop_reason": "refusal"},
+                },
+            )()
 
     got = label_mod.label_cluster(_Refusing(), "m", ["n"], [], 1200)
     assert got == {"refused": True, "stop_reason": "refusal"}
 
 
 def test_label_call_uses_structured_outputs_and_caches_the_system_prompt():
-    """The two guarantees §2.2 and §2.4 turn on, asserted on the actual request."""
+    """Labeling delegates its typed request through the reliable client boundary."""
     seen = {}
 
     class _Recording:
-        class messages:
-            @staticmethod
-            def create(**kwargs):
-                seen.update(kwargs)
-                payload = json.dumps({"harm_mechanism": "x"})
-                block = type("B", (), {"type": "text", "text": payload})()
-                return type("R", (), {"stop_reason": "end_turn",
-                                      "content": [block]})()
+        @staticmethod
+        def call_json(**kwargs):
+            seen.update(kwargs)
+            return type("R", (), {"payload": {"harm_mechanism": "x"}})()
 
     label_mod.label_cluster(_Recording(), "claude-sonnet-5", ["n"], ["L"], 1200)
 
-    fmt = seen["output_config"]["format"]
-    assert fmt["type"] == "json_schema" and fmt["schema"] is label_mod.LABEL_SCHEMA
-    assert seen["system"][0]["cache_control"] == {"type": "ephemeral"}
-    # Sampling parameters are rejected on current models, and a prefilled
-    # assistant turn is a 400 — neither may creep back in.
-    assert not {"temperature", "top_p", "top_k"} & set(seen)
-    assert seen["messages"][-1]["role"] == "user"
+    assert seen["model"] == "claude-sonnet-5"
+    assert seen["schema"] is label_mod.LABEL_SCHEMA
+    assert seen["system"] == label_mod.SYSTEM
+    assert "Dominant existing taxonomy labels for this cluster: L" in seen["prompt"]
+    assert seen["max_tokens"] == 2000
 
 
 @pytest.mark.parametrize("field", ["confidence", "is_likely_template"])

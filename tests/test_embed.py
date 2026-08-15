@@ -108,9 +108,9 @@ def test_a_full_encode_leaves_nothing_unmapped(con):
     _narratives(con, {1: "same", 2: "same", 3: "different"})
     n_mapped, n_unmapped = encode.build_map(con, "m", 4, n_rows=2)
     assert (n_mapped, n_unmapped) == (3, 0)
-    rows = dict(con.execute(
-        "SELECT complaint_id, row_idx FROM embedding_map WHERE model = 'm'"
-    ).fetchall())
+    rows = dict(
+        con.execute("SELECT complaint_id, row_idx FROM embedding_map WHERE model = 'm'").fetchall()
+    )
     assert rows[1] == rows[2] != rows[3]  # identical narratives share a row
 
 
@@ -119,3 +119,20 @@ def test_progress_refuses_to_resume_a_different_encode(tmp_path):
     encode.Progress(p, n_done=10, n_total=100, dim=384, model="a").write()
     prior = encode.Progress.read(p)
     assert (prior.n_done, prior.model, prior.dim) == (10, "a", 384)
+
+
+def test_embedding_artifact_paths_bind_the_collision_free_full_model_identity(tmp_path):
+    """Models sharing a tail cannot overwrite each other's vectors or FAISS index."""
+    first = encode.embedding_artifact_paths(tmp_path, "provider-a/shared")
+    second = encode.embedding_artifact_paths(tmp_path, "provider-b/shared")
+
+    assert first != second
+    assert first.memmap == tmp_path / (
+        "embeddings.5483d7e157e32b55a97648f86ed353a102798a1732e95dfed637114f50b6b38b.npy"
+    )
+    assert first.index == tmp_path / (
+        "faiss.5483d7e157e32b55a97648f86ed353a102798a1732e95dfed637114f50b6b38b.index"
+    )
+    assert second.memmap == tmp_path / (
+        "embeddings.277383a219c87b6ce6ba99ed9cd2837e5e7d08a64eba2be529c61f11d728b73b.npy"
+    )

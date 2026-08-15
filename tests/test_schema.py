@@ -10,13 +10,219 @@ after several hours of embedding.
 
 from __future__ import annotations
 
+from contextlib import suppress
 from datetime import date
+from pathlib import Path
 
 import duckdb
 import pytest
 
 from src import db
 from src.ids import COMPANY_TOTAL
+from src.llm import verify
+
+
+def test_phase8_tables_exist_on_a_fresh_database(con):
+    """Fresh installs must expose the Phase 8 persistence contract."""
+    required = {
+        "llm_usage", "label_verifications", "rag_answers", "rag_eval_results"
+    }
+    assert required <= set(db.table_names(con))
+    columns = {
+        row[1] for row in con.execute("PRAGMA table_info('label_verifications')").fetchall()
+    }
+    assert "reviewer_origin" in columns
+
+
+def test_phase8_migration_upgrades_a_pre_phase8_database(con):
+    """Migration 007 must be repeatable when upgrading an existing database."""
+    for table in ("rag_eval_results", "rag_answers", "label_verifications", "llm_usage"):
+        con.execute("DROP TABLE IF EXISTS " + table)
+    migration = Path("db/migrations/007_phase_08_llm_layer.sql").read_text()
+    con.execute(migration)
+    con.execute(migration)
+    assert {
+        "llm_usage", "label_verifications", "rag_answers", "rag_eval_results"
+    } <= set(db.table_names(con))
+    columns = {
+        row[1] for row in con.execute("PRAGMA table_info('label_verifications')").fetchall()
+    }
+    assert "reviewer_origin" in columns
+
+
+def test_phase8_provenance_migration_backfills_legacy_reviews_as_model(tmp_path):
+    """Migration 008 must preserve old reviews without letting them pass a human gate."""
+    legacy = duckdb.connect(str(tmp_path / "pre-provenance.duckdb"))
+    legacy.execute(
+        """
+        CREATE TABLE runs (
+          run_id VARCHAR PRIMARY KEY,
+          phase VARCHAR NOT NULL,
+          git_sha VARCHAR NOT NULL,
+          config_hash VARCHAR NOT NULL,
+          params_json VARCHAR NOT NULL,
+          started_at TIMESTAMP NOT NULL,
+          status VARCHAR NOT NULL
+        );
+        CREATE TABLE clusters (
+          cluster_id VARCHAR PRIMARY KEY,
+          run_id VARCHAR NOT NULL REFERENCES runs(run_id),
+          product_family VARCHAR NOT NULL,
+          n_members BIGINT NOT NULL,
+          as_of DATE NOT NULL
+        );
+        CREATE TABLE cluster_labels (
+          cluster_id VARCHAR PRIMARY KEY REFERENCES clusters(cluster_id),
+          confidence VARCHAR
+        );
+        CREATE TABLE signals (
+          run_id VARCHAR NOT NULL,
+          cluster_id VARCHAR NOT NULL,
+          q_value DOUBLE
+        );
+        CREATE TABLE label_verifications (
+          cluster_id VARCHAR NOT NULL REFERENCES cluster_labels(cluster_id),
+          reviewer_id VARCHAR NOT NULL,
+          worklist_version VARCHAR NOT NULL,
+          signals_run VARCHAR NOT NULL,
+          is_fired BOOLEAN NOT NULL,
+          mechanism_accuracy VARCHAR NOT NULL CHECK (
+            mechanism_accuracy IN ('agree', 'partial', 'disagree')
+          ),
+          taxonomy_distinctness_accuracy VARCHAR NOT NULL CHECK (
+            taxonomy_distinctness_accuracy IN ('agree', 'disagree')
+          ),
+          template_accuracy VARCHAR NOT NULL CHECK (
+            template_accuracy IN ('agree', 'disagree')
+          ),
+          should_have_abstained BOOLEAN NOT NULL,
+          failure_category VARCHAR NOT NULL CHECK (
+            failure_category IN (
+              'none', 'incoherent_cluster', 'overgeneralized', 'overspecific',
+              'missed_submechanism', 'taxonomy_error', 'template_error',
+              'unsupported_claim', 'other'
+            )
+          ),
+          notes VARCHAR,
+          reviewed_at TIMESTAMP NOT NULL,
+          PRIMARY KEY (cluster_id, reviewer_id, worklist_version)
+        );
+        """
+    )
+    cluster_run = "0000000000001-cluster1"
+    signals_run = "0000000000002-signal01"
+    legacy.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'cluster', 'test', 'test', '{}', now(), 'ok')",
+        [cluster_run],
+    )
+    legacy.execute(
+        "INSERT INTO runs (run_id, phase, git_sha, config_hash, params_json, "
+        "started_at, status) VALUES (?, 'signals', 'test', 'test', "
+        "'{\"params\": {\"cluster_run\": \"0000000000001-cluster1\"}}', now(), 'ok')",
+        [signals_run],
+    )
+    cluster_id = f"{cluster_run}:mortgage:0"
+    legacy.execute(
+        "INSERT INTO clusters (cluster_id, run_id, product_family, n_members, as_of) "
+        "VALUES (?, ?, 'mortgage', 30, DATE '2020-01-01')",
+        [cluster_id, cluster_run],
+    )
+    legacy.execute(
+        "INSERT INTO cluster_labels (cluster_id, confidence) VALUES (?, 'high')",
+        [cluster_id],
+    )
+
+    legacy.execute(
+        "INSERT INTO label_verifications "
+        "(cluster_id, reviewer_id, worklist_version, signals_run, is_fired, "
+        "mechanism_accuracy, taxonomy_distinctness_accuracy, template_accuracy, "
+        "should_have_abstained, failure_category, notes, reviewed_at) "
+        "VALUES (?, 'legacy-reviewer', 'wl-v1', ?, false, 'agree', 'agree', "
+        "'agree', false, 'none', NULL, now())",
+        [cluster_id, signals_run],
+    )
+
+    migration = Path("db/migrations/008_label_verification_provenance.sql").read_text()
+    legacy.execute(migration)
+
+    assert legacy.execute(
+        "SELECT reviewer_origin FROM label_verifications WHERE reviewer_id = 'legacy-reviewer'"
+    ).fetchone() == ("model",)
+    assert verify.report(legacy, "wl-v1").mechanism_total == 0
+    with pytest.raises(duckdb.ConstraintException):
+        legacy.execute(
+            "UPDATE label_verifications SET reviewer_origin = 'robot' "
+            "WHERE reviewer_id = 'legacy-reviewer'"
+        )
+    with pytest.raises(duckdb.ConstraintException):
+        legacy.execute(
+            "UPDATE label_verifications SET reviewer_origin = NULL "
+            "WHERE reviewer_id = 'legacy-reviewer'"
+        )
+    legacy.execute(migration)
+    assert legacy.execute("SELECT count(*) FROM label_verifications").fetchone() == (1,)
+    legacy.close()
+
+
+def test_phase8_provenance_migration_rolls_back_a_mid_rebuild_failure(tmp_path):
+    """A failed table rebuild must leave the legacy table, row, and schema intact."""
+    legacy = duckdb.connect(str(tmp_path / "rollback-provenance.duckdb"))
+    legacy.execute(
+        """
+        CREATE TABLE cluster_labels (cluster_id VARCHAR PRIMARY KEY);
+        CREATE TABLE label_verifications (
+          cluster_id VARCHAR NOT NULL REFERENCES cluster_labels(cluster_id),
+          reviewer_id VARCHAR NOT NULL,
+          worklist_version VARCHAR NOT NULL,
+          signals_run VARCHAR NOT NULL,
+          is_fired BOOLEAN NOT NULL,
+          mechanism_accuracy VARCHAR NOT NULL,
+          taxonomy_distinctness_accuracy VARCHAR NOT NULL,
+          template_accuracy VARCHAR NOT NULL,
+          should_have_abstained BOOLEAN NOT NULL,
+          failure_category VARCHAR NOT NULL,
+          notes VARCHAR,
+          reviewed_at TIMESTAMP NOT NULL,
+          PRIMARY KEY (cluster_id, reviewer_id, worklist_version)
+        );
+        INSERT INTO cluster_labels VALUES ('cluster-1');
+        INSERT INTO label_verifications VALUES (
+          'cluster-1', 'reviewer-1', 'wl-v1', 'signals-1', false,
+          'agree', 'agree', 'agree', false, 'none', 'keep me', now()
+        );
+        """
+    )
+    original_columns = [
+        row[1]
+        for row in legacy.execute(
+            "PRAGMA table_info('label_verifications')"
+        ).fetchall()
+    ]
+    migration = Path("db/migrations/008_label_verification_provenance.sql").read_text()
+    broken = migration.replace(
+        "ALTER TABLE label_verifications_v008 RENAME TO label_verifications;",
+        "SELECT * FROM deliberate_missing_table;\n"
+        "ALTER TABLE label_verifications_v008 RENAME TO label_verifications;",
+    )
+
+    with pytest.raises(duckdb.CatalogException, match="deliberate_missing_table"):
+        legacy.execute(broken)
+    with suppress(duckdb.TransactionException):
+        legacy.execute("ROLLBACK")
+
+    assert [
+        row[1]
+        for row in legacy.execute(
+            "PRAGMA table_info('label_verifications')"
+        ).fetchall()
+    ] == original_columns
+    assert "reviewer_origin" not in original_columns
+    assert legacy.execute(
+        "SELECT cluster_id, reviewer_id, notes FROM label_verifications"
+    ).fetchall() == [("cluster-1", "reviewer-1", "keep me")]
+    assert "label_verifications_v008" not in db.table_names(legacy)
+    legacy.close()
 
 
 def test_schema_applies_and_is_idempotent(tmp_path):

@@ -410,3 +410,80 @@ live and human gates above run.
 6. Evaluation manifest, retrieval metrics, and evaluation CLI.
 7. Full tests and documentation reconciliation.
 8. Paid 20-label pilot, followed by live evaluation when credits are available.
+
+## 12. Amendment — implemented boundaries and open gates (2026-08-11)
+
+This section records deviations discovered during implementation. It does not
+rewrite the approved design as though these decisions were present from the
+start.
+
+### 12.1 Retrieval and artifact provenance tightened
+
+The implementation uses exact FAISS search as designed, but does not address a
+vector artifact by model tail. It hashes the full model name and validates a
+sidecar's model, row count, dimension, completion, and loaded array shape. This
+was required because two providers can publish checkpoints with the same tail;
+the former filename could silently select the wrong vector space. Legacy
+tail-named artifacts fail closed and require regeneration or a separately
+validated migration.
+
+Retrieval also recreates the signal population rather than joining direct
+cluster members naively: it pins the cluster run's dedup run/cutoff/model,
+expands duplicate groups, excludes flagged campaigns, restricts to the cluster
+family/company, and selects one deterministic complaint per group/company. The
+neutral population SQL is shared with signals without adding an import from the
+detection path into `src.llm`.
+
+### 12.2 Answer generation separates support from display context
+
+The approved design said company responses and optional enforcement context
+should be included. The implemented answer prompt contains complaint evidence
+only; company responses and enforcement matches are returned/rendered in
+separate labeled sections. This prevents non-complaint context from becoming
+the basis for a claim that cites a complaint ID. Every substantive generated
+claim is deterministically rebuilt from validated complaint-cited claims, and
+closed limitation reason codes replace unconstrained model prose.
+
+The answer cache identity binds normalized question, ordered evidence, scope,
+model, and effective prompt version. Paid usage is persisted through an atomic,
+fsynced outbox; drain requires autocommit and deletes a staged event only after
+its database insert is durable.
+
+### 12.3 Benchmark freeze and evaluation execution are separate gates
+
+The authoring exporter can prepare a private 30-row candidate worklist, but an
+agent/model cannot set `privacy_reviewed=yes` or convert its relevance choices
+into human ground truth. The committed manifest therefore remains absent until
+a person authors and privacy-reviews it. Evaluation derives the one embedding
+model from the referenced cluster-run provenance rather than assuming the
+current config default.
+
+One `rag-eval` run writes exact `manifest_sha256`, `embed_model`, and
+`retrieval_only` parameters. It makes one retrieval call per question, persists
+three method rows per question, and declares 90 outputs only after all requested
+work and stable combined rendering succeed. Retrieval-only never invokes answer
+generation/provider code. Full mode adds fused-only answer metrics under the
+same run ID. Claim export requires that run to be complete and still match the
+current manifest bytes.
+
+The human claim artifact is private under configured `data/interim`. Export
+creates an unreviewed name; the reviewer saves the completed artifact with the
+required `.<reviewer_id>.csv` suffix. Reviewer ID is a trusted local audit label,
+not authenticated identity; Phase 10 must bind it to an authenticated actor
+before offering remote ingestion.
+
+### 12.4 Current external/design blockers are not implementation results
+
+The private candidate worklist has 18 cluster-wide rows without the concrete
+company scope required by the answer cache/schema. Its `company_response`
+category exposes only complaint excerpts, not independent public-response
+evidence. No silent schema/category change was made; both require a human design
+decision or regenerated candidates.
+
+The live Anthropic request on 2026-08-07 authenticated and then failed on zero
+organization credit. On 2026-08-11, the network-free retrieval command stopped
+before DB creation because the human-frozen manifest was absent. Thus there is
+no real evaluation run ID/hash, retrieval/answer metric, token/cost total, or
+human denominator to report. Software verified with fake clients is labeled
+automated evidence only; Phase 8 remains incomplete until the live and human
+gates in §10 run.

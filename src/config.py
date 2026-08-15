@@ -64,8 +64,14 @@ class Paths:
 
     def ensure(self) -> None:
         """Create every directory this project writes to. Idempotent."""
-        for p in (self.data, self.raw, self.interim, self.artifacts,
-                  self.ground_truth, self.llm_cache):
+        for p in (
+            self.data,
+            self.raw,
+            self.interim,
+            self.artifacts,
+            self.ground_truth,
+            self.llm_cache,
+        ):
             p.mkdir(parents=True, exist_ok=True)
 
 
@@ -86,9 +92,7 @@ class DataConfig:
 
     window_start: date = date(2015, 1, 1)
     # CFPB bulk CSV. Verified reachable before Phase 1 (docs/PROJECT_SPEC.md §5.4).
-    bulk_csv_url: str = (
-        "https://files.consumerfinance.gov/ccdb/complaints.csv.zip"
-    )
+    bulk_csv_url: str = "https://files.consumerfinance.gov/ccdb/complaints.csv.zip"
 
 
 @dataclass(frozen=True)
@@ -96,7 +100,7 @@ class DedupConfig:
     """docs/METHODOLOGY.md §2."""
 
     minhash_perms: int = 128
-    shingle_size: int = 5               # character 5-shingles beat word shingles here
+    shingle_size: int = 5  # character 5-shingles beat word shingles here
     # Tuned on the 300-pair labelled set (METHODOLOGY §2.2 sanctions this),
     # 2026-08-04. At the spec's 0.85 precision was 0.905 — the gate needs 0.95.
     # The cause was NOT a loose threshold but estimator noise: 128 permutations
@@ -122,7 +126,7 @@ class DedupConfig:
     # Not a trained model (docs/METHODOLOGY.md §2.2): too few labels, and a
     # human has to be able to audit why a flag fired.
     campaign_min_signals: int = 3
-    burstiness_threshold: float = 3.0            # Fano factor of daily counts
+    burstiness_threshold: float = 3.0  # Fano factor of daily counts
     # Concentration signals are RELATIVE to the product family's own baseline,
     # not absolute. Measured on the 2026-08-03 snapshot, absolute thresholds
     # were degenerate: `submitted_via > 0.95` fired on 100% of candidates
@@ -134,9 +138,9 @@ class DedupConfig:
     #
     # "Organic harms spread, campaigns concentrate" (METHODOLOGY §2.2) is a
     # claim about concentrating MORE than the surrounding family does.
-    concentration_ratio: float = 1.5   # group HHI / family baseline HHI
-    boilerplate_threshold: float = 0.50   # bimodal in practice; any 0.1-0.9 works
-    length_cv_threshold: float = 0.20     # LOW variance is the signal
+    concentration_ratio: float = 1.5  # group HHI / family baseline HHI
+    boilerplate_threshold: float = 0.50  # bimodal in practice; any 0.1-0.9 works
+    length_cv_threshold: float = 0.20  # LOW variance is the signal
     # Gate: docs/METHODOLOGY.md §2.4. False merges destroy real signal, so
     # precision is the binding constraint, not recall.
     min_precision: float = 0.95
@@ -162,15 +166,15 @@ class ClusterConfig:
     """docs/METHODOLOGY.md §4."""
 
     umap_n_neighbors: int = 30
-    umap_n_components: int = 10          # preprocessing for density clustering, not viz
+    umap_n_components: int = 10  # preprocessing for density clustering, not viz
     umap_min_dist: float = 0.0
     umap_metric: str = "cosine"
     hdbscan_min_cluster_size: int = 50
     hdbscan_min_samples: int = 10
-    cluster_selection_method: str = "leaf"   # finer clusters => mechanisms, not topics
+    cluster_selection_method: str = "leaf"  # finer clusters => mechanisms, not topics
     fit_sample_size: int = 500_000
     stability_sample_sizes: tuple[int, ...] = (100_000, 250_000, 500_000)
-    assign_max_distance: float = 0.35    # beyond this, a point becomes noise
+    assign_max_distance: float = 0.35  # beyond this, a point becomes noise
     # METHODOLOGY §4.2: clusters in different families this close are the same
     # harm under two products. Higher than assign_max_distance implies, because
     # two centroids agreeing is a stronger claim than a point sitting near one.
@@ -194,10 +198,10 @@ class NoveltyConfig:
     threshold: float = 0.60
     # Guard against the trivial failure: incoherent-and-novel is a clustering
     # defect, not a finding. Both floors must be cleared.
-    min_coherence: float = 0.45          # mean intra-cluster cosine similarity
-    min_persistence: float = 0.05        # HDBSCAN cluster persistence
+    min_coherence: float = 0.45  # mean intra-cluster cosine similarity
+    min_persistence: float = 0.05  # HDBSCAN cluster persistence
     ablation_n_issues: int = 10
-    ablation_min_auc: float = 0.70       # Phase 4 gate
+    ablation_min_auc: float = 0.70  # Phase 4 gate
 
     def __post_init__(self) -> None:
         total = self.w_dominant_share + self.w_entropy
@@ -209,14 +213,14 @@ class NoveltyConfig:
 class SignalConfig:
     """docs/METHODOLOGY.md §6."""
 
-    min_a: int = 5                       # raw PRR is unusable below this
-    fdr_alpha: float = 0.05              # Benjamini-Hochberg, within product family
+    min_a: int = 5  # raw PRR is unusable below this
+    fdr_alpha: float = 0.05  # Benjamini-Hochberg, within product family
     ewma_lambda: float = 0.2
-    ewma_control_limit: float = 3.0      # L, in sigma
+    ewma_control_limit: float = 3.0  # L, in sigma
     ewma_baseline_months: int = 12
     pelt_penalty: float = 10.0
-    min_supporting_groups: int = 15      # distinct dup-groups, not raw complaints
-    rank_by: str = "eb05"                # never the point estimate
+    min_supporting_groups: int = 15  # distinct dup-groups, not raw complaints
+    rank_by: str = "eb05"  # never the point estimate
 
 
 @dataclass(frozen=True)
@@ -233,14 +237,43 @@ class LLMConfig:
     # labelling run — free to change now because the model string is part of the
     # cache key, so switching after a run would have invalidated every label.
     model: str = "claude-opus-5"
-    prompt_version: str = "v1"           # bumped on any prompt edit; part of the cache key
+    prompt_version: str = "v1"  # label prompt; part of the label cache key
+    answer_prompt_version: str = "rag-v2"  # answer prompt/schema/cache contract
     label_sample_k: int = 20
-    label_medoid_k: int = 12             # nearest-medoid share of label_sample_k
+    label_medoid_k: int = 12  # nearest-medoid share of label_sample_k
     min_cluster_size_for_label: int = 30
     max_narrative_chars: int = 1_200
     rag_top_k: int = 10
+    rag_candidate_k: int = 50
+    bm25_tokenizer_version: str = "word-v1"
     rrf_k: int = 60
-    human_verify_n: int = 50             # docs/LLM_LAYER.md §2.5, required
+    human_verify_n: int = 50  # docs/LLM_LAYER.md §2.5, required
+    max_retries: int = 3
+    retry_base_seconds: float = 1.0
+    retry_max_seconds: float = 30.0
+    # Re-check official list pricing before a paid run. A change here produces
+    # a new config fingerprint, preserving cost-accounting provenance.
+    input_usd_per_million: float = 5.0
+    output_usd_per_million: float = 25.0
+    cache_write_usd_per_million: float = 6.25
+    cache_read_usd_per_million: float = 0.50
+    verification_seed: int = 20260809
+
+    def __post_init__(self) -> None:
+        for name in ("rag_top_k", "rag_candidate_k", "rrf_k"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive non-boolean integer")
+        if (
+            not isinstance(self.bm25_tokenizer_version, str)
+            or not self.bm25_tokenizer_version.strip()
+        ):
+            raise ValueError("bm25_tokenizer_version must be a nonblank string")
+        if self.rag_candidate_k < self.rag_top_k:
+            raise ValueError(
+                "rag_candidate_k must be at least rag_top_k "
+                f"({self.rag_candidate_k} < {self.rag_top_k})"
+            )
 
 
 @dataclass(frozen=True)
@@ -258,8 +291,14 @@ class EvalConfig:
     """
 
     cutoffs: tuple[date, ...] = (
-        date(2017, 1, 1), date(2018, 1, 1), date(2019, 1, 1), date(2020, 1, 1),
-        date(2021, 1, 1), date(2022, 1, 1), date(2023, 1, 1), date(2024, 1, 1),
+        date(2017, 1, 1),
+        date(2018, 1, 1),
+        date(2019, 1, 1),
+        date(2020, 1, 1),
+        date(2021, 1, 1),
+        date(2022, 1, 1),
+        date(2023, 1, 1),
+        date(2024, 1, 1),
     )
     # Enforcement actions are only usable as ground truth through 2024: CFPB's
     # 2025 posture change means absence of an action no longer implies absence

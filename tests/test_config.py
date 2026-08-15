@@ -4,7 +4,46 @@ import dataclasses
 
 import pytest
 
-from src.config import CONFIG, Config, NoveltyConfig, Paths, paths
+from src.config import CONFIG, Config, LLMConfig, NoveltyConfig, Paths, paths
+
+
+def test_llm_operational_parameters_are_fingerprinted():
+    """Retries and pricing must travel with every recorded configuration."""
+    payload = CONFIG.to_dict()["llm"]
+    assert payload["max_retries"] == 3
+    assert payload["retry_base_seconds"] == 1.0
+    assert payload["input_usd_per_million"] > 0
+    assert payload["output_usd_per_million"] > 0
+    assert payload["human_verify_n"] == 50
+    assert payload["rag_candidate_k"] == 50
+    assert payload["bm25_tokenizer_version"] == "word-v1"
+    assert payload["prompt_version"] == "v1"
+    assert payload["answer_prompt_version"] == "rag-v2"
+
+
+def test_llm_candidate_pool_cannot_be_smaller_than_returned_evidence():
+    """A truncation setting cannot silently make the requested top-k impossible."""
+    with pytest.raises(ValueError, match="rag_candidate_k"):
+        LLMConfig(rag_top_k=11, rag_candidate_k=10)
+
+
+@pytest.mark.parametrize("field", ["rag_top_k", "rag_candidate_k", "rrf_k"])
+@pytest.mark.parametrize("value", [0, -1, False, True, 1.5])
+def test_llm_retrieval_integer_settings_must_be_positive_non_boolean(field, value):
+    """Invalid retrieval limits cannot reach ranking or fusion at runtime."""
+    kwargs = {field: value}
+    if field == "rag_top_k" and isinstance(value, int) and not isinstance(value, bool):
+        kwargs["rag_candidate_k"] = max(50, value)
+
+    with pytest.raises(ValueError, match=field):
+        LLMConfig(**kwargs)
+
+
+@pytest.mark.parametrize("value", ["", "   ", None, 1])
+def test_llm_tokenizer_version_must_be_a_nonblank_string(value):
+    """Every sparse cache must be keyed by an explicit tokenizer contract."""
+    with pytest.raises(ValueError, match="bm25_tokenizer_version"):
+        LLMConfig(bm25_tokenizer_version=value)
 
 
 def test_config_is_frozen():

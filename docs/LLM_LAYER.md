@@ -105,6 +105,18 @@ Sample **≥ 50** labeled clusters. For each, read 10 narratives yourself and ma
 An unverified LLM label layer is decoration. A verified one with a reported 78% agreement rate
 is a result.
 
+The gate is evaluated only for one explicit worklist version and counts distinct
+human-reviewed clusters, not review rows. Export writes a non-reviewer-facing JSON
+sidecar beside the CSV; it pins the signals run, cluster run, model, prompt version,
+seed, canonical cluster IDs, and digest. Recording requires and validates that sidecar,
+so a later signals run or configuration change cannot silently alter provenance.
+
+Phase 8's CLI is a trusted local, human-only ingestion boundary. Its `--reviewer`
+value is an operator-supplied audit label, not authenticated identity, and model-origin
+reviews are intentionally unavailable through that command. Before Phase 10 exposes
+review ingestion through an API, bind both reviewer identity and `reviewer_origin` to
+the authenticated actor on the server; never accept either as client-asserted authority.
+
 ---
 
 ## 3. Evidence retrieval (RAG)
@@ -136,6 +148,13 @@ happens inside a statistically-identified population, not over the whole corpus.
 Including company public responses is not decoration. A system that shows only consumer
 allegations is an advocacy tool, not an analysis tool.
 
+The implementation keeps that separation structural. Complaint narratives are
+the only evidence supplied to answer generation and the only source that may
+support a citation. Company public responses are returned and rendered in a
+separate section; optional enforcement matches are labeled as context. Neither
+is placed in the complaint-evidence prompt, so it cannot silently become the
+basis for a complaint-cited claim.
+
 ### 3.4 Answer contract
 
 - Every claim in the synthesized answer carries inline complaint IDs.
@@ -155,6 +174,14 @@ Modest but real:
 This is small. Keep it small. The RAG layer is a feature, not the thesis — do not let it eat
 the schedule.
 
+The implemented benchmark is stricter than the original three-line protocol:
+it always reports dense, BM25, and fused Recall@10/MRR, fusion win/tie/loss
+against both components, per-question losses, latency, citation validity,
+citation coverage, answerable/unanswerable abstention, token/cache/outcome/cost
+totals, and a separate human-groundedness gate. Unanswerable questions are
+reported but excluded from retrieval macro means. A generated or LLM-judged
+review cannot satisfy the human denominator.
+
 ---
 
 ## 4. Config
@@ -164,13 +191,16 @@ Config lives in `src/config.py` as `LLMConfig`, not as loose module constants �
 reachable from one frozen dataclass and serialized into `runs.params_json`.
 
 ```python
-model                      = "claude-sonnet-5"
+model                      = "claude-opus-5"
 prompt_version             = "v1"
+answer_prompt_version      = "rag-v2"
 label_sample_k             = 20
 label_medoid_k             = 12   # remainder sampled for diversity (MMR)
 min_cluster_size_for_label = 30
 max_narrative_chars        = 1200
 rag_top_k                  = 10
+rag_candidate_k            = 50
+bm25_tokenizer_version     = "word-v1"
 rrf_k                      = 60
 human_verify_n             = 50
 ```
@@ -200,3 +230,111 @@ it.
 The remaining lever is the prompt. If §2.5 verification is still weak on
 `claude-opus-5`, change the prompt and bump `prompt_version` — one at a time, and
 record which, so an agreement-rate movement can be attributed.
+
+---
+
+## 5. Implemented interfaces and provenance
+
+### 5.1 Provider, retry, and accounting boundary
+
+`src.llm.client.AnthropicModelClient` is the only Anthropic transport boundary.
+`preflight(model)` retrieves the configured model. `call_json(...)` applies the
+closed JSON schema, bounded exponential backoff, prompt caching, typed usage,
+latency, and configuration-owned price estimates. Rate limits, connections, and
+server failures are retryable; authentication, permission, billing,
+invalid-request, refusal/schema, and other terminal failures are not. Estimated
+cost is provenance, not an invoice.
+
+`llm_usage` records operation, run ID, question/input identities, cache status,
+attempts, token categories, latency, estimated cost, outcome, and a closed error
+category. Answer accounting uses a fsynced atomic usage outbox: the public drain
+requires autocommit and deletes an event only after its insert is durable. That
+preserves paid-call accounting across process/database failures without logging
+prompt or narrative prose.
+
+### 5.2 Cache and resume identities
+
+- Label cache: prompt version, model, and sorted selected complaint IDs.
+- Sparse cache: exact scoped-membership hash plus tokenizer version.
+- Embedding artifact: SHA-256 of the full model name, with sidecar checks for
+  model, row count, dimension, completion, and array shape.
+- Answer cache: normalized question hash, ordered evidence identity, cluster,
+  company, model, and effective answer-prompt version.
+- Evaluation run: exact manifest bytes (`manifest_sha256`), the one embedding
+  model recorded by all referenced cluster runs, and `retrieval_only`.
+- Claim review: completed evaluation run, frozen manifest hash, question,
+  cached answer/input/evidence identity, claim position/text, cited IDs, and
+  cited redacted-evidence digests.
+
+These identities make cache hits explainable and replays idempotent. Legacy
+tail-named embedding files are intentionally not accepted by the current
+loader: falling back to the ambiguous name would undo the model-identity fix.
+
+### 5.3 Retrieval and answer APIs
+
+`load_corpus(con, cluster_id, company_id, embed_model)` recreates the exact
+signal-consistent population: the cluster run's recorded dedup run/cutoff,
+campaign exclusion, family restriction, company scope, one item per dedup
+group/company, and matching embedding-map provenance.
+
+`retrieve_variants(...)` encodes a question once, performs exact normalized
+FAISS inner-product ranking and deterministic BM25 over that same corpus, and
+returns independent component rankings plus configured reciprocal-rank fusion.
+`answer_question(...)` consumes fused evidence, validates every structural and
+scope invariant, requires complaint IDs on substantive claims, caches the
+closed structured answer, and renders complaint allegations, company response,
+context, limitations, metadata, and disclaimer as distinct sections.
+
+### 5.4 Evaluation and human-review APIs
+
+`src.llm.eval` exposes:
+
+- `load_manifest` / `validate_manifest` for the exact seven-column, balanced
+  30-question contract, cluster/company membership, and normalized eight-token
+  privacy guard;
+- `export_authoring_worklist` / `import_authoring_worklist` for private
+  evidence-assisted human authoring and ID-only freeze;
+- `run_retrieval_eval` for one-call-per-question dense/BM25/fused scoring and
+  atomic three-row persistence;
+- `run_answer_eval` for fused-only citation/coverage/abstention fields and
+  exact run-linked usage aggregation;
+- `export_claim_review` / `parse_claim_review` / `record_claim_review` for a
+  deterministic blinded sample of at least 50 claims and denominator-bearing
+  Wilson output.
+
+The CLI is lazy-imported and available as `rag-eval`, `rag-eval
+--retrieval-only`, `author`, `import`, `claims-export`, and `claims-record`.
+Pure artifact validation precedes writable connection/run creation. Successful
+evaluation declares 90 output rows only after all requested work and stable
+report rendering succeed; partial/interrupted runs stay failed. Claim export
+accepts only a completed run whose manifest hash equals the current frozen
+file, and completed review filenames must end in `.<reviewer_id>.csv` under
+configured `data/interim`.
+
+---
+
+## 6. Current gate status — 2026-08-11
+
+The software paths above are implemented and exercised with synthetic/fake
+provider fixtures. That is not a measured LLM result. The following remain
+open:
+
+1. A human must author/privacy-review the private 30-row draft and freeze the
+   ID-only manifest. No manifest hash or benchmark run ID exists yet.
+2. Eighteen draft rows have no concrete company scope, while grounded answer
+   evaluation deliberately requires one. The draft must be regenerated or the
+   design explicitly changed; the evaluator fails before provider work.
+3. `company_response` cannot be authored honestly from the current worklist's
+   complaint excerpts alone; independent public-response evidence or a human
+   scope decision is required.
+4. The local MiniLM vectors use the pre-SHA tail filename and need validated
+   regeneration/migration before current retrieval will load them.
+5. The provider authenticated on 2026-08-07 but returned a terminal billing
+   error because the organization had no credit. No live label or answer
+   benchmark has run.
+6. At least 50 labels and at least 50 answer claims still require human review.
+
+Accordingly, Recall@10, MRR, fusion comparisons, citation/abstention results,
+tokens, cost, and human groundedness are **pending**, not zero. On 2026-08-11,
+the network-free command stopped before opening the database because the frozen
+manifest does not yet exist; it created no `rag-eval` run.

@@ -63,6 +63,28 @@ narrative lands in git history.
 | `stratum` | `obvious` / `hard` / `unrelated` |
 | `notes` | short adjudicator note, no narrative quotes |
 
+## `rag_eval_questions.csv`
+
+This Phase 8D benchmark is a frozen, ID-only set of 30 synthetic analyst
+questions: five each for mechanism, actors/preconditions, consumer consequence,
+time sequence, company response, and unanswerable queries. Answerable rows list
+every hand-marked relevant complaint ID as an ascending semicolon-separated
+set; unanswerable rows contain no relevance IDs. Narrative excerpts remain in a
+gitignored `data/interim/` authoring worklist and never enter this directory.
+
+Before first freeze, a human author completes the private worklist and a human
+privacy reviewer checks each synthetic question for semantic paraphrase,
+recording `privacy_reviewed=yes`. Import also rejects any normalized eight-token
+sequence shared with a scoped redacted narrative. That automated check detects
+direct copying; it does not replace human paraphrase review.
+
+The first committed version must record its author ID, privacy-reviewer ID, and
+freeze commit here. Those fields are currently **pending** because no human has
+completed the authoring worklist; an agent-generated draft is not ground truth.
+After retrieval metrics have been viewed, neither questions nor relevant IDs
+may be edited in place. Corrections require a new manifest version, a new freeze
+commit, and preservation of results produced from the prior manifest hash.
+
 ## Also expected here
 
 - `company_canonical_manual.csv` — top-300 hand review (`docs/DATA.md` §3.5)

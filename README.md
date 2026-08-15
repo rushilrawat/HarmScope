@@ -14,8 +14,16 @@ lead time.
 
 ## Status
 
-**Phases 0–7 complete.** All four baselines are in `baseline_results` and the
-Results table at the bottom carries real numbers.
+**Phases 0–7 complete. Phase 8's engineering layer is built and tested; its
+live and human gates are still open.** All four baselines are in
+`baseline_results`, and the Results table at the bottom carries real numbers.
+The descriptive LLM layer now has resumable structured labeling, blinded label
+review, cluster/company-scoped hybrid retrieval, grounded answers, a frozen-set
+evaluation harness, and blinded claim review. It has not produced benchmark
+metrics yet: the 30-question set still needs human authorship/privacy review,
+the local embedding artifact needs regeneration under the current full-model
+SHA-256 filename contract, Anthropic billing is unavailable, and neither
+50-item human review has run.
 
 The headline, which four independent examinations now agree on: **the pipeline
 beats naive volume by about 10 points and is beaten by, or tied with, every
@@ -97,7 +105,7 @@ decisions rather than presented as satisfying the original bar.
 | 5 — Signal detection | ✅ negative control passes at 0.0045 vs α 0.05 |
 | 6 — Ground truth & backtest **[GATE]** | ✅ gate passed — refit at one cutoff in 3.2 min, 7 anti-leakage checks, blind adjudication on 14 actions |
 | 7 — Baselines | ✅ all four in `baseline_results` — B1 56.2% > B2 = B3 51.8% > HarmScope 50.9% > B0 41.1% |
-| 8 — LLM layer | 🔄 deterministic core built, determinism test passes; labelling needs an API key |
+| 8 — LLM layer | 🔄 engineering built and automated tests pass; live provider, frozen benchmark, and 50-label/50-claim human gates pending |
 | 9 — Evaluation & write-up | ⬜ |
 | 10 — Interface | ⬜ |
 
@@ -122,9 +130,10 @@ and the README must say so.
 4. Scores each cluster for **novelty** against the existing CFPB label taxonomy.
 5. Detects **abnormal growth** per cluster and per company × cluster (disproportionality +
    changepoint), with FDR correction.
-6. Labels surviving clusters with an LLM (harm mechanism, actors, preconditions) — labeling
-   only, never detection.
-7. Serves evidence: every signal links back to the specific complaint IDs that produced it.
+6. Labels surviving clusters with a structured-output LLM (harm mechanism,
+   actors, preconditions) — labeling only, never detection.
+7. Retrieves dense and BM25 evidence inside one cluster/company scope, fuses
+   ranks with RRF, and synthesizes only complaint-ID-cited claims.
 8. Backtests against a hand-curated set of pre-2025 CFPB enforcement actions.
 
 ---
@@ -151,7 +160,8 @@ and the README must say so.
 | Dim. reduction | UMAP | Required before density clustering |
 | Clustering | HDBSCAN | No fixed k; native noise class; matches "not everything is a harm mechanism" |
 | Stats | `statsmodels`, `scipy`, `ruptures` | Disproportionality, negative binomial, changepoint |
-| LLM | Anthropic API (`claude-sonnet-5`) | Cluster labeling + evidence synthesis, cached |
+| LLM | Anthropic API (`claude-opus-5`, configured; live gate pending) | Structured cluster labels + grounded evidence synthesis, atomically cached and resumable |
+| RAG evaluation | exact FAISS search + BM25 + reciprocal-rank fusion + DuckDB | Dense/sparse/fused Recall@10 and MRR, citation/abstention metrics, run provenance, blinded human review |
 | API | FastAPI | Serves signals + evidence |
 | UI | React + Vite + TS | Analyst-facing console (Streamlit fallback, see ROADMAP Phase 8) |
 
@@ -197,11 +207,21 @@ make test                                    # test suite
 make lint                                    # ruff
 make download                                # CFPB bulk CSV snapshot (~1.4 GB compressed)
 python -m src.pipeline runs                  # the run registry
+python -m src.pipeline rag-eval --help       # benchmark author/run/review workflow
 ```
 
 Everything the pipeline runs is registered: `python -m src.pipeline runs` shows
 phase, status, output rows, git SHA (with `-dirty` when the tree was not clean),
 and config fingerprint for every execution.
+
+The Phase 8 boundary is deliberate: deleting `src/llm/` leaves `signals`
+byte-identical, and `baseline_results` remains byte-identical given the same
+human-authored `backtest_links`. Model output describes and retrieves evidence;
+it cannot change detection, cluster membership, statistics, or rankings. The
+implemented evaluation reports dense, BM25, and fused results even when fusion
+loses, binds every run to the manifest SHA-256 and recorded embedding model,
+and refuses to call groundedness complete before at least 50 human-reviewed
+claims. Fake-client tests establish software behavior, not model quality.
 
 Phases that are not built raise and name the roadmap phase that would build
 them, rather than quietly doing nothing:

@@ -22,6 +22,7 @@ demand, so truncation drops the half that is often more specific.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -34,6 +35,25 @@ import numpy as np
 # an over-long slice is harmless and a char split avoids tokenizing twice. ~4
 # chars/token for English prose against a 512-token window.
 WINDOW_CHARS = 2000
+
+
+@dataclass(frozen=True)
+class EmbeddingArtifactPaths:
+    """Collision-free vector and FAISS paths for one full model identity."""
+
+    memmap: Path
+    index: Path
+
+
+def embedding_artifact_paths(artifact_dir: Path, model_name: str) -> EmbeddingArtifactPaths:
+    """Address artifacts by a case-insensitive-filesystem-safe full-model digest."""
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("model_name must be a nonblank string")
+    identity = hashlib.sha256(model_name.encode("utf-8")).hexdigest()
+    return EmbeddingArtifactPaths(
+        memmap=artifact_dir / f"embeddings.{identity}.npy",
+        index=artifact_dir / f"faiss.{identity}.index",
+    )
 
 
 @dataclass(frozen=True)
