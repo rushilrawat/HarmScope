@@ -8,22 +8,23 @@ validated by whether the signal appears *before* the corresponding public enforc
 
 **This is not a complaint classifier.** Classification over CFPB data is a solved, crowded
 problem. The contribution is open-world discovery + temporal validation against enforcement
-lead time.
+lead time.ple
 
 ---
 
 ## Status
 
-**Phases 0–7 complete. Phase 8's engineering layer is built and tested; its
-live and human gates are still open.** All four baselines are in
-`baseline_results`, and the Results table at the bottom carries real numbers.
-The descriptive LLM layer now has resumable structured labeling, blinded label
-review, cluster/company-scoped hybrid retrieval, grounded answers, a frozen-set
-evaluation harness, and blinded claim review. It has not produced benchmark
-metrics yet: the 30-question set still needs human authorship/privacy review,
-the local embedding artifact needs regeneration under the current full-model
-SHA-256 filename contract, Anthropic billing is unavailable, and neither
-50-item human review has run.
+**Phases 0–7 complete. Phase 8's engineering and embedding-operational layers
+are built, tested, and verified; its live-provider and human gates remain open.**
+All four baselines are in `baseline_results`, and the Results table at the bottom
+carries real numbers. The descriptive LLM layer now has resumable structured
+labeling, blinded label review, cluster/company-scoped hybrid retrieval, grounded
+answers, a frozen-set evaluation harness, and blinded claim review. The MiniLM
+artifacts were safely migrated to strict full-model SHA names on 2026-09-03 and
+passed idempotency, exact-byte, strict-loader, offline-retrieval, and unchanged-DB
+checks. Phase 8 has not produced benchmark metrics yet: the 30-question set still
+needs human authorship/privacy review, Anthropic billing is unavailable, and
+neither 50-item human review has run.
 
 The headline, which four independent examinations now agree on: **the pipeline
 beats naive volume by about 10 points and is beaten by, or tied with, every
@@ -105,9 +106,34 @@ decisions rather than presented as satisfying the original bar.
 | 5 — Signal detection | ✅ negative control passes at 0.0045 vs α 0.05 |
 | 6 — Ground truth & backtest **[GATE]** | ✅ gate passed — refit at one cutoff in 3.2 min, 7 anti-leakage checks, blind adjudication on 14 actions |
 | 7 — Baselines | ✅ all four in `baseline_results` — B1 56.2% > B2 = B3 51.8% > HarmScope 50.9% > B0 41.1% |
-| 8 — LLM layer | 🔄 engineering built and automated tests pass; live provider, frozen benchmark, and 50-label/50-claim human gates pending |
+| 8 — LLM layer | 🔄 engineering + embedding prerequisite verified; live provider, frozen benchmark, and 50-label/50-claim human gates pending |
 | 9 — Evaluation & write-up | ⬜ |
 | 10 — Interface | ⬜ |
+| 11 — Delivery & portfolio packaging *(proposed)* | ⬜ |
+
+---
+
+## Next plan
+
+The next milestone is **closing Phase 8**, not starting the interface. Work proceeds
+in this order:
+
+1. Freeze the human-authored 30-question benchmark, resolve its company-scope
+   and `company_response` evidence decisions, and complete privacy review.
+2. Recheck provider availability and current cost, run a small live sample
+   before the full job, and complete the 50-label and 50-claim human reviews.
+3. Complete Phase 9: final metrics, sensitivity analysis, failure analysis, and
+   an honest write-up of where HarmScope loses, ties, or adds value.
+4. Build a deliberately small Phase 10 analyst interface with FastAPI and
+   React/TypeScript. Every displayed result must resolve to its evidence IDs.
+5. If the interface is useful, add proposed Phase 11: reproducible deployment,
+   a public read-only demo or safe sample, CI/container packaging, architecture
+   material, and a short portfolio walkthrough. Do not add accounts, a write
+   API, streaming ingestion, or new data sources.
+
+Estimated remaining effort is roughly **10–15 focused working days** through
+the proposed Phase 11. Provider access and genuine human review can extend the
+calendar even when the engineering is ready.
 
 ---
 
@@ -133,7 +159,7 @@ and the README must say so.
 6. Labels surviving clusters with a structured-output LLM (harm mechanism,
    actors, preconditions) — labeling only, never detection.
 7. Retrieves dense and BM25 evidence inside one cluster/company scope, fuses
-   ranks with RRF, and synthesizes only complaint-ID-cited claims.
+   ranks with RRF, and accepts only complaint-ID-cited contiguous excerpts.
 8. Backtests against a hand-curated set of pre-2025 CFPB enforcement actions.
 
 ---
@@ -221,7 +247,44 @@ it cannot change detection, cluster membership, statistics, or rankings. The
 implemented evaluation reports dense, BM25, and fused results even when fusion
 loses, binds every run to the manifest SHA-256 and recorded embedding model,
 and refuses to call groundedness complete before at least 50 human-reviewed
-claims. Fake-client tests establish software behavior, not model quality.
+claims. Private review artifacts are direct children of a descriptor-pinned
+interim root with independent byte snapshots for rollback if that root moves
+during publication, label-review
+fired/control strata are frozen at export, and paid label/answer usage is durably
+replayable; a reused usage ID must match every stored accounting field. Every
+substantive answer claim must be a locally verified,
+NFC-and-whitespace-normalized contiguous excerpt from at least one cited
+redacted complaint narrative. One versioned canonical local renderer adds
+`Complaints allege:` and the declared complaint IDs to both CLI and human-review
+exports, and claim-review identity binds the hash of that exact rendered output.
+Extract validation establishes source fidelity, not the truth of the allegation.
+Fake-client tests establish software behavior, not model quality.
+
+### Embedding artifact migration — completed and verified 2026-09-03
+
+The strict retrieval loader accepts only full-model SHA-256 artifact names; it
+never falls back to the ambiguous legacy tail. After five adversarial fix rounds,
+five witnessed final regressions, 175 focused tests, a 912-test repository gate,
+and an independent review with no Critical or Important finding, the approved
+maintenance command migrated the completed MiniLM artifacts:
+
+```bash
+python -m src.pipeline migrate-embeddings \
+  --model sentence-transformers/all-MiniLM-L6-v2 --execute
+```
+
+The command reported `migrated` for 2,477,937 rows × 384 dimensions; an immediate
+replay reported `already-migrated`. The original inodes now live under three
+deterministic dot-prefixed retirement names. The three SHA targets are separate
+APFS copy-on-write inodes on the same device, with identical sizes and SHA-256
+content; all six entries have link count one and the legacy basenames are absent.
+The sidecar digest remains
+`5e6e54abb81cf8e173b8a9e47b8a2a34eaf63a6a4d66ad9066c2b6ede687484c`.
+DuckDB size, mtime, inode, and MiniLM mapping aggregates were unchanged. The
+strict loader returned `(2477937, 384) float32`, and a forced-offline hybrid
+retrieval smoke returned five evidence IDs for one existing cluster/company
+scope. No provider call occurred. Retirement entries remain intentionally
+retained until a separate quiescent cleanup decision.
 
 Phases that are not built raise and name the roadmap phase that would build
 them, rather than quietly doing nothing:
@@ -236,9 +299,9 @@ phase 'cluster' is not built.
 
 ## Results
 
-**Provisional, unadjudicated, dev model, and incomplete — B2 and B3 are still
-running.** Not the headline: the headline needs blind human adjudication
-(`EVALUATION.md` §1.3), all four baselines, and a `bge-base` encode.
+**Provisional, dev-model, and only partly human-adjudicated.** All four baseline
+runs are complete, but the final headline still needs the remaining blind human
+review, Phase 9 sensitivity/failure analysis, and a `bge-base` encode.
 
 | System | Detected | Rate | Median lead* | Units at 2024 |
 |---|---|---|---|---|

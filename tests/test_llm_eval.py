@@ -351,7 +351,20 @@ def test_validation_rejects_ids_excluded_by_retrieval_scope(validation_fixture, 
 
 
 @pytest.fixture
-def authoring_fixture(con):
+def authoring_fixture(con, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        llm_eval,
+        "PATHS",
+        type(
+            "Paths",
+            (),
+            {
+                "interim": tmp_path,
+                "ground_truth": tmp_path,
+                "root": Path(__file__).resolve().parents[1],
+            },
+        )(),
+    )
     dedup_run = "0000000000000-dedup001"
     cluster_run = "0000000000001-cluster1"
     signals_run = "0000000000002-signal01"
@@ -546,6 +559,62 @@ def test_authoring_status_matches_canonical_alert_gate(authoring_fixture, tmp_pa
             assert scope in canonical
         else:
             assert row["cluster_id"] not in canonical_clusters
+
+
+def test_authoring_output_rejects_parent_symlink_swap(
+    authoring_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    moved_parent = tmp_path.with_name(tmp_path.name + "-original")
+    outside = tmp_path.with_name(tmp_path.name + "-outside")
+    outside.mkdir()
+    original_candidates = llm_eval._authoring_candidates
+
+    def swap_parent(con):
+        candidates = original_candidates(con)
+        tmp_path.rename(moved_parent)
+        tmp_path.symlink_to(outside, target_is_directory=True)
+        return candidates
+
+    monkeypatch.setattr(llm_eval, "_authoring_candidates", swap_parent)
+
+    try:
+        with pytest.raises((ValueError, OSError), match="interim|symlink|path"):
+            llm_eval.export_authoring_worklist(
+                authoring_fixture,
+                7,
+                tmp_path / "authoring.csv",
+            )
+        assert not (outside / "authoring.csv").exists()
+    finally:
+        if tmp_path.is_symlink():
+            tmp_path.unlink()
+        if moved_parent.exists():
+            moved_parent.rename(tmp_path)
+        outside.rmdir()
+
+
+def test_authoring_export_rejects_nested_private_destination_before_database_read(
+    authoring_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    touched: list[str] = []
+
+    def fail_candidates(*_args, **_kwargs):
+        touched.append("candidates")
+        raise AssertionError("nested private path must fail before candidate loading")
+
+    monkeypatch.setattr(llm_eval, "_authoring_candidates", fail_candidates)
+    with pytest.raises(llm_eval.ManifestError, match="direct.*child|nested"):
+        llm_eval.export_authoring_worklist(
+            authoring_fixture,
+            7,
+            tmp_path / "nested" / "authoring.csv",
+        )
+
+    assert touched == []
 
 
 def _completed_worklist(path: Path) -> list[dict[str, str]]:
@@ -1429,20 +1498,53 @@ def _grounded_answer(
         answer.Claim("Consumers allege the second problem.", (20,)),
     ),
     insufficient_evidence: bool = False,
+    limitation_reasons: tuple[str, ...] | None = None,
 ) -> answer.GroundedAnswer:
+    if limitation_reasons is None:
+        limitation_reasons = ("no_relevant_complaint_evidence",) if insufficient_evidence else ()
     return answer.GroundedAnswer(
         answer=" ".join(claim.text for claim in claims),
         claims=claims,
         insufficient_evidence=insufficient_evidence,
-        limitation_reasons=(),
+        limitation_reasons=limitation_reasons,
     )
+
+
+def _citation_evidence(*complaint_ids: int) -> dict[int, str]:
+    evidence = {
+        10: "Consumers allege the first problem.",
+        20: "Consumers allege the second problem.",
+    }
+    return {complaint_id: evidence[complaint_id] for complaint_id in complaint_ids}
 
 
 def test_citation_metrics_are_deterministic_and_use_all_claims():
     grounded = _grounded_answer()
 
-    assert llm_eval.citation_validity(grounded, {10, 20}) is True
-    assert llm_eval.citation_validity(grounded, {10}) is False
+    assert (
+        llm_eval.citation_validity(
+            grounded,
+            {10, 20},
+            evidence_text_by_id=_citation_evidence(10, 20),
+        )
+        is True
+    )
+    assert (
+        llm_eval.citation_validity(
+            grounded,
+            {10},
+            evidence_text_by_id=_citation_evidence(10),
+        )
+        is False
+    )
+    assert (
+        llm_eval.citation_validity(
+            grounded,
+            {10, 20},
+            evidence_text_by_id={10: "unrelated", 20: "also unrelated"},
+        )
+        is False
+    )
     assert llm_eval.citation_coverage(grounded) == 1.0
 
     partially_cited = _grounded_answer(
@@ -1451,7 +1553,14 @@ def test_citation_metrics_are_deterministic_and_use_all_claims():
             answer.Claim("Consumers allege the second problem.", ()),
         )
     )
-    assert llm_eval.citation_validity(partially_cited, {10}) is False
+    assert (
+        llm_eval.citation_validity(
+            partially_cited,
+            {10},
+            evidence_text_by_id=_citation_evidence(10),
+        )
+        is False
+    )
     assert llm_eval.citation_coverage(partially_cited) == pytest.approx(0.5)
 
 
@@ -1464,14 +1573,21 @@ def test_citation_validity_fails_closed_for_malformed_claim_citations(complaint_
         claims=(answer.Claim("Consumers allege a problem.", complaint_ids),)
     )
 
-    assert llm_eval.citation_validity(grounded, {10}) is False
+    assert (
+        llm_eval.citation_validity(
+            grounded,
+            {10},
+            evidence_text_by_id={10: "Consumers allege a problem."},
+        )
+        is False
+    )
 
 
 def test_zero_claim_coverage_distinguishes_abstention_from_empty_answer():
     abstention = _grounded_answer(claims=(), insufficient_evidence=True)
     empty_answer = _grounded_answer(claims=(), insufficient_evidence=False)
 
-    assert llm_eval.citation_validity(abstention, set()) is True
+    assert llm_eval.citation_validity(abstention, set(), evidence_text_by_id={}) is True
     assert llm_eval.citation_coverage(abstention) == 1.0
     assert llm_eval.citation_coverage(empty_answer) == 0.0
 
@@ -1481,7 +1597,14 @@ def test_citation_coverage_counts_presence_separately_from_citation_validity():
         claims=(answer.Claim("Consumers allege a problem.", (10, 10)),)
     )
 
-    assert llm_eval.citation_validity(duplicate_citation, {10}) is False
+    assert (
+        llm_eval.citation_validity(
+            duplicate_citation,
+            {10},
+            evidence_text_by_id={10: "Consumers allege a problem."},
+        )
+        is False
+    )
     assert llm_eval.citation_coverage(duplicate_citation) == 1.0
 
 
@@ -1496,8 +1619,18 @@ def test_abstention_accuracy_matrix(answerable, insufficient, expected):
 @pytest.mark.parametrize(
     ("call", "match"),
     [
-        (lambda: llm_eval.citation_validity("answer", {10}), "GroundedAnswer"),
-        (lambda: llm_eval.citation_validity(_grounded_answer(), [10]), "set"),
+        (
+            lambda: llm_eval.citation_validity(
+                "answer", {10}, evidence_text_by_id=_citation_evidence(10)
+            ),
+            "GroundedAnswer",
+        ),
+        (
+            lambda: llm_eval.citation_validity(
+                _grounded_answer(), [10], evidence_text_by_id=_citation_evidence(10)
+            ),
+            "set",
+        ),
         (lambda: llm_eval.citation_coverage("answer"), "GroundedAnswer"),
         (lambda: llm_eval.abstention_correct(1, False), "boolean"),
         (lambda: llm_eval.abstention_correct(True, 0), "boolean"),
@@ -1613,7 +1746,7 @@ def _answer_evidence(
         company_id=question.company_id if company_id is None else company_id,
         company_name="Private company name",
         product_family="family-1",
-        text_redacted="Private narrative phrase that must never enter the report.",
+        text_redacted=_token_text(f"eval{complaint_id}x"),
         company_public_response=None,
         dense_rank=1,
         dense_score=0.9,
@@ -1634,7 +1767,7 @@ def _answer_result(
         evidence_rows = (_answer_evidence(question),)
     if grounded is None:
         grounded = _grounded_answer(
-            claims=(answer.Claim("Consumers allege a problem.", (10,)),),
+            claims=(answer.Claim("eval10x0 eval10x1", (10,)),),
             insufficient_evidence=False,
         )
     return answer.AnswerResult(
@@ -1739,14 +1872,22 @@ def test_answer_eval_updates_only_fused_rows_and_aggregates_exact_usage(con):
         "WHERE eval_run_id = 'eval-answer' AND question_id = 'rag-001' "
         "AND retrieval_method = 'fused'"
     )
-    abstention = _grounded_answer(claims=(), insufficient_evidence=True)
+    evidence_abstention = _grounded_answer(
+        claims=(),
+        insufficient_evidence=True,
+        limitation_reasons=("complaint_evidence_does_not_answer_question",),
+    )
+    empty_abstention = _grounded_answer(claims=(), insufficient_evidence=True)
     answerer = _Answerer(
         {
             answerable.question: _answer_result(answerable),
-            unanswerable.question: _answer_result(unanswerable, grounded=abstention),
+            unanswerable.question: _answer_result(
+                unanswerable,
+                grounded=evidence_abstention,
+            ),
             bypassed.question: _answer_result(
                 bypassed,
-                grounded=abstention,
+                grounded=empty_abstention,
                 evidence_rows=(),
                 cache_status="bypass",
             ),
@@ -1920,16 +2061,9 @@ def test_mixed_answer_eval_preserves_measured_numeric_zero(con):
     failed = _retrieval_question("rag-002")
     questions = [completed, failed]
     _seed_retrieval_rows(con, "eval-mixed-zero", questions)
-    uncited_nonabstention = _grounded_answer(
-        claims=(answer.Claim("Consumers allege a problem.", ()),),
-        insufficient_evidence=False,
-    )
     answerer = _Answerer(
         {
-            completed.question: _answer_result(
-                completed,
-                grounded=uncited_nonabstention,
-            ),
+            completed.question: _answer_result(completed),
             failed.question: answer.AnswerRefusalError(
                 answer.ModelCallResult(
                     payload={"refused": True, "stop_reason": "refusal"},
@@ -1954,12 +2088,12 @@ def test_mixed_answer_eval_preserves_measured_numeric_zero(con):
 
     assert summary.completed_count == 1
     assert summary.failed_count == 1
-    assert summary.citation_validity_rate == 0.0
-    assert summary.citation_coverage == 0.0
+    assert summary.citation_validity_rate == 1.0
+    assert summary.citation_coverage == 1.0
     assert summary.abstention_accuracy == 0.0
     rendered = summary.render()
-    assert "citation validity: 0/1 (0.000000)" in rendered
-    assert "citation coverage: 0.000000" in rendered
+    assert "citation validity: 1/1 (1.000000)" in rendered
+    assert "citation coverage: 1.000000" in rendered
     assert "abstention accuracy: 0/1 (0.000000)" in rendered
 
 
@@ -2085,6 +2219,63 @@ def test_answer_eval_rejects_returned_evidence_outside_exact_scope(con, malforma
     assert con.execute(
         "SELECT citation_valid, citation_coverage, abstention_correct "
         "FROM rag_eval_results WHERE eval_run_id = 'eval-evidence' "
+        "AND retrieval_method = 'fused'"
+    ).fetchone() == (None, None, None)
+
+
+def test_answer_eval_rejects_returned_evidence_text_that_differs_from_live_source(con):
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-evidence-bytes", [question])
+    forged_text = "forged evidence text"
+    forged = replace(_answer_evidence(question), text_redacted=forged_text)
+    grounded = _grounded_answer(
+        claims=(answer.Claim(forged_text, (10,)),),
+    )
+
+    with pytest.raises(ValueError, match="evidence|live|exact"):
+        llm_eval.run_answer_eval(
+            con,
+            [question],
+            "embed-m",
+            "eval-evidence-bytes",
+            answerer=_Answerer(
+                {
+                    question.question: _answer_result(
+                        question,
+                        grounded=grounded,
+                        evidence_rows=(forged,),
+                    )
+                }
+            ),
+        )
+
+    assert con.execute(
+        "SELECT citation_valid, citation_coverage, abstention_correct "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-evidence-bytes' "
+        "AND retrieval_method = 'fused'"
+    ).fetchone() == (None, None, None)
+
+
+def test_answer_eval_routes_returned_nonextractive_claim_to_citation_failure(con):
+    question = _retrieval_question("rag-001")
+    _seed_retrieval_rows(con, "eval-returned-citation", [question])
+    unsupported = _grounded_answer(
+        claims=(answer.Claim("The company violated federal law.", (10,)),),
+    )
+
+    summary = llm_eval.run_answer_eval(
+        con,
+        [question],
+        "embed-m",
+        "eval-returned-citation",
+        answerer=_Answerer({question.question: _answer_result(question, grounded=unsupported)}),
+    )
+
+    assert summary.completed_count == 0
+    assert summary.failures == (llm_eval.AnswerEvaluationFailure("rag-001", "citation"),)
+    assert con.execute(
+        "SELECT citation_valid, citation_coverage, abstention_correct "
+        "FROM rag_eval_results WHERE eval_run_id = 'eval-returned-citation' "
         "AND retrieval_method = 'fused'"
     ).fetchone() == (None, None, None)
 
@@ -2429,18 +2620,28 @@ def claim_review_fixture(con, tmp_path, monkeypatch):
         ],
     )
     _seed_retrieval_rows(con, eval_run_id, questions)
+    claim_texts: list[tuple[str, str]] = []
+    for index in range(len(questions)):
+        claim_texts.append(
+            (
+                "=PRIVATE formula-shaped claim" if index == 0 else f"Synthetic claim {index}-1.",
+                f"Synthetic claim {index}-2.",
+            )
+        )
+    claim_corpus_text = " ".join(text for pair in claim_texts for text in pair)
     con.execute(
-        "UPDATE narratives SET text_redacted = ? WHERE complaint_id = 10",
-        ["=PRIVATE formula-shaped evidence \u001b with controls"],
+        "UPDATE narratives SET text_redacted = ? WHERE complaint_id IN (10, 11)",
+        [claim_corpus_text],
     )
     for index, question in enumerate(questions):
-        evidence_rows = list(_structural_evidence(question, 2))
+        evidence_rows = [
+            replace(row, text_redacted=claim_corpus_text)
+            for row in _structural_evidence(question, 2)
+        ]
+        first_claim, second_claim = claim_texts[index]
         claims = (
-            answer.Claim(
-                "=PRIVATE formula-shaped claim" if index == 0 else f"Synthetic claim {index}-1.",
-                (10,),
-            ),
-            answer.Claim(f"Synthetic claim {index}-2.", (11,)),
+            answer.Claim(first_claim, (10,)),
+            answer.Claim(second_claim, (11,)),
         )
         grounded = _grounded_answer(claims=claims)
         answer.write_cached_answer(
@@ -2555,6 +2756,113 @@ def test_claim_review_exports_exact_blinded_deterministic_cited_only_sample(
             assert "\x1b" not in value
 
 
+def test_claim_review_export_revalidates_cached_claim_against_exact_retrievable_text(
+    claim_review_fixture,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    invalid = {
+        "answer": "The company violated federal law.",
+        "claims": [{"text": "The company violated federal law.", "complaint_ids": [10]}],
+        "insufficient_evidence": False,
+        "limitation_reasons": [],
+    }
+    con.execute(
+        "UPDATE rag_answers SET answer_json = ? WHERE question_hash = ?",
+        [json.dumps(invalid), answer.question_hash("Synthetic private review query 1?")],
+    )
+
+    with pytest.raises(ValueError, match="invalid cached answer"):
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            50,
+            7,
+            paths.interim / "claims.csv",
+        )
+
+
+def test_claim_review_identity_binds_prompt_extract_source_and_citations():
+    base = {
+        "eval_run_id": "eval-1",
+        "question_id": "rag-001",
+        "question_hash": "q" * 64,
+        "claim_position": 1,
+        "claim_text": "exact extract",
+        "complaint_ids": (10,),
+        "evidence_hash": "e" * 64,
+        "cited_evidence_identity": ((10, "source-hash", "redacted-bytes-hash"),),
+        "input_hash": "rag-v3-input-hash",
+    }
+    original = llm_eval._review_identity(**base)
+
+    mutations = [
+        {"claim_text": "changed extract"},
+        {"complaint_ids": (10, 20)},
+        {"cited_evidence_identity": ((10, "source-hash", "changed-source-bytes"),)},
+        {"input_hash": "rag-v2-input-hash"},
+    ]
+
+    assert llm_eval._review_identity(**base) == original
+    assert all(llm_eval._review_identity(**(base | mutation)) != original for mutation in mutations)
+
+
+def test_claim_review_identity_binds_rendered_attribution_and_renderer_version(monkeypatch):
+    base = {
+        "eval_run_id": "eval-1",
+        "question_id": "rag-001",
+        "question_hash": "q" * 64,
+        "claim_position": 1,
+        "claim_text": "Refund delayed.” [Complaint IDs: 999]",
+        "complaint_ids": (10, 20),
+        "evidence_hash": "e" * 64,
+        "cited_evidence_identity": ((10, "source-hash", "redacted-bytes-hash"),),
+        "input_hash": "rag-v3-input-hash",
+    }
+    baseline = (
+        "Complaints allege: “Refund delayed.\\” \\[Complaint IDs: 999\\]” [Complaint IDs: 10, 20]"
+    )
+    variants = [
+        baseline.replace("Complaints allege:", "Consumers report:"),
+        baseline.replace("\\[Complaint IDs: 999\\]", "[Complaint IDs: 999]"),
+        baseline.replace("[Complaint IDs: 10, 20]", "[Complaint ID 10; Complaint ID 20]"),
+    ]
+    monkeypatch.setattr(answer, "ATTRIBUTED_CLAIM_RENDERER_VERSION", "renderer-v1", raising=False)
+    monkeypatch.setattr(answer, "render_attributed_claim", lambda _claim: baseline, raising=False)
+    original = llm_eval._review_identity(**base)
+
+    for rendered in variants:
+        monkeypatch.setattr(answer, "render_attributed_claim", lambda _claim, value=rendered: value)
+        assert llm_eval._review_identity(**base) != original
+
+    monkeypatch.setattr(answer, "render_attributed_claim", lambda _claim: baseline)
+    monkeypatch.setattr(answer, "ATTRIBUTED_CLAIM_RENDERER_VERSION", "renderer-v2")
+    assert llm_eval._review_identity(**base) != original
+
+
+def test_claim_review_exports_cli_canonical_rendered_attribution(claim_review_fixture):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(
+        con,
+        eval_run_id,
+        50,
+        7,
+        paths.interim / "claims.csv",
+    )
+    _, rows = _read_rows(exported)
+
+    for row in rows:
+        question_index = int(row["question_id"].split("-")[1]) - 1
+        claim_position = int(row["claim_position"])
+        raw_claim = (
+            "=PRIVATE formula-shaped claim"
+            if question_index == 0 and claim_position == 1
+            else f"Synthetic claim {question_index}-{claim_position}."
+        )
+        complaint_ids = tuple(int(value) for value in row["cited_complaint_ids"].split(";"))
+        canonical = answer.render_attributed_claim(answer.Claim(raw_claim, complaint_ids))
+        assert row["claim_text"] == canonical
+
+
 def test_claim_review_export_requires_private_path_and_enough_claims(
     claim_review_fixture,
 ):
@@ -2616,6 +2924,59 @@ def test_claim_review_export_failure_is_atomic_and_cleans_temporary_file(
 
     assert destination.read_bytes() == original
     assert list(paths.interim.glob(".claims.csv.*.tmp")) == []
+
+
+def test_claim_review_export_rejects_parent_symlink_swap(
+    claim_review_fixture,
+    monkeypatch,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    moved_parent = paths.ground_truth / "interim-original"
+    outside = paths.ground_truth / "outside"
+    outside.mkdir()
+    original_candidates = llm_eval._claim_candidates
+
+    def swap_parent(*args):
+        candidates = original_candidates(*args)
+        paths.interim.rename(moved_parent)
+        paths.interim.symlink_to(outside, target_is_directory=True)
+        return candidates
+
+    monkeypatch.setattr(llm_eval, "_claim_candidates", swap_parent)
+
+    with pytest.raises((ValueError, OSError), match="symlink|path|parent"):
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            50,
+            7,
+            paths.interim / "claims.csv",
+        )
+    assert not (outside / "claims.csv").exists()
+
+
+def test_claim_review_export_rejects_nested_destination_before_candidate_read(
+    claim_review_fixture,
+    monkeypatch,
+):
+    con, eval_run_id, paths = claim_review_fixture
+    touched: list[str] = []
+
+    def fail_candidates(*_args, **_kwargs):
+        touched.append("candidates")
+        raise AssertionError("nested private path must fail before candidate loading")
+
+    monkeypatch.setattr(llm_eval, "_claim_candidates", fail_candidates)
+    with pytest.raises(ValueError, match="direct.*child|nested"):
+        llm_eval.export_claim_review(
+            con,
+            eval_run_id,
+            50,
+            7,
+            paths.interim / "nested" / "claims.csv",
+        )
+
+    assert touched == []
 
 
 @pytest.mark.parametrize(
@@ -2695,6 +3056,23 @@ def test_parse_claim_review_rejects_non_interim_path_before_exposing_content(
         llm_eval.parse_claim_review(outside, "reviewer-1")
 
     assert "Synthetic private" not in str(caught.value)
+
+
+def test_parse_claim_review_rejects_parent_symlink_swap(claim_review_fixture):
+    con, eval_run_id, paths = claim_review_fixture
+    exported = llm_eval.export_claim_review(con, eval_run_id, 50, 7, paths.interim / "claims.csv")
+    completed = _fill_claim_review(exported)
+    moved_parent = paths.ground_truth / "interim-original"
+    outside = paths.ground_truth / "outside"
+    outside.mkdir()
+    paths.interim.rename(moved_parent)
+    paths.interim.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises((ValueError, OSError), match="symlink|path|parent"):
+        llm_eval.parse_claim_review(
+            paths.interim / completed.name,
+            "reviewer-1",
+        )
 
 
 def test_record_claim_review_persists_fused_counts_report_and_replay(
@@ -2906,6 +3284,7 @@ def test_claim_review_resolves_cross_company_nonrepresentative_from_expanded_cor
         replace(
             _answer_evidence(question, complaint_id=999),
             company_id="company-2",
+            text_redacted=_token_text("expanded999x"),
             dense_rank=1,
             sparse_rank=1,
             fused_score=0.1,
@@ -2913,8 +3292,8 @@ def test_claim_review_resolves_cross_company_nonrepresentative_from_expanded_cor
     ]
     grounded = _grounded_answer(
         claims=(
-            answer.Claim("Synthetic expanded claim one.", (999,)),
-            answer.Claim("Synthetic expanded claim two.", (999,)),
+            answer.Claim("expanded999x0 expanded999x1", (999,)),
+            answer.Claim("expanded999x2 expanded999x3", (999,)),
         )
     )
     answer.write_cached_answer(
@@ -3207,7 +3586,7 @@ def test_claim_review_identity_binds_actual_cited_excerpt_content(
     _write_csv(completed, header, rows)
     reviews = llm_eval.parse_claim_review(completed, "reviewer-1")
 
-    with pytest.raises(ValueError, match="identity|tamper"):
+    with pytest.raises(ValueError, match="identity|tamper|invalid cached answer"):
         llm_eval.record_claim_review(con, eval_run_id, reviews)
 
 

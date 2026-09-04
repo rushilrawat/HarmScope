@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import FrozenInstanceError, replace
-from datetime import date
+from datetime import date, timedelta
 from hashlib import sha256
 from pathlib import Path
 
@@ -15,6 +15,10 @@ from src.config import Paths
 from src.llm import answer
 from src.llm.client import ModelCallError, ModelCallResult, TokenUsage
 from src.llm.retrieve import RetrievedEvidence
+
+DEFAULT_EVIDENCE_TEXT = (
+    "Consumers allege delayed refunds. Consumers allege refund delays persisted."
+)
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +38,7 @@ def evidence(
     cluster_id: str = "0000000000001-abcdef01:mortgage:3",
     company_id: str = "scope-company",
     product_family: str = "mortgage",
-    text_redacted: str = "Consumers describe a delayed refund.",
+    text_redacted: str = DEFAULT_EVIDENCE_TEXT,
     company_public_response: str | None = None,
     dense_rank: int | None = 1,
     dense_score: float | None = 0.9,
@@ -88,8 +92,16 @@ def answer_payload(**changes: object) -> dict[str, object]:
     return payload
 
 
+def evidence_text_by_id(*complaint_ids: int) -> dict[int, str]:
+    return dict.fromkeys(complaint_ids, DEFAULT_EVIDENCE_TEXT)
+
+
 def grounded_answer(**changes: object) -> answer.GroundedAnswer:
-    return answer.validate_answer(answer_payload(**changes), {10, 20})
+    return answer.validate_answer(
+        answer_payload(**changes),
+        {10, 20},
+        evidence_text_by_id=evidence_text_by_id(10, 20),
+    )
 
 
 def model_result(payload: dict[str, object] | None = None) -> ModelCallResult:
@@ -166,7 +178,11 @@ def test_answer_schema_is_closed_and_complete():
 
 
 def test_validator_returns_frozen_typed_answer():
-    got = answer.validate_answer(answer_payload(), {10})
+    got = answer.validate_answer(
+        answer_payload(),
+        {10},
+        evidence_text_by_id=evidence_text_by_id(10),
+    )
 
     assert got == answer.GroundedAnswer(
         answer="Consumers allege delayed refunds.",
@@ -184,7 +200,206 @@ def test_validator_rejects_unretrieved_citations():
     )
 
     with pytest.raises(answer.CitationError, match="999"):
-        answer.validate_answer(payload, {10, 20})
+        answer.validate_answer(
+            payload,
+            {10, 20},
+            evidence_text_by_id=evidence_text_by_id(10, 20),
+        )
+
+
+def test_validator_rejects_cited_but_nonextractive_legal_conclusion():
+    """A valid citation ID must not license model-written legal conclusions."""
+    payload = answer_payload(
+        answer="The company violated federal law.",
+        claims=[{"text": "The company violated federal law.", "complaint_ids": [10]}],
+    )
+
+    with pytest.raises(answer.CitationError, match="extract"):
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id={10: "My refund did not arrive after I requested it."},
+        )
+
+
+def test_validator_accepts_nfc_and_whitespace_normalized_contiguous_extract():
+    payload = answer_payload(
+        answer="Café refund delayed",
+        claims=[{"text": "  Café   refund delayed  ", "complaint_ids": [10]}],
+    )
+
+    got = answer.validate_answer(
+        payload,
+        {10},
+        evidence_text_by_id={10: "Before Café\nrefund delayed after."},
+    )
+
+    assert got.claims == (answer.Claim("Café refund delayed", (10,)),)
+    assert got.answer == "Café refund delayed"
+
+
+@pytest.mark.parametrize(
+    ("claim_text", "source_text"),
+    [
+        ("Refund Delayed", "refund delayed"),
+        ("refund was delayed", "refund was repeatedly and materially delayed"),
+    ],
+    ids=["case-mismatch", "non-contiguous"],
+)
+def test_validator_rejects_text_that_is_not_an_exact_contiguous_extract(
+    claim_text,
+    source_text,
+):
+    payload = answer_payload(
+        answer=claim_text,
+        claims=[{"text": claim_text, "complaint_ids": [10]}],
+    )
+
+    with pytest.raises(answer.CitationError, match="extract"):
+        answer.validate_answer(payload, {10}, evidence_text_by_id={10: source_text})
+
+
+def test_multi_id_claim_needs_one_exact_cited_source_and_retains_all_ids():
+    payload = answer_payload(
+        answer="refund delayed",
+        claims=[{"text": "refund delayed", "complaint_ids": [10, 20]}],
+    )
+
+    got = answer.validate_answer(
+        payload,
+        {10, 20},
+        evidence_text_by_id={10: "unrelated narrative", 20: "the refund delayed again"},
+    )
+    assert got.claims == (answer.Claim("refund delayed", (10, 20)),)
+
+    with pytest.raises(answer.CitationError, match="extract"):
+        answer.validate_answer(
+            payload,
+            {10, 20},
+            evidence_text_by_id={10: "unrelated narrative", 20: "refund eventually arrived"},
+        )
+
+
+def test_claim_cannot_borrow_support_from_an_allowed_but_uncited_source():
+    payload = answer_payload(
+        answer="refund delayed",
+        claims=[{"text": "refund delayed", "complaint_ids": [10]}],
+    )
+
+    with pytest.raises(answer.CitationError, match="extract"):
+        answer.validate_answer(
+            payload,
+            {10, 20},
+            evidence_text_by_id={10: "unrelated narrative", 20: "refund delayed"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("allowed_ids", "evidence_map", "exception_type"),
+    [
+        ({10, 20}, {10: DEFAULT_EVIDENCE_TEXT}, answer.CitationError),
+        ({10}, {10: DEFAULT_EVIDENCE_TEXT, 20: "extra"}, answer.CitationError),
+        ({1}, {True: DEFAULT_EVIDENCE_TEXT}, answer.AnswerSchemaError),
+        ({True}, {True: DEFAULT_EVIDENCE_TEXT}, answer.AnswerSchemaError),
+        ({10}, {10: ""}, answer.AnswerSchemaError),
+        ({10}, {10: 123}, answer.AnswerSchemaError),
+        ({10}, [(10, DEFAULT_EVIDENCE_TEXT)], answer.AnswerSchemaError),
+    ],
+    ids=[
+        "missing",
+        "extra",
+        "boolean-key",
+        "boolean-allowed-id",
+        "blank-text",
+        "non-string-text",
+        "non-dict",
+    ],
+)
+def test_validator_rejects_malformed_or_mismatched_evidence_mappings(
+    allowed_ids,
+    evidence_map,
+    exception_type,
+):
+    with pytest.raises(exception_type):
+        answer.validate_answer(
+            answer_payload(),
+            allowed_ids,
+            evidence_text_by_id=evidence_map,
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    ["refund\x00delayed", "refund\x1bdelayed", "refund\x85delayed", "refund\u202edelayed"],
+    ids=["c0-nul", "c0-escape", "c1", "bidi"],
+)
+def test_validator_rejects_unsafe_control_bearing_claims(unsafe_text):
+    payload = answer_payload(
+        answer=unsafe_text,
+        claims=[{"text": unsafe_text, "complaint_ids": [10]}],
+    )
+
+    with pytest.raises(answer.AnswerSchemaError, match="control|safe"):
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id={10: f"before refund delayed after {unsafe_text!r}"},
+        )
+
+
+def test_validator_rejects_control_only_and_overlength_claims_without_truncation():
+    control_only = answer_payload(
+        answer="\x1b",
+        claims=[{"text": "\x1b", "complaint_ids": [10]}],
+    )
+    with pytest.raises(answer.AnswerSchemaError):
+        answer.validate_answer(control_only, {10}, evidence_text_by_id={10: "\x1b"})
+
+    overlength = "x" * (answer.CONFIG.llm.max_narrative_chars + 1)
+    payload = answer_payload(
+        answer=overlength,
+        claims=[{"text": overlength, "complaint_ids": [10]}],
+    )
+    with pytest.raises(answer.AnswerSchemaError, match="length|long"):
+        answer.validate_answer(payload, {10}, evidence_text_by_id={10: overlength})
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    ["👩🏽‍💻", "क्‍ष", "می‌خواهم", "Café"],
+    ids=["emoji-zwj", "indic-zwj", "persian-zwnj", "combining-nfc"],
+)
+def test_validator_preserves_safe_joiners_and_combining_text(safe_text):
+    source_text = "Café" if safe_text == "Café" else safe_text
+    payload = answer_payload(
+        answer=safe_text,
+        claims=[{"text": safe_text, "complaint_ids": [10]}],
+    )
+
+    got = answer.validate_answer(payload, {10}, evidence_text_by_id={10: source_text})
+
+    assert got.claims[0].text == safe_text
+
+
+@pytest.mark.parametrize("noncharacter", ["\ufdd0", "\ufffe", "\U0010ffff"])
+def test_validator_rejects_unicode_noncharacters(noncharacter):
+    claim_text = f"refund {noncharacter} delayed"
+    payload = answer_payload(
+        answer=claim_text,
+        claims=[{"text": claim_text, "complaint_ids": [10]}],
+    )
+
+    with pytest.raises(answer.AnswerSchemaError, match="safe|noncharacter"):
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id={10: claim_text},
+        )
+
+
+def test_validator_requires_exact_evidence_not_ids_only():
+    with pytest.raises(TypeError, match="evidence_text_by_id"):
+        answer.validate_answer(answer_payload(), {10})
 
 
 @pytest.mark.parametrize("complaint_ids", [[], [10, 10], [True], ["10"]])
@@ -194,7 +409,11 @@ def test_validator_requires_unique_integer_citations(complaint_ids):
     )
 
     with pytest.raises(answer.CitationError):
-        answer.validate_answer(payload, {10})
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id=evidence_text_by_id(10),
+        )
 
 
 @pytest.mark.parametrize(
@@ -212,7 +431,24 @@ def test_validator_requires_unique_integer_citations(complaint_ids):
 )
 def test_validator_requires_exact_schema_and_nonblank_strings(payload):
     with pytest.raises(answer.AnswerSchemaError):
-        answer.validate_answer(payload, {10})
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id=evidence_text_by_id(10),
+        )
+
+
+def test_validator_reports_mixed_type_object_keys_as_schema_error():
+    payload = answer_payload()
+    payload[1] = "integer key"
+    payload["extra"] = "string key"
+
+    with pytest.raises(answer.AnswerSchemaError, match="fields"):
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id=evidence_text_by_id(10),
+        )
 
 
 def test_insufficient_evidence_cannot_smuggle_a_substantive_answer():
@@ -223,7 +459,11 @@ def test_insufficient_evidence_cannot_smuggle_a_substantive_answer():
     )
 
     with pytest.raises(answer.AnswerSchemaError, match="insufficient"):
-        answer.validate_answer(payload, {10})
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id=evidence_text_by_id(10),
+        )
 
 
 def test_insufficient_evidence_requires_empty_answer_and_claims():
@@ -235,6 +475,7 @@ def test_insufficient_evidence_requires_empty_answer_and_claims():
             limitation_reasons=["complaint_evidence_does_not_answer_question"],
         ),
         {10},
+        evidence_text_by_id=evidence_text_by_id(10),
     )
 
     assert got.insufficient_evidence is True
@@ -247,7 +488,11 @@ def test_insufficient_evidence_requires_a_nonblank_limitation():
     )
 
     with pytest.raises(answer.AnswerSchemaError, match="limitation reason"):
-        answer.validate_answer(payload, {10})
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id=evidence_text_by_id(10),
+        )
 
 
 def test_wire_answer_must_exactly_match_deterministic_cited_claim_synthesis():
@@ -255,7 +500,11 @@ def test_wire_answer_must_exactly_match_deterministic_cited_claim_synthesis():
     payload = answer_payload(answer="The company violated consumer-protection law.")
 
     with pytest.raises(answer.AnswerSchemaError, match="cited claims"):
-        answer.validate_answer(payload, {10})
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id=evidence_text_by_id(10),
+        )
 
 
 def test_claim_text_is_normalized_and_duplicate_normalized_claims_are_rejected():
@@ -275,7 +524,11 @@ def test_claim_text_is_normalized_and_duplicate_normalized_claims_are_rejected()
     )
 
     with pytest.raises(answer.AnswerSchemaError, match="duplicate"):
-        answer.validate_answer(payload, {10, 20})
+        answer.validate_answer(
+            payload,
+            {10, 20},
+            evidence_text_by_id=evidence_text_by_id(10, 20),
+        )
 
 
 def test_limitation_schema_uses_only_closed_non_substantive_reason_codes():
@@ -291,7 +544,11 @@ def test_limitation_schema_uses_only_closed_non_substantive_reason_codes():
         limitation_reasons=["The company violated consumer-protection law."],
     )
     with pytest.raises(answer.AnswerSchemaError):
-        answer.validate_answer(payload, {10})
+        answer.validate_answer(
+            payload,
+            {10},
+            evidence_text_by_id=evidence_text_by_id(10),
+        )
 
 
 def test_abstention_accepts_only_the_context_free_reason_code():
@@ -302,7 +559,11 @@ def test_abstention_accepts_only_the_context_free_reason_code():
         "limitation_reasons": ["complaint_evidence_does_not_answer_question"],
     }
 
-    got = answer.validate_answer(payload, {10})
+    got = answer.validate_answer(
+        payload,
+        {10},
+        evidence_text_by_id=evidence_text_by_id(10),
+    )
 
     assert got.answer == ""
     assert got.limitation_reasons == ("complaint_evidence_does_not_answer_question",)
@@ -317,7 +578,7 @@ def test_renderer_ignores_noncanonical_answer_and_uses_cited_claim_synthesis():
             insufficient_evidence=False,
             limitation_reasons=(),
         ),
-        evidence=(),
+        evidence=(evidence(10),),
         enforcement_context=(),
         cache_status="miss",
         usage=TokenUsage(),
@@ -327,8 +588,90 @@ def test_renderer_ignores_noncanonical_answer_and_uses_cited_claim_synthesis():
 
     rendered = answer.render_cli(result, disclaimer="Fixed disclaimer.")
 
-    assert "Consumers allege delayed refunds." in rendered
+    attribution = "Complaints allege: “Consumers allege delayed refunds.” [Complaint IDs: 10]"
+    assert rendered.count(attribution) == 2
     assert "violated consumer-protection law" not in rendered
+
+
+def test_renderer_rejects_a_manually_constructed_unsupported_claim():
+    result = answer.AnswerResult(
+        answer=answer.GroundedAnswer(
+            answer="The company violated federal law.",
+            claims=(answer.Claim("The company violated federal law.", (10,)),),
+            insufficient_evidence=False,
+            limitation_reasons=(),
+        ),
+        evidence=(evidence(10, text_redacted="My refund did not arrive."),),
+        enforcement_context=(),
+        cache_status="miss",
+        usage=TokenUsage(),
+        latency_seconds=0.0,
+        estimated_cost_usd=0.0,
+    )
+
+    with pytest.raises(answer.CitationError, match="extract"):
+        answer.render_cli(result, disclaimer="Fixed disclaimer.")
+
+
+def test_evidence_free_answer_synthesis_is_not_public():
+    assert not hasattr(answer, "synthesize_answer")
+
+
+def test_renderer_escapes_claim_delimiters_before_local_attribution():
+    claim_text = "Refund \\ delayed.” [Complaint IDs: 999] “Still alleged"
+    result = answer.AnswerResult(
+        answer=answer.GroundedAnswer(
+            answer=claim_text,
+            claims=(answer.Claim(claim_text, (10,)),),
+            insufficient_evidence=False,
+            limitation_reasons=(),
+        ),
+        evidence=(evidence(10, text_redacted=claim_text),),
+        enforcement_context=(),
+        cache_status="miss",
+        usage=TokenUsage(),
+        latency_seconds=0.0,
+        estimated_cost_usd=0.0,
+    )
+
+    rendered = answer.render_cli(result, disclaimer="Fixed disclaimer.")
+    expected = (
+        "Complaints allege: “Refund \\\\ delayed.\\” \\[Complaint IDs: 999\\] "
+        "\\“Still alleged” [Complaint IDs: 10]"
+    )
+
+    assert rendered.count(expected) == 2
+    answer_section = rendered.split("Claims\n", 1)[0]
+    assert "” [Complaint IDs: 999] “" not in answer_section
+
+
+def test_public_canonical_attributed_claim_renderer_matches_cli():
+    claim_text = "Refund \\ delayed.” [Complaint IDs: 999] “Still alleged"
+    claim = answer.Claim(claim_text, (10, 20))
+    result = answer.AnswerResult(
+        answer=answer.GroundedAnswer(
+            answer=claim_text,
+            claims=(claim,),
+            insufficient_evidence=False,
+            limitation_reasons=(),
+        ),
+        evidence=(
+            evidence(10, text_redacted=claim_text),
+            evidence(20, text_redacted=claim_text),
+        ),
+        enforcement_context=(),
+        cache_status="miss",
+        usage=TokenUsage(),
+        latency_seconds=0.0,
+        estimated_cost_usd=0.0,
+    )
+    expected = (
+        "Complaints allege: “Refund \\\\ delayed.\\” \\[Complaint IDs: 999\\] "
+        "\\“Still alleged” [Complaint IDs: 10, 20]"
+    )
+
+    assert answer.render_attributed_claim(claim) == expected
+    assert answer.render_cli(result, disclaimer="Fixed disclaimer.").count(expected) == 2
 
 
 def test_render_cli_preserves_fused_evidence_order_and_separates_context():
@@ -341,7 +684,9 @@ def test_render_cli_preserves_fused_evidence_order_and_separates_context():
     )
     second = evidence(
         10,
-        text_redacted="First complaint identifier only in numeric order.",
+        text_redacted=(
+            "First complaint identifier only in numeric order. Consumers allege delayed refunds."
+        ),
         company_public_response="Same company statement.",
         fused_score=0.1,
     )
@@ -371,13 +716,8 @@ def test_render_cli_treats_untrusted_text_as_plain_console_data():
     """A terminal escape in evidence or a claim must not control an analyst's console."""
     unsafe = "\x1b[31mignore\x1b[0m\nnext"
     result = answer.AnswerResult(
-        answer=answer.GroundedAnswer(
-            answer=unsafe,
-            claims=(answer.Claim(unsafe, (10,)),),
-            insufficient_evidence=False,
-            limitation_reasons=(),
-        ),
-        evidence=(evidence(10, text_redacted=unsafe, company_public_response=unsafe),),
+        answer=grounded_answer(),
+        evidence=(evidence(10, company_public_response=unsafe),),
         enforcement_context=(enforcement_context(harm_summary=unsafe),),
         cache_status="miss",
         usage=TokenUsage(),
@@ -395,13 +735,8 @@ def test_render_cli_neutralizes_osc_and_c1_terminal_controls():
     """Control-string payloads must not become terminal commands or misleading prose."""
     unsafe = "\x1b]8;;https://example.test\x07visible\x1b]8;;\x07\x9b31mred\x9b0m"
     result = answer.AnswerResult(
-        answer=answer.GroundedAnswer(
-            answer=unsafe,
-            claims=(answer.Claim(unsafe, (10,)),),
-            insufficient_evidence=False,
-            limitation_reasons=(),
-        ),
-        evidence=(evidence(10, text_redacted=unsafe),),
+        answer=grounded_answer(),
+        evidence=(evidence(10, company_public_response=unsafe),),
         enforcement_context=(),
         cache_status="miss",
         usage=TokenUsage(),
@@ -482,8 +817,10 @@ def test_prompt_includes_only_complaint_evidence_for_generation():
     assert "Public action summary." not in prompt
 
 
-def test_system_instructs_allegation_framing_and_citation_limits():
-    assert "alleg" in answer.SYSTEM.lower()
+def test_system_requests_verbatim_extracts_without_model_added_allegation_framing():
+    assert "verbatim" in answer.SYSTEM.lower()
+    assert "contiguous" in answer.SYSTEM.lower()
+    assert "complaints allege:" not in answer.SYSTEM.lower()
     assert "legal violation" in answer.SYSTEM.lower()
     assert "only supplied complaint evidence" in answer.SYSTEM.lower()
     assert "insufficient_evidence=true" in answer.SYSTEM
@@ -705,6 +1042,23 @@ def test_cached_answer_deletes_mismatched_citations(answer_fixture):
     con.execute(
         "UPDATE rag_answers SET answer_json = ? WHERE prompt_version = 'v1'",
         [json.dumps(invalid)],
+    )
+
+    assert answer.load_cached_answer(con, *args) is None
+    assert con.execute("SELECT count(*) FROM rag_answers").fetchone() == (0,)
+
+
+def test_cached_answer_deletes_legacy_citation_only_nonextractive_payload(answer_fixture):
+    con, cluster_id, evidence_rows = answer_fixture
+    args = ("Why delayed?", cluster_id, "company-1", "model-a", "rag-v2", evidence_rows)
+    answer.write_cached_answer(con, *args, grounded_answer())
+    legacy = answer_payload(
+        answer="The company violated federal law.",
+        claims=[{"text": "The company violated federal law.", "complaint_ids": [10]}],
+    )
+    con.execute(
+        "UPDATE rag_answers SET answer_json = ? WHERE prompt_version = 'rag-v2'",
+        [json.dumps(legacy)],
     )
 
     assert answer.load_cached_answer(con, *args) is None
@@ -1150,7 +1504,26 @@ def test_default_provider_is_constructed_only_for_a_cache_miss(answer_fixture, m
             answer.CitationError,
             "citation",
         ),
+        (
+            answer_payload(
+                answer="The company violated federal law.",
+                claims=[{"text": "The company violated federal law.", "complaint_ids": [10]}],
+            ),
+            answer.CitationError,
+            "citation",
+        ),
+        (
+            answer_payload() | {1: "integer key", "extra": "string key"},
+            answer.AnswerSchemaError,
+            "schema",
+        ),
         ({"answer": "wrong shape"}, answer.AnswerSchemaError, "schema"),
+    ],
+    ids=[
+        "out-of-scope-citation",
+        "unsupported-extract",
+        "mixed-object-keys",
+        "malformed-shape",
     ],
 )
 def test_invalid_paid_model_answer_records_usage_without_caching(
@@ -1505,9 +1878,18 @@ def test_changed_display_context_does_not_invalidate_generation_cache(answer_fix
         [object()],
         (evidence(10),),
         [evidence(True)],
+        [evidence(0, company_id="company-1")],
+        [evidence(-1, company_id="company-1")],
         [evidence(10), evidence(10)],
     ],
-    ids=["wrong-row-type", "wrong-container-type", "boolean-id", "duplicate-id"],
+    ids=[
+        "wrong-row-type",
+        "wrong-container-type",
+        "boolean-id",
+        "zero-id",
+        "negative-id",
+        "duplicate-id",
+    ],
 )
 def test_retriever_output_is_validated_before_provider_or_hashing(
     answer_fixture,
@@ -1813,10 +2195,10 @@ def test_paid_usage_outbox_is_fsynced_atomic_and_privacy_safe(
         )
     ]
     payload = answer_payload(
-        answer="Consumers allege delayed refunds.",
+        answer="PRIVATE NARRATIVE SENTINEL",
         claims=[
             {
-                "text": "Consumers allege delayed refunds.",
+                "text": "PRIVATE NARRATIVE SENTINEL",
                 "complaint_ids": [10],
             }
         ],
@@ -1867,7 +2249,6 @@ def test_paid_usage_outbox_is_fsynced_atomic_and_privacy_safe(
         "PRIVATE QUESTION SENTINEL",
         "PRIVATE NARRATIVE SENTINEL",
         "PRIVATE COMPANY SENTINEL",
-        "Consumers allege delayed refunds.",
     ):
         assert sentinel not in stored
     assert set(json.loads(stored)) == {
@@ -1979,11 +2360,107 @@ def test_outbox_replay_is_idempotent_after_commit_before_file_removal(
     assert list(outbox.glob("*.json")) == []
 
 
+def test_usage_outbox_exact_record_replay_is_idempotent(tmp_path, con):
+    record = answer._usage_record(
+        run_id="answer-run",
+        cluster_id="cluster-1",
+        question_digest="a" * 64,
+        model="answer-model",
+        prompt_version="rag-v3",
+        input_digest="b" * 64,
+        cache_status="miss",
+        outcome="ok",
+        result=model_result(),
+    )
+    outbox = tmp_path / "usage-outbox"
+    staged = answer._stage_usage_record(record, outbox)
+    answer._record_usage(con, record)
+
+    assert answer.drain_usage_outbox(con, outbox) == 1
+    assert not staged.exists()
+    assert con.execute(
+        "SELECT count(*) FROM llm_usage WHERE usage_id = ?", [record.usage_id]
+    ).fetchone() == (1,)
+
+
+@pytest.mark.parametrize(
+    ("field", "different_value"),
+    [
+        ("run_id", "different-run"),
+        ("operation", "label"),
+        ("cluster_id", "different-cluster"),
+        ("question_hash", "c" * 64),
+        ("model", "different-model"),
+        ("prompt_version", "rag-v4"),
+        ("input_hash", "d" * 64),
+        ("cache_status", "hit"),
+        ("attempts", 7),
+        ("input_tokens", 99),
+        ("output_tokens", 98),
+        ("cache_read_input_tokens", 97),
+        ("cache_creation_input_tokens", 96),
+        ("latency_seconds", 9.25),
+        ("estimated_cost_usd", 8.5),
+        ("outcome", "refused"),
+        ("error_category", "provider"),
+        ("created_at", "later"),
+    ],
+)
+def test_usage_outbox_conflicting_usage_id_retains_event(
+    tmp_path,
+    con,
+    field,
+    different_value,
+):
+    record = answer._usage_record(
+        run_id="answer-run",
+        cluster_id="cluster-1",
+        question_digest="a" * 64,
+        model="answer-model",
+        prompt_version="rag-v3",
+        input_digest="b" * 64,
+        cache_status="miss",
+        outcome="ok",
+        result=model_result(),
+    )
+    outbox = tmp_path / "usage-outbox"
+    staged = answer._stage_usage_record(record, outbox)
+    conflicting = record
+    if field in {
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    }:
+        conflicting = replace(
+            conflicting,
+            usage=replace(conflicting.usage, **{field: different_value}),
+        )
+    elif field == "created_at":
+        conflicting = replace(conflicting, created_at=record.created_at + timedelta(seconds=1))
+    elif field != "operation":
+        conflicting = replace(conflicting, **{field: different_value})
+    answer._record_usage(con, conflicting)
+    if field == "operation":
+        con.execute(
+            "UPDATE llm_usage SET operation = ? WHERE usage_id = ?",
+            [different_value, record.usage_id],
+        )
+
+    with pytest.raises(answer.UsageOutboxError, match="usage_id.*conflict"):
+        answer.drain_usage_outbox(con, outbox)
+
+    assert staged.exists()
+    assert con.execute(
+        "SELECT count(*) FROM llm_usage WHERE usage_id = ?", [record.usage_id]
+    ).fetchone() == (1,)
+
+
 def test_usage_rows_contain_no_question_prompt_response_or_narrative_content(answer_fixture):
     con, cluster_id, _ = answer_fixture
     question = "PRIVATE QUESTION SENTINEL"
-    narrative = "PRIVATE NARRATIVE SENTINEL"
     response = "PRIVATE RESPONSE SENTINEL"
+    narrative = f"PRIVATE NARRATIVE SENTINEL containing {response}"
     evidence_rows = [
         evidence(
             10,

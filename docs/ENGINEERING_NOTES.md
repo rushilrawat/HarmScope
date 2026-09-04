@@ -1173,12 +1173,7 @@ _Open gates, in dependency order:_
 3. **`company_response` evidence decision.** The authoring worklist contains ten
    complaint excerpts, not independently sourced public responses. Five honest
    questions in this category cannot be authored from that view alone.
-4. **Embedding artifact regeneration/migration.** The real data has
-   `embeddings.all-MiniLM-L6-v2.npy` and its old tail-named sidecar. The reviewed
-   loader requires `embeddings.<sha256(full model name)>.npy` plus exact model,
-   row-count, dimension, completion, and array-shape checks. No ambiguous
-   fallback exists.
-5. **Live provider/funding check.** On 2026-08-07, authentication and model
+4. **Live provider/funding check.** On 2026-08-07, authentication and model
    preflight succeeded; the subsequent messages request returned terminal
    `400 invalid_request_error` because the organization's credit balance was
    too low. The earlier CLI token-expiry interpretation was wrong because
@@ -1186,7 +1181,7 @@ _Open gates, in dependency order:_
    so it did not recheck the current balance. The earlier full 4,818-cluster
    estimate was roughly $205, but pricing and population must be re-estimated
    before purchase. No Task 8D call incurred provider cost.
-6. **Human label and claim review.** At least 50 version-bound labels and at
+5. **Human label and claim review.** At least 50 version-bound labels and at
    least 50 run-bound claims must be reviewed by a person. Automated/LLM judges
    cannot complete either denominator.
 
@@ -1368,3 +1363,53 @@ and require a validated migration or regeneration. The last live messages
 request returned insufficient credit, but Phase 8D did not recheck the current
 balance; live labeling and answering plus both the 50-label and 50-claim
 blinded human reviews remain pending.
+
+### 2026-08-15 — Embedding migration Fix Round 5 protocol review complete
+
+The `migrate-embeddings` maintenance CLI is implemented with an explicit
+full-model `--model`; plan mode is the default and `--execute` is required for
+publication. It requires an existing DuckDB file, opens it read-only, creates no
+schema or run record, and always closes its connection. It validates sidecar,
+NumPy, FAISS, and mapping contracts before Darwin `fclonefileat` publishes CoW
+targets from retained source descriptors. Targets are independently validated
+before legacy basenames can be atomically moved, without overwrite, to
+deterministic dot-prefixed retirement names. Automated execution never unlinks
+those retained originals; exact digest and semantic equivalence drives crash
+replay, while conflicts remain named and fail closed. Non-Darwin mutation has
+no path-copy fallback. The current retrieval loader remains strictly
+SHA-addressed: a legacy or retirement filename is never a runtime fallback.
+Target-only state and same-inode dual aliases left by a superseded hard-link
+protocol fail closed because they lack an independent retained comparison.
+
+The Fix Round 5 implementation is locally verified, and an independent Task 2
+audit found no remaining Critical or Important protocol issue. No shared-data
+plan, `--execute`, provider call, or real-data access occurred during this task.
+The embedding gate stays open until a separate pre-execution review authorizes
+an execution record covering source/target/retirement names, distinct target
+and retained-source inode/size evidence, exact bytes, validation
+counts/dimension, strict-loader success, and unchanged database evidence.
+Retirement deletion is a later manual operation requiring a quiescent artifact
+directory.
+
+### 2026-09-03 — MiniLM artifact migration completed and verified
+
+After the four final Important findings were fixed with witnessed RED/GREEN
+regressions, 175 migration/embed/retrieval/CLI tests and the full 912-test
+repository gate passed. A fresh independent source review found no Critical or
+Important issue and approved a real read-only plan plus explicitly authorized
+execution. The plan reported `planned` for 2,477,937 rows × 384 dimensions and
+changed no filesystem or database evidence.
+
+The approved execute returned `migrated`; immediate replay returned
+`already-migrated`. The original memmap, FAISS, and sidecar inodes
+(`133525751`, `133569509`, `133526780`) are retained under deterministic
+dot-prefixed retirement names. SHA targets use distinct inodes, the same device
+and sizes, and exact matching per-role SHA-256 digests. All six names have link
+count one; all three legacy basenames are absent. DuckDB retained inode
+`133057031`, size `16013864960`, and mtime `1786116682`; MiniLM mapping
+aggregates remained `(3830002 rows, 2477937 distinct row_idx, 0 min, 2477936
+max, 384 min/max dim)`. The strict loader returned `(2477937, 384) float32`.
+Forced-offline dense/BM25/RRF retrieval over cluster
+`1786080772276-4d6745a1:bank_account:16` and company `jpmorgan-chase` returned
+five complaint IDs. No provider call or narrative output occurred. Retirement
+deletion remains a separate quiescent manual decision.

@@ -18,7 +18,7 @@ def test_llm_operational_parameters_are_fingerprinted():
     assert payload["rag_candidate_k"] == 50
     assert payload["bm25_tokenizer_version"] == "word-v1"
     assert payload["prompt_version"] == "v1"
-    assert payload["answer_prompt_version"] == "rag-v2"
+    assert payload["answer_prompt_version"] == "rag-v3"
 
 
 def test_llm_candidate_pool_cannot_be_smaller_than_returned_evidence():
