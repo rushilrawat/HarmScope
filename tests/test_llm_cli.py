@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src import pipeline
+from src import pipeline, private_artifacts
 from src.llm import answer, verify
 from src.llm import eval as llm_eval
 from src.llm import run as llm_run
@@ -44,8 +44,8 @@ def _ask_result(*, insufficient_evidence: bool = False) -> answer.AnswerResult:
         )
         if insufficient_evidence
         else answer.GroundedAnswer(
-            answer="Consumers allege delayed refunds.",
-            claims=(answer.Claim("Consumers allege delayed refunds.", (10,)),),
+            answer="Consumers reported a delayed refund.",
+            claims=(answer.Claim("Consumers reported a delayed refund.", (10,)),),
             insufficient_evidence=False,
             limitation_reasons=("retrieved_complaints_do_not_establish_frequency",),
         )
@@ -232,6 +232,7 @@ def test_label_summary_reports_all_operational_totals(monkeypatch, capsys):
 
     monkeypatch.setattr(pipeline.db, "bootstrap", lambda: object())
     monkeypatch.setattr(pipeline.db, "run", fake_run)
+    monkeypatch.setattr(llm_run, "embedding_model_for_cluster_run", lambda *_args: "embed-m")
     monkeypatch.setattr(
         llm_run,
         "run",
@@ -274,7 +275,7 @@ def test_label_summary_reports_all_operational_totals(monkeypatch, capsys):
         assert term in out
 
 
-def test_label_verify_rejects_duplicate_cluster_ids(tmp_path):
+def test_label_verify_rejects_duplicate_cluster_ids(tmp_path, monkeypatch):
     """One cluster cannot count twice toward the human-review denominator."""
     row = dict.fromkeys(verify.HEADER, "")
     row.update(
@@ -288,6 +289,7 @@ def test_label_verify_rejects_duplicate_cluster_ids(tmp_path):
         }
     )
     path = tmp_path / "duplicate.csv"
+    monkeypatch.setattr(verify, "PATHS", SimpleNamespace(interim=tmp_path))
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=verify.HEADER)
         writer.writeheader()
@@ -295,6 +297,55 @@ def test_label_verify_rejects_duplicate_cluster_ids(tmp_path):
 
     with pytest.raises(ValueError, match="duplicate cluster_id"):
         verify.parse_worklist(path, "reviewer-1")
+
+
+def test_label_verify_record_preflights_private_artifact_before_database(
+    monkeypatch,
+    tmp_path,
+):
+    interim = tmp_path / "interim"
+    interim.mkdir()
+    source = interim / "review.csv"
+    source.write_text("not,a,worklist\n", encoding="utf-8")
+    paths = SimpleNamespace(interim=interim)
+    monkeypatch.setattr(pipeline, "PATHS", paths)
+    monkeypatch.setattr(verify, "PATHS", paths)
+    opened = []
+    monkeypatch.setattr(pipeline.db, "bootstrap", lambda: opened.append(True))
+
+    with pytest.raises(ValueError, match="sidecar|worklist"):
+        pipeline.cmd_label_verify(
+            SimpleNamespace(
+                verify_action="record",
+                input=str(source),
+                reviewer="reviewer-1",
+            )
+        )
+
+    assert opened == []
+
+
+def test_label_verify_export_rejects_outside_path_before_database(
+    monkeypatch,
+    tmp_path,
+):
+    interim = tmp_path / "interim"
+    interim.mkdir()
+    monkeypatch.setattr(pipeline, "PATHS", SimpleNamespace(interim=interim))
+    opened = []
+    monkeypatch.setattr(pipeline.db, "bootstrap", lambda: opened.append(True))
+
+    with pytest.raises(ValueError, match="data/interim"):
+        pipeline.cmd_label_verify(
+            SimpleNamespace(
+                verify_action="export",
+                output=str(tmp_path / "outside.csv"),
+                signals_run="signals-run",
+                n=50,
+            )
+        )
+
+    assert opened == []
 
 
 class _ConnectionSpy:
@@ -309,6 +360,23 @@ class _ConnectionSpy:
 
     def close(self):
         self.closed = True
+
+
+def test_label_verify_report_closes_database(monkeypatch):
+    connection = SimpleNamespace(closed=False)
+    connection.close = lambda: setattr(connection, "closed", True)
+    monkeypatch.setattr(pipeline.db, "bootstrap", lambda: connection)
+    monkeypatch.setattr(
+        verify,
+        "report",
+        lambda *_args: SimpleNamespace(render=lambda: "human label report"),
+    )
+
+    assert (
+        pipeline.cmd_label_verify(SimpleNamespace(verify_action="report", worklist_version=None))
+        == 0
+    )
+    assert connection.closed is True
 
 
 def _rag_args(**overrides):
@@ -408,6 +476,61 @@ def test_rag_eval_loads_manifest_before_opening_writable_database(monkeypatch, t
     assert opened == []
 
 
+def test_rag_manifest_questions_and_hash_come_from_one_byte_buffer(monkeypatch, tmp_path):
+    """A→B→A replacement cannot pair B questions with A's recorded hash."""
+    manifest = tmp_path / "ground_truth" / "rag_eval_questions.csv"
+    manifest.parent.mkdir()
+    manifest.write_bytes(b"A")
+    monkeypatch.setattr(
+        pipeline,
+        "PATHS",
+        SimpleNamespace(ground_truth=manifest.parent, interim=tmp_path / "interim"),
+    )
+    parsed_buffers = []
+
+    def parse_bytes(data):
+        parsed_buffers.append(data)
+        return [data]
+
+    monkeypatch.setattr(llm_eval, "load_manifest_bytes", parse_bytes, raising=False)
+
+    _path, questions, digest = pipeline._load_rag_manifest(llm_eval)
+
+    assert parsed_buffers == [b"A"]
+    assert questions == [b"A"]
+    assert digest == hashlib.sha256(b"A").hexdigest()
+
+
+def test_stable_manifest_read_rejects_a_to_b_to_a_path_identity_swap(
+    monkeypatch,
+    tmp_path,
+):
+    """Restoring the original inode cannot hide an intervening path replacement."""
+    manifest = tmp_path / "manifest.csv"
+    replacement = tmp_path / "replacement.csv"
+    held = tmp_path / "held.csv"
+    manifest.write_bytes(b"A")
+    replacement.write_bytes(b"B")
+    original_read = private_artifacts.os.read
+    swapped = False
+
+    def read_then_swap(file_descriptor, size):
+        nonlocal swapped
+        data = original_read(file_descriptor, size)
+        if data and not swapped:
+            swapped = True
+            manifest.rename(held)
+            replacement.rename(manifest)
+            manifest.rename(replacement)
+            held.rename(manifest)
+        return data
+
+    monkeypatch.setattr(private_artifacts.os, "read", read_then_swap)
+
+    with pytest.raises(private_artifacts.PrivatePathError, match="changed"):
+        private_artifacts.read_stable_bytes(manifest)
+
+
 def test_rag_eval_registers_exact_manifest_identity_and_finishes_ninety_rows(
     monkeypatch, con, tmp_path, capsys
 ):
@@ -428,8 +551,8 @@ def test_rag_eval_registers_exact_manifest_identity_and_finishes_ninety_rows(
     monkeypatch.setattr(pipeline.db, "bootstrap", lambda: events.append("bootstrap") or spy)
     monkeypatch.setattr(
         llm_eval,
-        "load_manifest",
-        lambda path: events.append(("load", path)) or questions,
+        "load_manifest_bytes",
+        lambda data: events.append(("load", data)) or questions,
     )
     monkeypatch.setattr(
         llm_eval,
@@ -478,7 +601,7 @@ def test_rag_eval_registers_exact_manifest_identity_and_finishes_ninety_rows(
         "retrieval_only": False,
     }
     assert events[:4] == [
-        ("load", manifest),
+        ("load", manifest.read_bytes()),
         "bootstrap",
         ("validate", spy, questions),
         ("model", spy, questions),
@@ -510,7 +633,7 @@ def test_rag_eval_retrieval_only_never_reaches_answer_provider(monkeypatch, con,
     questions = [object()] * 30
     spy = _ConnectionSpy(con)
     monkeypatch.setattr(pipeline.db, "bootstrap", lambda: spy)
-    monkeypatch.setattr(llm_eval, "load_manifest", lambda _path: questions)
+    monkeypatch.setattr(llm_eval, "load_manifest_bytes", lambda _data: questions)
     monkeypatch.setattr(llm_eval, "validate_manifest", lambda *_args: None)
     monkeypatch.setattr(llm_eval, "manifest_embed_model", lambda *_args: "embed-m")
     retrieval = SimpleNamespace(render=lambda: "retrieval metrics")
@@ -556,7 +679,7 @@ def test_rag_eval_failure_stays_failed_without_output_declaration(monkeypatch, c
     questions = [object()] * 30
     spy = _ConnectionSpy(con)
     monkeypatch.setattr(pipeline.db, "bootstrap", lambda: spy)
-    monkeypatch.setattr(llm_eval, "load_manifest", lambda _path: questions)
+    monkeypatch.setattr(llm_eval, "load_manifest_bytes", lambda _data: questions)
     monkeypatch.setattr(llm_eval, "validate_manifest", lambda *_args: None)
     monkeypatch.setattr(llm_eval, "manifest_embed_model", lambda *_args: "embed-m")
 
@@ -592,7 +715,7 @@ def test_rag_eval_render_failure_cannot_leave_a_successful_run(monkeypatch, con,
     questions = [object()] * 30
     spy = _ConnectionSpy(con)
     monkeypatch.setattr(pipeline.db, "bootstrap", lambda: spy)
-    monkeypatch.setattr(llm_eval, "load_manifest", lambda _path: questions)
+    monkeypatch.setattr(llm_eval, "load_manifest_bytes", lambda _data: questions)
     monkeypatch.setattr(llm_eval, "validate_manifest", lambda *_args: None)
     monkeypatch.setattr(llm_eval, "manifest_embed_model", lambda *_args: "embed-m")
     monkeypatch.setattr(llm_eval, "run_retrieval_eval", lambda *_args: object())
@@ -633,6 +756,11 @@ def test_rag_eval_author_import_and_claim_actions_wire_exact_contracts(
         "PATHS",
         SimpleNamespace(ground_truth=ground_truth, interim=interim),
     )
+    monkeypatch.setattr(
+        llm_eval,
+        "PATHS",
+        SimpleNamespace(ground_truth=ground_truth, interim=interim),
+    )
     connections = []
 
     def open_connection():
@@ -657,6 +785,7 @@ def test_rag_eval_author_import_and_claim_actions_wire_exact_contracts(
         or destination,
     )
     monkeypatch.setattr(llm_eval, "load_manifest", lambda path: [object()] * 30)
+    monkeypatch.setattr(llm_eval, "load_manifest_bytes", lambda data: [object()] * 30)
     monkeypatch.setattr(
         llm_eval,
         "export_claim_review",
@@ -736,6 +865,11 @@ def test_rag_eval_claim_record_parses_before_opening_database(monkeypatch, tmp_p
         "PATHS",
         SimpleNamespace(ground_truth=tmp_path / "ground_truth", interim=interim),
     )
+    monkeypatch.setattr(
+        llm_eval,
+        "PATHS",
+        SimpleNamespace(ground_truth=tmp_path / "ground_truth", interim=interim),
+    )
     monkeypatch.setattr(llm_eval, "PATHS", SimpleNamespace(interim=interim))
     opened = []
     monkeypatch.setattr(pipeline.db, "bootstrap", lambda: opened.append(True))
@@ -764,6 +898,11 @@ def test_rag_eval_import_fully_parses_malformed_worklist_before_database(monkeyp
         "PATHS",
         SimpleNamespace(ground_truth=tmp_path / "ground_truth", interim=interim),
     )
+    monkeypatch.setattr(
+        llm_eval,
+        "PATHS",
+        SimpleNamespace(ground_truth=tmp_path / "ground_truth", interim=interim),
+    )
     opened = []
     monkeypatch.setattr(pipeline.db, "bootstrap", lambda: opened.append(True))
 
@@ -783,6 +922,11 @@ def test_rag_eval_import_rejects_source_changed_during_database_bootstrap(monkey
     _write_completed_authoring(source)
     monkeypatch.setattr(
         pipeline,
+        "PATHS",
+        SimpleNamespace(ground_truth=ground_truth, interim=interim),
+    )
+    monkeypatch.setattr(
+        llm_eval,
         "PATHS",
         SimpleNamespace(ground_truth=ground_truth, interim=interim),
     )

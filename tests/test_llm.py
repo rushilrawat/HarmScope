@@ -160,19 +160,19 @@ def test_selection_handles_a_cluster_smaller_than_k():
 
 # --- cache key --------------------------------------------------------------
 def test_cache_key_ignores_selection_order_but_not_prompt_version():
-    a = label_mod.input_hash("v1", "m", [3, 1, 2])
-    b = label_mod.input_hash("v1", "m", [1, 2, 3])
+    a = label_mod.input_hash("v1", "m", [3, 1, 2], "embed-m")
+    b = label_mod.input_hash("v1", "m", [1, 2, 3], "embed-m")
     assert a == b, "the same 20 narratives must hash the same in any order"
 
-    assert label_mod.input_hash("v2", "m", [1, 2, 3]) != a, (
+    assert label_mod.input_hash("v2", "m", [1, 2, 3], "embed-m") != a, (
         "a prompt edit must invalidate cached labels — that is why §4 requires "
         "bumping prompt_version"
     )
-    assert label_mod.input_hash("v1", "other", [1, 2, 3]) != a
+    assert label_mod.input_hash("v1", "other", [1, 2, 3], "embed-m") != a
 
 
 def test_cache_write_is_atomic_and_validated(tmp_path):
-    key = label_mod.input_hash("v1", "m", [1])
+    key = label_mod.input_hash("v1", "m", [1], "embed-m")
     assert label_mod.cached(tmp_path, key) is None
     label_mod.write_cache(tmp_path, key, complete_label())
     assert label_mod.cached(tmp_path, key) == complete_label()

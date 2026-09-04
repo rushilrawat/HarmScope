@@ -12,20 +12,25 @@ import hashlib
 import io
 import json
 import math
-import os
 import re
-import tempfile
 from collections import Counter
-from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from numbers import Real
 from pathlib import Path
 from statistics import median
 
+from src.alert_scope import canonical_alert_scopes
 from src.config import CONFIG, PATHS
 from src.llm import answer, retrieve, verify
 from src.population import EXPANDED_SELECT_SQL
+from src.private_artifacts import (
+    PrivatePathError,
+    atomic_write_bytes,
+    canonical_private_path,
+    read_private_bytes,
+    read_stable_bytes,
+)
 
 CATEGORY_ORDER = (
     "mechanism",
@@ -64,7 +69,7 @@ _SHINGLE_SIZE = 8
 _EXCERPTS_PER_ROW = 10
 _QUESTIONS_PER_CATEGORY = 5
 _RETRIEVAL_METHODS = ("dense", "bm25", "fused")
-_CLAIM_REVIEW_VERSION = 1
+_CLAIM_REVIEW_VERSION = 2
 _CLAIM_FAILURE_CATEGORIES = frozenset(
     {"unsupported", "contradicted", "overgeneralized", "citation_mismatch", "other"}
 )
@@ -311,24 +316,25 @@ def _grounded_claims(value: object) -> tuple[answer.Claim, ...]:
     return value.claims
 
 
-def citation_validity(value: answer.GroundedAnswer, retrieved_ids: set[int]) -> bool:
-    """Return whether every claim has unique, positive, in-scope citations."""
-    claims = _grounded_claims(value)
+def citation_validity(
+    value: answer.GroundedAnswer,
+    retrieved_ids: set[int],
+    *,
+    evidence_text_by_id: object,
+) -> bool:
+    """Return whether the complete answer is valid against exact retrieved text."""
+    _grounded_claims(value)
     if type(retrieved_ids) is not set:
         raise TypeError("retrieved_ids must be a set")
     _positive_complaint_ids(retrieved_ids, "retrieved_ids")
-    for claim in claims:
-        complaint_ids = claim.complaint_ids
-        if (
-            type(complaint_ids) is not tuple
-            or not complaint_ids
-            or any(
-                type(complaint_id) is not int or complaint_id <= 0 for complaint_id in complaint_ids
-            )
-            or len(complaint_ids) != len(set(complaint_ids))
-            or any(complaint_id not in retrieved_ids for complaint_id in complaint_ids)
-        ):
-            return False
+    try:
+        answer.validate_answer(
+            answer._answer_payload(value),
+            retrieved_ids,
+            evidence_text_by_id=evidence_text_by_id,
+        )
+    except (answer.AnswerSchemaError, answer.CitationError):
+        return False
     return True
 
 
@@ -861,8 +867,8 @@ def _retrievable_answer_scopes(
     con,
     questions: list[EvalQuestion],
     embed_model: str,
-) -> dict[tuple[str, str], tuple[str, frozenset[int]]]:
-    scopes: dict[tuple[str, str], tuple[str, frozenset[int]]] = {}
+) -> dict[tuple[str, str], tuple[str, dict[int, str]]]:
+    scopes: dict[tuple[str, str], tuple[str, dict[int, str]]] = {}
     keys = sorted({(question.cluster_id, question.company_id) for question in questions})
     for cluster_id, company_id in keys:
         corpus = retrieve.load_corpus(con, cluster_id, company_id, embed_model)
@@ -871,12 +877,15 @@ def _retrievable_answer_scopes(
         product_families = {row.product_family for row in corpus.rows}
         if len(product_families) != 1:
             raise ValueError("retrievable answer corpus has inconsistent product families")
-        complaint_ids = frozenset(row.complaint_id for row in corpus.rows)
-        if len(complaint_ids) != len(corpus.rows) or any(
-            type(complaint_id) is not int or complaint_id <= 0 for complaint_id in complaint_ids
+        evidence_text_by_id = {row.complaint_id: row.text_redacted for row in corpus.rows}
+        if len(evidence_text_by_id) != len(corpus.rows) or any(
+            type(complaint_id) is not int or complaint_id <= 0
+            for complaint_id in evidence_text_by_id
         ):
             raise ValueError("retrievable answer corpus has invalid complaint IDs")
-        scopes[(cluster_id, company_id)] = (product_families.pop(), complaint_ids)
+        if any(type(text) is not str for text in evidence_text_by_id.values()):
+            raise ValueError("retrievable answer corpus has invalid evidence text")
+        scopes[(cluster_id, company_id)] = (product_families.pop(), evidence_text_by_id)
     return scopes
 
 
@@ -968,10 +977,10 @@ def _validated_scored_answer_inputs(
     eval_run_id: str,
     indexed: dict[str, retrieve.RetrievalResult],
 ) -> tuple[
-    dict[tuple[str, str], tuple[str, frozenset[int]]],
+    dict[tuple[str, str], tuple[str, dict[int, str]]],
     dict[str, tuple[retrieve.RetrievedEvidence, ...]],
 ]:
-    scopes: dict[tuple[str, str], tuple[str, frozenset[int]]] = {}
+    scopes: dict[tuple[str, str], tuple[str, dict[int, str]]] = {}
     evidence_by_question: dict[str, tuple[retrieve.RetrievedEvidence, ...]] = {}
     for question in questions:
         result = indexed[question.question_id]
@@ -1004,12 +1013,17 @@ def _validated_scored_answer_inputs(
         product_families = {row.product_family for row in live_corpus.rows}
         if len(product_families) != 1:
             raise ValueError("retrievable answer corpus has inconsistent product families")
-        complaint_ids = frozenset(row.complaint_id for row in live_corpus.rows)
-        if len(complaint_ids) != len(live_corpus.rows):
+        evidence_text_by_id = {row.complaint_id: row.text_redacted for row in live_corpus.rows}
+        if len(evidence_text_by_id) != len(live_corpus.rows) or any(
+            type(complaint_id) is not int or complaint_id <= 0
+            for complaint_id in evidence_text_by_id
+        ):
             raise ValueError("retrievable answer corpus has invalid complaint IDs")
+        if any(type(text) is not str for text in evidence_text_by_id.values()):
+            raise ValueError("retrievable answer corpus has invalid evidence text")
         scopes[(question.cluster_id, question.company_id)] = (
             product_families.pop(),
-            complaint_ids,
+            evidence_text_by_id,
         )
         evidence_by_question[question.question_id] = exact_evidence
     return scopes, evidence_by_question
@@ -1034,13 +1048,13 @@ def _bound_evidence_retriever(
     return bound
 
 
-def _returned_evidence_ids(
+def _validated_returned_evidence(
     result: object,
     question: EvalQuestion,
     product_family: str,
-    retrievable_ids: frozenset[int],
+    live_evidence_text_by_id: dict[int, str],
     expected_evidence: tuple[retrieve.RetrievedEvidence, ...] | None = None,
-) -> set[int]:
+) -> list[retrieve.RetrievedEvidence]:
     if type(result) is not answer.AnswerResult:
         raise TypeError("answerer must return an AnswerResult")
     evidence = result.evidence
@@ -1062,9 +1076,17 @@ def _returned_evidence_ids(
     complaint_ids = [row.complaint_id for row in validated]
     if any(type(complaint_id) is not int or complaint_id <= 0 for complaint_id in complaint_ids):
         raise ValueError("answer evidence complaint IDs must be positive integers")
-    if not set(complaint_ids).issubset(retrievable_ids):
+    if not set(complaint_ids).issubset(live_evidence_text_by_id):
         raise ValueError("answer evidence IDs are outside the exact retrievable scope")
-    return set(complaint_ids)
+    if any(type(row.text_redacted) is not str for row in validated):
+        raise ValueError("answer evidence text must be exact strings")
+    if any(
+        row.text_redacted.encode("utf-8")
+        != live_evidence_text_by_id[row.complaint_id].encode("utf-8")
+        for row in validated
+    ):
+        raise ValueError("answer evidence text does not match exact live retrievable evidence")
+    return validated
 
 
 def _write_answer_metrics(
@@ -1247,23 +1269,40 @@ def run_answer_eval(
             failures.append(AnswerEvaluationFailure(question.question_id, "refusal"))
             continue
 
-        product_family, retrievable_ids = retrievable_scopes[
+        product_family, live_evidence_text_by_id = retrievable_scopes[
             (question.cluster_id, question.company_id)
         ]
-        retrieved_ids = _returned_evidence_ids(
+        returned_evidence = _validated_returned_evidence(
             result,
             question,
             product_family,
-            retrievable_ids,
+            live_evidence_text_by_id,
             evidence_by_question.get(question.question_id),
         )
+        try:
+            canonical_answer = answer._validate_grounded_answer(
+                result.answer,
+                returned_evidence,
+            )
+        except answer.CitationError:
+            failures.append(AnswerEvaluationFailure(question.question_id, "citation"))
+            continue
+        except answer.AnswerSchemaError:
+            failures.append(AnswerEvaluationFailure(question.question_id, "schema"))
+            continue
+        returned_text_by_id = {row.complaint_id: row.text_redacted for row in returned_evidence}
+        retrieved_ids = set(returned_text_by_id)
         metrics = AnswerQuestionEvaluation(
             question_id=question.question_id,
-            citation_valid=citation_validity(result.answer, retrieved_ids),
-            citation_coverage=citation_coverage(result.answer),
+            citation_valid=citation_validity(
+                canonical_answer,
+                retrieved_ids,
+                evidence_text_by_id=returned_text_by_id,
+            ),
+            citation_coverage=citation_coverage(canonical_answer),
             abstention_correct=abstention_correct(
                 question.answerable,
-                result.answer.insufficient_evidence,
+                canonical_answer.insufficient_evidence,
             ),
         )
         _write_answer_metrics(con, eval_run_id, metrics)
@@ -1349,12 +1388,12 @@ def _cached_evidence_ids(
     return tuple(parsed)
 
 
-def _claim_evidence(
+def _retrievable_evidence_text_by_id(
     con,
     question: EvalQuestion,
     complaint_ids: tuple[int, ...],
     corpus_cache: dict[tuple[str, str, str], dict[int, str]],
-) -> tuple[tuple[ClaimEvidence, ...], tuple[tuple[int, str, str], ...]]:
+) -> dict[int, str]:
     if question.company_id is None:
         raise ValueError(f"question {question.question_id!r} has no concrete evidence scope")
     embed_model = _embed_model_for_cluster(con, question.question_id, question.cluster_id)
@@ -1387,20 +1426,39 @@ def _claim_evidence(
             )
         corpus_cache[scope_key] = evidence_by_id
 
+    requested: dict[int, str] = {}
+    for complaint_id in complaint_ids:
+        text_redacted = evidence_by_id.get(complaint_id)
+        if type(text_redacted) is not str or not text_redacted.strip():
+            raise ValueError(
+                f"question {question.question_id!r} has unavailable cited evidence "
+                f"for complaint_id {complaint_id}"
+            )
+        requested[complaint_id] = text_redacted
+    return requested
+
+
+def _claim_evidence(
+    con,
+    question: EvalQuestion,
+    complaint_ids: tuple[int, ...],
+    corpus_cache: dict[tuple[str, str, str], dict[int, str]],
+) -> tuple[tuple[ClaimEvidence, ...], tuple[tuple[int, str, str], ...]]:
+    evidence_by_id = _retrievable_evidence_text_by_id(
+        con,
+        question,
+        complaint_ids,
+        corpus_cache,
+    )
     visible: list[ClaimEvidence] = []
     identity: list[tuple[int, str, str]] = []
     for complaint_id in complaint_ids:
-        text_redacted = evidence_by_id.get(complaint_id)
+        text_redacted = evidence_by_id[complaint_id]
         text_hash_row = con.execute(
             "SELECT text_hash FROM narratives WHERE complaint_id = ?",
             [complaint_id],
         ).fetchone()
-        if (
-            type(text_redacted) is not str
-            or not text_redacted.strip()
-            or text_hash_row is None
-            or type(text_hash_row[0]) is not str
-        ):
+        if text_hash_row is None or type(text_hash_row[0]) is not str:
             raise ValueError(
                 f"question {question.question_id!r} has unavailable cited evidence "
                 f"for complaint_id {complaint_id}"
@@ -1428,6 +1486,7 @@ def _review_identity(
     cited_evidence_identity: tuple[tuple[int, str, str], ...],
     input_hash: str,
 ) -> str:
+    rendered_claim = answer.render_attributed_claim(answer.Claim(claim_text, complaint_ids))
     material = json.dumps(
         {
             "version": _CLAIM_REVIEW_VERSION,
@@ -1436,6 +1495,8 @@ def _review_identity(
             "question_hash": question_hash,
             "claim_position": claim_position,
             "claim_text_hash": hashlib.sha256(claim_text.encode("utf-8")).hexdigest(),
+            "rendered_claim_hash": hashlib.sha256(rendered_claim.encode("utf-8")).hexdigest(),
+            "renderer_version": answer.ATTRIBUTED_CLAIM_RENDERER_VERSION,
             "cited_complaint_ids": list(complaint_ids),
             "evidence_hash": evidence_hash,
             "cited_evidence_identity": [list(value) for value in cited_evidence_identity],
@@ -1450,8 +1511,7 @@ def _review_identity(
 def _claim_candidates(con, eval_run_id: str) -> list[_ClaimCandidate]:
     manifest_path = PATHS.ground_truth / "rag_eval_questions.csv"
     try:
-        manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        questions = load_manifest(manifest_path)
+        questions, manifest_sha256 = load_manifest_snapshot(manifest_path)
     except FileNotFoundError:
         raise ValueError("RAG evaluation manifest is unavailable") from None
     run_identity = con.execute(
@@ -1554,7 +1614,16 @@ def _claim_candidates(con, eval_run_id: str) -> list[_ClaimCandidate]:
                 raise ValueError(f"question {question.question_id!r} has an invalid cached answer")
             payload = _stored_json(answer_json, "answer", question.question_id)
             try:
-                grounded = answer.validate_answer(payload, set(evidence_ids))
+                grounded = answer.validate_answer(
+                    payload,
+                    set(evidence_ids),
+                    evidence_text_by_id=_retrievable_evidence_text_by_id(
+                        con,
+                        question,
+                        evidence_ids,
+                        corpus_cache,
+                    ),
+                )
             except (answer.AnswerSchemaError, TypeError, ValueError):
                 raise ValueError(
                     f"question {question.question_id!r} has an invalid cached answer"
@@ -1594,7 +1663,10 @@ def _claim_candidates(con, eval_run_id: str) -> list[_ClaimCandidate]:
                     company_id=question.company_id,
                     question=_review_text(question.question, "question"),
                     claim_position=claim_position,
-                    claim_text=_review_text(claim.text, "claim text"),
+                    claim_text=_review_text(
+                        answer.render_attributed_claim(claim),
+                        "rendered claim",
+                    ),
                     cited_complaint_ids=claim.complaint_ids,
                     cited_evidence=cited_evidence,
                 )
@@ -1640,11 +1712,6 @@ def _sample_claims(
     return sorted(selected, key=lambda candidate: (candidate.question_id, candidate.claim_position))
 
 
-def _ensure_claim_review_destination(path: Path) -> None:
-    if not _inside(path.resolve(), PATHS.interim.resolve()):
-        raise ValueError("claim review worklists must stay under configured data/interim")
-
-
 def _claim_review_row(candidate: _ClaimCandidate) -> dict[str, str]:
     evidence_json = json.dumps(
         [
@@ -1687,7 +1754,7 @@ def export_claim_review(
         raise ValueError(f"human groundedness requires at least {CONFIG.llm.human_verify_n} claims")
     if type(seed) is not int or isinstance(seed, bool):
         raise ValueError("seed must be an integer")
-    _ensure_claim_review_destination(path)
+    canonical_private_path(path, PATHS.interim, create_parents=True)
     candidates = _claim_candidates(con, eval_run_id)
     if len(candidates) < n:
         raise ValueError(
@@ -1698,6 +1765,7 @@ def export_claim_review(
         path,
         CLAIM_REVIEW_HEADER,
         [_claim_review_row(candidate) for candidate in selected],
+        root=PATHS.interim,
     )
 
 
@@ -1753,10 +1821,10 @@ def parse_claim_review(path: Path, reviewer_id: str) -> list[ClaimReview]:
     """Parse completed human judgments without trusting artifact identities."""
     if type(reviewer_id) is not str or not _SAFE_ID.fullmatch(reviewer_id):
         raise ValueError("reviewer_id must be a safe non-blank identifier")
-    _ensure_claim_review_destination(path)
-    if not path.stem.endswith(f".{reviewer_id}"):
+    canonical_path, source_bytes = read_private_bytes(path, PATHS.interim)
+    if not canonical_path.stem.endswith(f".{reviewer_id}"):
         raise ValueError("claim review filename must end with the reviewer_id")
-    rows = _read_strict_csv(path, CLAIM_REVIEW_HEADER, "claim review")
+    rows = _read_strict_csv_bytes(source_bytes, CLAIM_REVIEW_HEADER, "claim review")
     parsed: list[ClaimReview] = []
     seen_ids: set[str] = set()
     seen_claims: set[tuple[str, int]] = set()
@@ -2092,8 +2160,22 @@ def _parse_rows(rows: list[dict[str, str]], expected_n: int) -> list[EvalQuestio
 
 def load_manifest(path: Path, expected_n: int = 30) -> list[EvalQuestion]:
     """Load the exact seven-column, category-balanced evaluation manifest."""
-    rows = _read_strict_csv(path, MANIFEST_HEADER, "manifest")
+    return load_manifest_bytes(read_stable_bytes(path), expected_n)
+
+
+def load_manifest_bytes(data: bytes, expected_n: int = 30) -> list[EvalQuestion]:
+    """Parse questions from the exact bytes used for the manifest identity."""
+    rows = _read_strict_csv_bytes(data, MANIFEST_HEADER, "manifest")
     return _parse_rows(rows, expected_n)
+
+
+def load_manifest_snapshot(
+    path: Path,
+    expected_n: int = 30,
+) -> tuple[list[EvalQuestion], str]:
+    """Load and hash one stable manifest byte buffer."""
+    data = read_stable_bytes(path)
+    return load_manifest_bytes(data, expected_n), hashlib.sha256(data).hexdigest()
 
 
 def _read_strict_csv_bytes(
@@ -2117,11 +2199,6 @@ def _read_strict_csv_bytes(
             )
         rows.append(row)
     return rows
-
-
-def _read_strict_csv(path: Path, header: tuple[str, ...], artifact: str) -> list[dict[str, str]]:
-    """Read a CSV only when every physical row has exactly the header's arity."""
-    return _read_strict_csv_bytes(path.read_bytes(), header, artifact)
 
 
 def _shingles(tokens: list[str]) -> set[tuple[str, ...]]:
@@ -2260,55 +2337,13 @@ def _authoring_candidates(con) -> list[_AuthoringCandidate]:
         scope_counts AS (
           SELECT cluster_id, company_id, count(*) AS n_evidence
           FROM retrievable GROUP BY cluster_id, company_id
-        ),
-        cluster_counts AS (
-          SELECT cluster_id, sum(n_evidence) AS n_evidence
-          FROM scope_counts GROUP BY cluster_id
-        ),
-        grouped_signals AS (
-          SELECT cluster_id, company_id,
-                 min(CASE WHEN method = 'ebgm' THEN q_value END) AS q_value,
-                 max(CASE WHEN method IN ('ewma', 'pelt') THEN 1 ELSE 0 END) AS changed,
-                 max(n_supporting_groups) AS n_groups
-          FROM signals WHERE run_id = ? GROUP BY cluster_id, company_id
-        ),
-        canonical_fired AS (
-          SELECT g.cluster_id, g.company_id
-          FROM grouped_signals g JOIN clusters c USING (cluster_id)
-          WHERE c.run_id = ? AND c.coherence >= ? AND g.n_groups >= ?
-            AND (g.q_value <= ? OR g.changed = 1)
-        ),
-        fired AS (
-          SELECT fs.cluster_id,
-                 CASE WHEN fs.company_id = '__ALL__' THEN NULL ELSE fs.company_id END
-                   AS company_id,
-                 cl.product_family,
-                 true AS did_fire
-          FROM canonical_fired fs
-          JOIN clusters cl ON cl.cluster_id = fs.cluster_id AND cl.run_id = ?
-          LEFT JOIN scope_counts sc
-            ON sc.cluster_id = fs.cluster_id AND sc.company_id = fs.company_id
-          LEFT JOIN cluster_counts cc ON cc.cluster_id = fs.cluster_id
-          WHERE CASE WHEN fs.company_id = '__ALL__'
-                     THEN coalesce(cc.n_evidence, 0)
-                     ELSE coalesce(sc.n_evidence, 0)
-                END >= ?
-        ),
-        controls AS (
-          SELECT cl.cluster_id, NULL AS company_id, cl.product_family, false AS did_fire
-          FROM clusters cl
-          JOIN cluster_counts cc USING (cluster_id)
-          WHERE cl.run_id = ? AND cc.n_evidence >= ?
-            AND NOT EXISTS (
-              SELECT 1 FROM canonical_fired f WHERE f.cluster_id = cl.cluster_id
-            )
         )
-        SELECT DISTINCT cluster_id, company_id, product_family, did_fire FROM fired
-        UNION ALL
-        SELECT cluster_id, company_id, product_family, did_fire FROM controls
-        ORDER BY cluster_id, company_id
+        SELECT sc.cluster_id, sc.company_id, sc.n_evidence, cl.product_family
+        FROM scope_counts sc
+        JOIN clusters cl ON cl.cluster_id = sc.cluster_id AND cl.run_id = ?
+        ORDER BY sc.cluster_id, sc.company_id
         """  # noqa: S608 - interpolation is the static shared population SQL
-    rows = con.execute(
+    scope_rows = con.execute(
         query,
         [
             cluster_run,
@@ -2317,18 +2352,58 @@ def _authoring_candidates(con) -> list[_AuthoringCandidate]:
             cutoff,
             cutoff,
             embed_model,
-            signals_run,
             cluster_run,
-            CONFIG.novelty.min_coherence,
-            CONFIG.signals.min_supporting_groups,
-            CONFIG.signals.fdr_alpha,
-            cluster_run,
-            _EXCERPTS_PER_ROW,
-            cluster_run,
-            _EXCERPTS_PER_ROW,
         ],
     ).fetchall()
-    return [_AuthoringCandidate(*row) for row in rows]
+    scope_counts = {
+        (cluster_id, company_id): int(n_evidence)
+        for cluster_id, company_id, n_evidence, _family in scope_rows
+    }
+    cluster_counts: Counter[str] = Counter()
+    cluster_families: dict[str, str] = {}
+    for cluster_id, _company_id, n_evidence, product_family in scope_rows:
+        cluster_counts[cluster_id] += int(n_evidence)
+        cluster_families[cluster_id] = product_family
+
+    canonical = canonical_alert_scopes(con, signals_run)
+    fired_clusters = {scope.cluster_id for scope in canonical}
+    candidates: set[_AuthoringCandidate] = set()
+    for scope in canonical:
+        if scope.company_id == "__ALL__":
+            company_id = None
+            n_evidence = cluster_counts[scope.cluster_id]
+        else:
+            company_id = scope.company_id
+            n_evidence = scope_counts.get((scope.cluster_id, scope.company_id), 0)
+        if n_evidence >= _EXCERPTS_PER_ROW:
+            candidates.add(
+                _AuthoringCandidate(
+                    scope.cluster_id,
+                    company_id,
+                    scope.product_family,
+                    True,
+                )
+            )
+
+    for cluster_id, n_evidence in cluster_counts.items():
+        if n_evidence >= _EXCERPTS_PER_ROW and cluster_id not in fired_clusters:
+            candidates.add(
+                _AuthoringCandidate(
+                    cluster_id,
+                    None,
+                    cluster_families[cluster_id],
+                    False,
+                )
+            )
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.cluster_id,
+            candidate.company_id or "",
+            candidate.product_family,
+            candidate.did_fire,
+        ),
+    )
 
 
 def _tie_break(seed: int, category: str, candidate: _AuthoringCandidate) -> str:
@@ -2399,69 +2474,28 @@ def _evidence(con, candidate: _AuthoringCandidate) -> list[tuple[int, str]]:
     return [(row.complaint_id, row.text_redacted) for row in corpus.rows[:_EXCERPTS_PER_ROW]]
 
 
-def _inside(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-    except ValueError:
-        return False
-    return True
-
-
-def _ensure_private_destination(path: Path) -> None:
-    resolved = path.resolve()
-    allowed = PATHS.interim.resolve()
-    repository_roots = [PATHS.root.resolve()]
-    if PATHS.root.parent.name == ".worktrees":
-        repository_roots.append(PATHS.root.parent.parent.resolve())
-    if any(_inside(resolved, root) for root in repository_roots) and not _inside(resolved, allowed):
-        raise ManifestError("private authoring worklists must stay under data/interim")
-
-
-def _write_rows(path: Path, header: tuple[str, ...], rows: list[dict[str, str]]) -> Path:
-    parent_existed = path.parent.exists()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not parent_existed:
-        _fsync_directory(path.parent.parent)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            newline="",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            writer = csv.DictWriter(handle, fieldnames=list(header), extrasaction="raise")
-            writer.writeheader()
-            writer.writerows(rows)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        _fsync_directory(path.parent)
-        return path
-    except BaseException:
-        if temporary_path is not None:
-            with suppress(FileNotFoundError):
-                temporary_path.unlink()
-        raise
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+def _write_rows(
+    path: Path,
+    header: tuple[str, ...],
+    rows: list[dict[str, str]],
+    *,
+    root: Path,
+) -> Path:
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=list(header), extrasaction="raise")
+    writer.writeheader()
+    writer.writerows(rows)
+    return atomic_write_bytes(path, root, buffer.getvalue().encode("utf-8"))
 
 
 def export_authoring_worklist(con, seed: int, path: Path) -> Path:
     """Export thirty deterministic candidates with private redacted evidence."""
     if not isinstance(seed, int) or isinstance(seed, bool):
         raise ManifestError("seed must be an integer")
-    _ensure_private_destination(path)
+    try:
+        canonical_private_path(path, PATHS.interim, create_parents=True)
+    except PrivatePathError as exc:
+        raise ManifestError(str(exc)) from None
     selected = _select_authoring_candidates(_authoring_candidates(con), seed)
     rows: list[dict[str, str]] = []
     for question_number, (category, candidate) in enumerate(selected, start=1):
@@ -2485,7 +2519,7 @@ def export_authoring_worklist(con, seed: int, path: Path) -> Path:
             row[f"evidence_{index}_complaint_id"] = str(complaint_id)
             row[f"evidence_{index}_text_redacted"] = _spreadsheet_safe(text_redacted)
         rows.append(row)
-    return _write_rows(path, AUTHORING_HEADER, rows)
+    return _write_rows(path, AUTHORING_HEADER, rows, root=PATHS.interim)
 
 
 def _prepare_authoring_bytes(source: Path, source_bytes: bytes) -> PreparedAuthoringImport:
@@ -2509,7 +2543,7 @@ def _prepare_authoring_bytes(source: Path, source_bytes: bytes) -> PreparedAutho
     questions = tuple(_parse_rows(manifest_rows, expected_n=30))
     rows = tuple(tuple(row[field] for field in MANIFEST_HEADER) for row in manifest_rows)
     return PreparedAuthoringImport(
-        source=source.resolve(),
+        source=source,
         source_sha256=hashlib.sha256(source_bytes).hexdigest(),
         source_bytes=source_bytes,
         questions=questions,
@@ -2521,7 +2555,8 @@ def prepare_authoring_import(source: Path) -> PreparedAuthoringImport:
     """Fully parse one exact private worklist before opening a writable database."""
     if not isinstance(source, Path):
         raise TypeError("source must be a Path")
-    return _prepare_authoring_bytes(source, source.read_bytes())
+    canonical_source, source_bytes = read_private_bytes(source, PATHS.interim)
+    return _prepare_authoring_bytes(canonical_source, source_bytes)
 
 
 def import_authoring_worklist(
@@ -2535,12 +2570,12 @@ def import_authoring_worklist(
     prepared = prepare_authoring_import(source) if preflight is None else preflight
     if type(prepared) is not PreparedAuthoringImport:
         raise TypeError("preflight must be a PreparedAuthoringImport")
-    if prepared.source != source.resolve():
+    canonical_source, current_bytes = read_private_bytes(source, PATHS.interim)
+    if prepared.source != canonical_source:
         raise ManifestError("authoring worklist path does not match its preflight")
-    rebuilt = _prepare_authoring_bytes(source, prepared.source_bytes)
+    rebuilt = _prepare_authoring_bytes(canonical_source, prepared.source_bytes)
     if rebuilt != prepared:
         raise ManifestError("authoring worklist preflight identity is invalid")
-    current_bytes = source.read_bytes()
     if (
         current_bytes != prepared.source_bytes
         or hashlib.sha256(current_bytes).hexdigest() != prepared.source_sha256
@@ -2549,4 +2584,9 @@ def import_authoring_worklist(
     questions = list(prepared.questions)
     validate_manifest(con, questions)
     manifest_rows = [dict(zip(MANIFEST_HEADER, row, strict=True)) for row in prepared.manifest_rows]
-    return _write_rows(destination, MANIFEST_HEADER, manifest_rows)
+    return _write_rows(
+        destination,
+        MANIFEST_HEADER,
+        manifest_rows,
+        root=PATHS.ground_truth,
+    )

@@ -20,7 +20,9 @@ from collections.abc import Callable
 from pathlib import Path
 
 from src import checks, db
+from src.alert_scope import canonical_alert_scopes
 from src.config import CONFIG, PATHS
+from src.private_artifacts import canonical_private_path
 
 
 def phase_init(args: argparse.Namespace) -> int:
@@ -1103,34 +1105,6 @@ def cmd_adjudicate(args: argparse.Namespace) -> int:
     return 0
 
 
-ALERT_SQL = """
-WITH fired AS (
-  SELECT cluster_id, company_id,
-         max(CASE WHEN method = 'ebgm' THEN statistic END)   AS eb05,
-         min(CASE WHEN method = 'ebgm' THEN q_value END)     AS q_value,
-         max(CASE WHEN method IN ('ewma', 'pelt') THEN 1 ELSE 0 END) AS changed,
-         min(CASE WHEN method IN ('ewma', 'pelt') THEN period_month END) AS change_month,
-         max(n_supporting)        AS n_supporting,
-         max(n_supporting_groups) AS n_groups
-  FROM signals WHERE run_id = ? GROUP BY 1, 2
-)
-SELECT c.product_family, f.company_id, f.cluster_id, f.eb05, f.q_value,
-       f.changed, f.change_month, f.n_supporting, f.n_groups,
-       c.coherence, c.persistence, n.novelty_score, n.is_novel, n.dominant_label
-FROM fired f
-JOIN clusters c USING (cluster_id)
-LEFT JOIN cluster_novelty n USING (cluster_id)
-WHERE c.coherence >= ?
-  AND f.n_groups >= ?
-  AND (f.q_value <= ? OR f.changed = 1)
-  AND (? = 'all'
-       OR (? = 'novel' AND n.novelty_score >= ?)
-       OR (? = 'known' AND n.novelty_score <  ?))
-ORDER BY f.eb05 DESC NULLS LAST, f.n_groups DESC
-LIMIT ?
-"""
-
-
 def cmd_alerts(args: argparse.Namespace) -> int:
     """METHODOLOGY §6.3 — the joint criteria, ranked by EB05.
 
@@ -1147,21 +1121,42 @@ def cmd_alerts(args: argparse.Namespace) -> int:
     con = db.connect(read_only=True)
     run_id = args.run_id or latest_run(con, "signals")
     track = args.track
-    rows = con.execute(
-        ALERT_SQL,
-        [
-            run_id,
-            CONFIG.novelty.min_coherence,
-            CONFIG.signals.min_supporting_groups,
-            CONFIG.signals.fdr_alpha,
-            track,
-            track,
-            CONFIG.novelty.threshold,
-            track,
-            CONFIG.novelty.threshold,
-            args.n,
-        ],
-    ).fetchall()
+    scopes = canonical_alert_scopes(con, run_id)
+    rows = []
+    for scope in scopes:
+        novelty_row = con.execute(
+            "SELECT novelty_score, is_novel, dominant_label "
+            "FROM cluster_novelty WHERE cluster_id = ?",
+            [scope.cluster_id],
+        ).fetchone()
+        novelty, is_novel, dominant = novelty_row or (None, None, None)
+        in_track = (
+            track == "all"
+            or (track == "novel" and novelty is not None and novelty >= CONFIG.novelty.threshold)
+            or (track == "known" and novelty is not None and novelty < CONFIG.novelty.threshold)
+        )
+        if not in_track:
+            continue
+        rows.append(
+            (
+                scope.product_family,
+                scope.company_id,
+                scope.cluster_id,
+                scope.eb05,
+                scope.q_value,
+                scope.changed,
+                scope.change_month,
+                scope.n_supporting,
+                scope.n_groups,
+                scope.coherence,
+                scope.persistence,
+                novelty,
+                is_novel,
+                dominant,
+            )
+        )
+        if len(rows) >= args.n:
+            break
 
     print(f"run    : {run_id}")
     print(
@@ -1407,13 +1402,14 @@ def phase_label(args: argparse.Namespace) -> int:
     con = db.bootstrap()
     cluster_run = args.run_id or latest_run(con, "cluster")
     signals_run = args.signals_run or latest_run(con, "signals")
-    model = args.model or CONFIG.embed.dev_model
+    model = llm_run.embedding_model_for_cluster_run(con, cluster_run, args.model)
 
     params = {
         "cluster_run": cluster_run,
         "signals_run": signals_run,
         "limit": args.limit,
         "control_n": args.control_n,
+        "embed_model": model,
     }
     with db.run(con, "label", CONFIG, params=params) as r:
         stats = llm_run.run(
@@ -2076,25 +2072,25 @@ def _rag_identifier(value: object, field: str) -> str:
 def _rag_interim_path(value: object, field: str, *, must_exist: bool = False) -> Path:
     if type(value) is not str or not value.strip():
         raise ValueError(f"{field} is required")
-    path = Path(value)
     try:
-        path.resolve().relative_to(PATHS.interim.resolve())
+        return canonical_private_path(
+            Path(value),
+            PATHS.interim,
+            must_exist=must_exist,
+            create_parents=not must_exist,
+        )
     except ValueError:
         raise ValueError(f"{field} must stay under configured data/interim") from None
-    if must_exist and not path.is_file():
-        raise FileNotFoundError(path)
-    return path
 
 
 def _load_rag_manifest(llm_eval):
     """Load and hash one unchanged byte identity before writable work begins."""
     path = PATHS.ground_truth / _RAG_MANIFEST_NAME
-    before = path.read_bytes()
-    questions = llm_eval.load_manifest(path)
-    after = path.read_bytes()
-    if before != after:
-        raise llm_eval.ManifestError("RAG evaluation manifest changed while it was loading")
-    return path, questions, hashlib.sha256(before).hexdigest()
+    from src.private_artifacts import read_stable_bytes
+
+    data = read_stable_bytes(path)
+    questions = llm_eval.load_manifest_bytes(data)
+    return path, questions, hashlib.sha256(data).hexdigest()
 
 
 def cmd_rag_eval(args: argparse.Namespace) -> int:
@@ -2326,34 +2322,79 @@ def cmd_label_verify(args: argparse.Namespace) -> int:
     """Export, ingest, and report the blinded human label-review workflow."""
     from src.llm import verify
 
-    con = db.bootstrap()
     if args.verify_action == "export":
-        signals_run = args.signals_run or latest_run(con, "signals")
-        path = verify.export_worklist(
-            con,
-            signals_run,
-            args.n,
-            CONFIG.llm.verification_seed,
-            Path(args.output),
-        )
-        metadata = verify.load_worklist_metadata(con, path)
-        print(f"worklist  : {path}")
-        print(f"sidecar   : {verify.worklist_sidecar_path(path)}")
-        print(f"version   : {metadata.worklist_version}")
-        return 0
+        output = _rag_interim_path(args.output, "label-review output")
+        con = db.bootstrap()
+        try:
+            signals_run = args.signals_run or latest_run(con, "signals")
+            path = verify.export_worklist(
+                con,
+                signals_run,
+                args.n,
+                CONFIG.llm.verification_seed,
+                output,
+            )
+            metadata = verify.load_worklist_metadata(con, path)
+            print(f"worklist  : {path}")
+            print(f"sidecar   : {verify.worklist_sidecar_path(path)}")
+            print(f"version   : {metadata.worklist_version}")
+            return 0
+        finally:
+            con.close()
     if args.verify_action == "record":
         # This CLI is the human-review ingestion path. Model-origin reviews
         # remain available to callers of src.llm.verify, never as CLI input.
-        count, metadata = verify.record_worklist(
-            con,
-            Path(args.input),
-            args.reviewer,
-        )
-        print(f"recorded  : {count}")
-        print(f"version   : {metadata.worklist_version}")
+        source = _rag_interim_path(args.input, "label-review input", must_exist=True)
+        prepared = verify.prepare_worklist_record(source, args.reviewer)
+        con = db.bootstrap()
+        try:
+            count, metadata = verify.record_worklist(
+                con,
+                source,
+                args.reviewer,
+                preflight=prepared,
+            )
+            print(f"recorded  : {count}")
+            print(f"version   : {metadata.worklist_version}")
+            return 0
+        finally:
+            con.close()
+    con = db.bootstrap()
+    try:
+        print(verify.report(con, args.worklist_version).render())
         return 0
-    print(verify.report(con, args.worklist_version).render())
-    return 0
+    finally:
+        con.close()
+
+
+def cmd_migrate_embeddings(args: argparse.Namespace) -> int:
+    """Validate or publish SHA-addressed embedding artifact names."""
+    from src.embed import migrate
+
+    if not PATHS.db.is_file():
+        raise SystemExit(f"database does not exist at {PATHS.db}")
+    con = db.connect(PATHS.db, read_only=True)
+    active_error: BaseException | None = None
+    try:
+        report = migrate.migrate_embedding_artifacts(
+            con,
+            PATHS.artifacts,
+            args.model,
+            execute=args.execute,
+        )
+        print(report.render())
+        return 0
+    except BaseException as exc:
+        active_error = exc
+        raise
+    finally:
+        try:
+            con.close()
+        except BaseException as exc:
+            if active_error is not None:
+                active_error.add_note(f"close error: {type(exc).__name__}")
+            else:
+                raise migrate.ArtifactMigrationError("database connection close failed") from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2539,6 +2580,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_claims_record.add_argument("--run-id", required=True)
     p_claims_record.add_argument("--input", required=True)
     p_claims_record.add_argument("--reviewer", required=True)
+
+    p_migrate_embeddings = sub.add_parser(
+        "migrate-embeddings",
+        help="validate or publish SHA-addressed embedding artifact names",
+    )
+    p_migrate_embeddings.add_argument("--model", required=True)
+    p_migrate_embeddings.add_argument(
+        "--execute",
+        action="store_true",
+        help=(
+            "publish descriptor-bound copy-on-write clones, validate exact content on "
+            "different inodes, and retain legacy artifacts under deterministic "
+            "retirement names for replay"
+        ),
+    )
+    p_migrate_embeddings.set_defaults(func=cmd_migrate_embeddings)
 
     p_runs = sub.add_parser("runs", help="show the run registry")
     p_runs.add_argument("-n", type=int, default=20)

@@ -43,8 +43,7 @@ LABEL_SCHEMA = {
     "properties": {
         "harm_mechanism": {
             "type": "string",
-            "description": "One sentence, active voice, describing what goes "
-                           "wrong mechanically.",
+            "description": "One sentence, active voice, describing what goes wrong mechanically.",
         },
         "actors": {"type": "array", "items": {"type": "string"}},
         "preconditions": {
@@ -61,8 +60,13 @@ LABEL_SCHEMA = {
         "is_likely_template": {"type": "boolean"},
     },
     "required": [
-        "harm_mechanism", "actors", "preconditions", "consumer_impact",
-        "distinct_from_taxonomy", "distinctness_rationale", "confidence",
+        "harm_mechanism",
+        "actors",
+        "preconditions",
+        "consumer_impact",
+        "distinct_from_taxonomy",
+        "distinctness_rationale",
+        "confidence",
         "is_likely_template",
     ],
     "additionalProperties": False,
@@ -112,8 +116,11 @@ def validate_label(payload: dict) -> dict:
         raise LabelSchemaError(f"missing={missing} extra={extra}")
 
     string_fields = {
-        "harm_mechanism", "preconditions", "consumer_impact",
-        "distinctness_rationale", "confidence",
+        "harm_mechanism",
+        "preconditions",
+        "consumer_impact",
+        "distinctness_rationale",
+        "confidence",
     }
     if any(not isinstance(payload[field], str) for field in string_fields):
         raise LabelSchemaError("label text fields must be strings")
@@ -139,13 +146,11 @@ def _validate_cached_payload(payload: object) -> dict:
     return validate_label(payload)
 
 
-def build_prompt(narratives: list[str], taxonomy_labels: list[str],
-                 max_chars: int) -> str:
+def build_prompt(narratives: list[str], taxonomy_labels: list[str], max_chars: int) -> str:
     """The per-cluster user turn. Stable content lives in SYSTEM, not here."""
     labels = ", ".join(taxonomy_labels) if taxonomy_labels else "(none recorded)"
     body = "\n\n".join(
-        f"--- narrative {i + 1} ---\n{text[:max_chars]}"
-        for i, text in enumerate(narratives)
+        f"--- narrative {i + 1} ---\n{text[:max_chars]}" for i, text in enumerate(narratives)
     )
     return (
         f"Dominant existing taxonomy labels for this cluster: {labels}\n\n"
@@ -153,17 +158,28 @@ def build_prompt(narratives: list[str], taxonomy_labels: list[str],
     )
 
 
-def input_hash(prompt_version: str, model: str, complaint_ids: list[int]) -> str:
-    """§2.4's cache key: sha256(prompt_version + model + sorted ids).
+def input_hash(
+    prompt_version: str,
+    model: str,
+    complaint_ids: list[int],
+    evidence_model: str,
+) -> str:
+    """Hash the LLM contract, selected IDs, and evidence-vector provenance.
 
     Sorted, so the key does not depend on selection order — the same 20
     narratives always hash the same. `prompt_version` is in the key because a
     prompt edit invalidates every cached label, which is the whole reason §4
     requires bumping it.
     """
+    if type(evidence_model) is not str or not evidence_model.strip():
+        raise ValueError("evidence_model must be a nonblank string")
     payload = json.dumps(
-        {"prompt_version": prompt_version, "model": model,
-         "complaint_ids": sorted(int(c) for c in complaint_ids)},
+        {
+            "prompt_version": prompt_version,
+            "model": model,
+            "evidence_model": evidence_model,
+            "complaint_ids": sorted(int(c) for c in complaint_ids),
+        },
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -199,8 +215,9 @@ def write_cache(cache_dir: Path, key: str, label: dict) -> None:
     os.replace(temp_path, cache_dir / f"{key}.json")
 
 
-def label_cluster(client, model: str, narratives: list[str],
-                  taxonomy_labels: list[str], max_chars: int) -> dict:
+def label_cluster(
+    client, model: str, narratives: list[str], taxonomy_labels: list[str], max_chars: int
+) -> dict:
     """Delegate one typed request through the reliable transport boundary."""
     result = client.call_json(
         model=model,

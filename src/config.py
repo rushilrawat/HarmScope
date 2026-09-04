@@ -238,7 +238,7 @@ class LLMConfig:
     # cache key, so switching after a run would have invalidated every label.
     model: str = "claude-opus-5"
     prompt_version: str = "v1"  # label prompt; part of the label cache key
-    answer_prompt_version: str = "rag-v2"  # answer prompt/schema/cache contract
+    answer_prompt_version: str = "rag-v3"  # answer prompt/schema/cache contract
     label_sample_k: int = 20
     label_medoid_k: int = 12  # nearest-medoid share of label_sample_k
     min_cluster_size_for_label: int = 30
