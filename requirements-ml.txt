@@ -12,7 +12,7 @@ faiss-cpu==1.13.0
 numpy==2.3.4
 
 # Phase 4 - dimensionality reduction + clustering
-umap-learn==0.5.9
+umap-learn==0.5.9.post2
 hdbscan==0.8.41
 scikit-learn==1.7.2
 
