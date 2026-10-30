@@ -1,3 +1,9 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="HarmScope: an evidence-backed build report for open-world consumer-harm discovery over CFPB complaints.">
 <title>HarmScope — Build Report, Phases 0–7</title>
 <style>
   :root {
@@ -57,6 +63,7 @@
     letter-spacing: 0.13em; color: var(--muted); margin: 0;
   }
   .lede { font-size: 1.16rem; color: var(--muted); }
+  .project-links { display: flex; flex-wrap: wrap; gap: 0.7rem 1.1rem; font-family: var(--mono); font-size: 0.78rem; }
 
   header.head {
     padding: 3.5rem 0 2rem; border-bottom: 2px solid var(--ink);
@@ -123,6 +130,8 @@
   .fine { font-size: 0.86rem; color: var(--muted); }
   .rule { height: 1px; background: var(--hair); border: 0; margin: 0; }
 </style>
+</head>
+<body>
 
 <div class="wrap">
 
@@ -130,6 +139,11 @@
   <p class="eyebrow">Build report · 2026-08-02 → 2026-08-07 · 56 commits</p>
   <h1>HarmScope</h1>
   <p class="lede col">Emergent consumer-harm discovery over the CFPB Consumer Complaint Database — 16.9M complaints, 3.8M narratives. <strong>Phases 0–7 complete</strong>: three gates passed, five systems backtested through one harness, one blind adjudication. This report is written to be evaluated: every number below was recomputed from the database, not copied from a commit message.</p>
+  <p class="fine col">This is the verified Phase 0–7 snapshot from 2026-08-07. Phase 8 engineering landed later; the repository README is the source of truth for current status.</p>
+  <nav class="project-links" aria-label="Project links">
+    <a href="https://github.com/rushilrawat/HarmScope">GitHub repository</a>
+    <a href="https://github.com/rushilrawat/HarmScope#status">Current project status</a>
+  </nav>
 </header>
 
 <section>
@@ -475,3 +489,5 @@
 <p class="fine" style="padding:2rem 0 0">HarmScope · phases 0–7 complete · 56 commits · 226 tests passing, 1 xfail · report generated 2026-08-07 and verified against the database at that commit. Per-phase dossiers in <code>docs/phases/</code>.</p>
 
 </div>
+</body>
+</html>
